@@ -1,4 +1,4 @@
-# Byte-compiled / optimized / DLL files
+#D:\blosum_distance\test\test\aa Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -127,3 +127,20 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# big chonky test files
+test/
+
+# compiled rust objects
+target/
+
+# Windows virtualenv folders
+Lib/
+Scripts/
+
+# Cargo lock
+Cargo.lock
+
+# Maturin files
+pyvenv.cfg
+.github/

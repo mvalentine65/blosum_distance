@@ -1,0 +1,35 @@
+
+
+name: Build wrap-rocks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build-nightly-only:
+    name: Build wheels
+    runs-on: ubuntu-latest
+    container: saferq/wrap-rocks:0.2.0
+    steps:
+      - uses: actions/checkout@v1
+      - name: Install stable rust
+        run: curl --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+      - name: build
+        run: |
+          source $HOME/.cargo/env
+          for PYBIN in /opt/python/cp3[891]*/bin; do
+            "${PYBIN}/maturin" build -m Cargo.toml -i "${PYBIN}/python" --release
+          done
+      - name: auditwheel
+        run: |
+          for wheel in target/wheels/*.whl; do
+              auditwheel repair "${wheel}"
+          done
+      - name: pypi upload
+        run: |
+          for wheel in target/wheels/*; do
+            python3.10 -m maturin upload ${wheel} -u ${{ secrets.PYPI_USERNAME }} -p ${{ secrets.PYPI_PASSWORD }}
+          done

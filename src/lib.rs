@@ -1,8 +1,35 @@
 extern crate bio;
 extern crate pyo3;
 
+//use bio::alphabets::dna::complement;
 use pyo3::prelude::*;
 use std::collections::HashSet;
+
+#[pyfunction]
+fn batch_reverse_complement(list: Vec<String>) -> Vec<String> {
+    list.into_iter()
+        .map(|sequence| reverse_complement(sequence))
+        .collect()
+}
+
+#[pyfunction]
+fn reverse_complement(sequence: String) -> String {
+    let array: Vec<u8> = sequence.into_bytes();
+    //let max: usize = array.len() -1;
+    let mut complement: Vec<u8> = Vec::new();
+    for ascii in array.iter().rev() {
+        complement.push( match ascii {
+            65 => 84, // A => T
+            84 => 65, // T => A
+            67 => 71, // C => G
+            71 => 67, // G => C
+            78 => 78, // C => G
+            _ => panic!("Invalid character found")
+            // panic! is fine for now, but an error is the proper response for production
+        }); // switch case should be at least as fast as a HashMap
+    }
+    String::from_utf8(complement).unwrap()
+}
 
 
 fn not_skip_character(character: u8) -> bool {
@@ -45,5 +72,7 @@ fn blosum62_distance(one: String, two: String) -> PyResult<f64>{
 #[pymodule]
 fn blosum_distance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
+    m.add_function(wrap_pyfunction!(reverse_complement, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_reverse_complement, m)?)?;
     Ok(())
 }

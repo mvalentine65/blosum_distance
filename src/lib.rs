@@ -1,7 +1,7 @@
 extern crate bio;
 extern crate pyo3;
 
-//use bio::alphabets::dna::complement;
+use bio::alphabets::dna::complement;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 
@@ -30,7 +30,10 @@ fn reverse_complement(sequence: String) -> String {
     }
     String::from_utf8(complement).unwrap()
 }
-
+#[pyfunction]
+fn bio_revcomp(sequence: String) -> String {
+    String::from_utf8(bio::alphabets::dna::revcomp(sequence.into_bytes())).unwrap()
+}
 
 fn not_skip_character(character: u8) -> bool {
     const HYPHEN: u8 = 45;
@@ -74,5 +77,6 @@ fn blosum_distance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(reverse_complement, m)?)?;
     m.add_function(wrap_pyfunction!(batch_reverse_complement, m)?)?;
+    m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
     Ok(())
 }

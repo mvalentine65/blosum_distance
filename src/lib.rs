@@ -1,38 +1,42 @@
 extern crate bio;
 extern crate pyo3;
+extern crate strsim;
 
 use bio::alphabets::dna::complement;
 use pyo3::prelude::*;
 use std::collections::HashSet;
+use strsim::hamming;
 
 #[pyfunction]
 fn batch_reverse_complement(list: Vec<String>) -> Vec<String> {
     list.into_iter()
-        .map(|sequence| reverse_complement(sequence))
+        .map(|sequence| bio_revcomp(sequence))
         .collect()
 }
 
 #[pyfunction]
-fn reverse_complement(sequence: String) -> String {
-    let array: Vec<u8> = sequence.into_bytes();
-    //let max: usize = array.len() -1;
-    let mut complement: Vec<u8> = Vec::new();
-    for ascii in array.iter().rev() {
-        complement.push( match ascii {
-            65 => 84, // A => T
-            84 => 65, // T => A
-            67 => 71, // C => G
-            71 => 67, // G => C
-            78 => 78, // C => G
-            _ => panic!("Invalid character found")
-            // panic! is fine for now, but an error is the proper response for production
-        }); // switch case should be at least as fast as a HashMap
-    }
-    String::from_utf8(complement).unwrap()
-}
-#[pyfunction]
 fn bio_revcomp(sequence: String) -> String {
     String::from_utf8(bio::alphabets::dna::revcomp(sequence.into_bytes())).unwrap()
+}
+
+#[pyfunction]
+fn seqs_within_distance(first: String, second: String, max_distance: u32) -> bool {
+    let (array_one, array_two) = (first.as_bytes(), second.as_bytes());
+    if array_one.len() != array_two.len() { return false; }
+    let mut distance: u32 = 0;
+    for i in 0..array_one.len() {
+        if array_one[i] != array_two[i] {
+            distance += 1;
+            if distance > max_distance { return false}
+        }
+    }
+    true
+} 
+
+#[pyfunction]
+fn str_hamming(first: &str, second: &str, max_distance: u32) -> bool {
+    let distance = hamming(first, second).unwrap_or(2) as u32;
+    distance <= max_distance
 }
 
 fn not_skip_character(character: u8) -> bool {
@@ -75,8 +79,9 @@ fn blosum62_distance(one: String, two: String) -> PyResult<f64>{
 #[pymodule]
 fn blosum_distance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
-    m.add_function(wrap_pyfunction!(reverse_complement, m)?)?;
     m.add_function(wrap_pyfunction!(batch_reverse_complement, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
+    m.add_function(wrap_pyfunction!(str_hamming, m)?)?;
+    m.add_function(wrap_pyfunction!(seqs_within_distance, m)?)?;
     Ok(())
 }

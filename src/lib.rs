@@ -1,11 +1,32 @@
 extern crate bio;
 extern crate pyo3;
-extern crate strsim;
+//extern crate strsim;
 
-use bio::alphabets::dna::complement;
+//use bio::alphabets::dna::complement;
+use bio::io::fasta;
 use pyo3::prelude::*;
 use std::collections::HashSet;
-use strsim::hamming;
+//use strsim::hamming;
+
+#[pyfunction]
+fn fasta_reader(path: String) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    let fasta_reader = fasta::Reader::from_file(path).unwrap();
+    for fasta in fasta_reader.records() {
+        let record = &fasta.unwrap();
+        result.push(format!(">{}",record.id()));
+        result.push(String::from_utf8(record.seq().to_vec()).unwrap());
+    }
+    return result;
+}
+
+//#[pyfunction]
+//fn cluster_distance_filter(lines: Vec<String>) -> Vec<String> {
+  //  clusters = HashSet::new();:
+   // for line in lines.into_iter().skip(1).step_by(2) {
+//
+ //   }
+//}
 
 #[pyfunction]
 fn batch_reverse_complement(list: Vec<String>) -> Vec<String> {
@@ -33,11 +54,11 @@ fn seqs_within_distance(first: String, second: String, max_distance: u32) -> boo
     true
 } 
 
-#[pyfunction]
-fn str_hamming(first: &str, second: &str, max_distance: u32) -> bool {
-    let distance = hamming(first, second).unwrap_or(2) as u32;
-    distance <= max_distance
-}
+//#[pyfunction]
+//fn str_hamming(first: &str, second: &str, max_distance: u32) -> bool {
+    //let distance = hamming(first, second).unwrap_or(2) as u32;
+    //distance <= max_distance
+//}
 
 fn not_skip_character(character: u8) -> bool {
     const HYPHEN: u8 = 45;
@@ -81,7 +102,8 @@ fn blosum_distance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(batch_reverse_complement, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
-    m.add_function(wrap_pyfunction!(str_hamming, m)?)?;
+    m.add_function(wrap_pyfunction!(fasta_reader, m)?)?;
+    //m.add_function(wrap_pyfunction!(str_hamming, m)?)?;
     m.add_function(wrap_pyfunction!(seqs_within_distance, m)?)?;
     Ok(())
 }

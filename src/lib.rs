@@ -1,12 +1,33 @@
 extern crate bio;
 extern crate pyo3;
+extern crate hashbrown;
+extern crate rayon;
 //extern crate strsim;
 
 //use bio::alphabets::dna::complement;
 use bio::io::fasta;
+use hashbrown::{HashMap, HashSet};
 use pyo3::prelude::*;
-use std::collections::HashSet;
+use rayon::prelude::*;
+//use std::collections::{HashMap, HashSet};
 //use strsim::hamming;
+
+
+// Lifetime annotations for object lifetime c
+// and some lifetime s which is greater than c.
+// If you prefer, c is the current scope,
+// and s is the outer scope.
+
+struct HammingCluster<'c>{
+    records: Vec<&'c HammingRecord<'c>>
+}
+
+
+struct HammingRecord<'c> {
+    header: &'c str,
+    sequence: &'c str,
+    dupe_count: u8,
+}
 
 #[pyfunction]
 fn fasta_reader(path: String) -> Vec<String> {
@@ -20,13 +41,20 @@ fn fasta_reader(path: String) -> Vec<String> {
     return result;
 }
 
-//#[pyfunction]
-//fn cluster_distance_filter(lines: Vec<String>) -> Vec<String> {
-  //  clusters = HashSet::new();:
-   // for line in lines.into_iter().skip(1).step_by(2) {
-//
- //   }
-//}
+#[pyfunction]
+fn cluster_distance_filter(lines: Vec<&str>) -> Vec<String> {
+    let mut clusters = HashMap::new();
+    //let lines = lines_vector.as_slice();
+    for line in lines.iter().skip(1).step_by(2).cloned() {
+        let key = &line[0..10];
+        clusters.entry(key).or_insert(Vec::new()).push(Some(line.clone()));
+    }
+    for (prefix, cluster) in clusters{
+        // implement sort by dupe count here
+        for option in cluster
+    }
+    unimplemented!();
+}
 
 #[pyfunction]
 fn batch_reverse_complement(list: Vec<String>) -> Vec<String> {

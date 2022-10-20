@@ -1,14 +1,14 @@
 extern crate bio;
 extern crate pyo3;
 extern crate hashbrown;
-extern crate rayon;
+// extern crate rayon;
 //extern crate strsim;
 
 //use bio::alphabets::dna::complement;
 use bio::io::fasta;
 use hashbrown::{HashMap, HashSet};
 use pyo3::prelude::*;
-use rayon::prelude::*;
+// use rayon::prelude::*;
 //use std::collections::{HashMap, HashSet};
 //use strsim::hamming;
 
@@ -17,17 +17,21 @@ use rayon::prelude::*;
 // and some lifetime s which is greater than c.
 // If you prefer, c is the current scope,
 // and s is the outer scope.
+// #[pyclass]
+// struct HammingCluster<'c>{ // do i really need this if its one vec?
+//     leader: HammingRecord<'c>,
+//     others: Vec<HammingRecord<'c>>
+// #
+// #[new]
+//
+// }
 
-struct HammingCluster<'c>{
-    records: Vec<&'c HammingRecord<'c>>
-}
-
-
-struct HammingRecord<'c> {
-    header: &'c str,
-    sequence: &'c str,
-    dupe_count: u8,
-}
+// #[derive(Hash, Debug, Clone)]
+// struct HammingRecord<'c> {
+//     header: &'c str,
+//     sequence: &'c str,
+//     dupe_count: u8,
+// }
 
 #[pyfunction]
 fn fasta_reader(path: String) -> Vec<String> {
@@ -42,18 +46,62 @@ fn fasta_reader(path: String) -> Vec<String> {
 }
 
 #[pyfunction]
-fn cluster_distance_filter(lines: Vec<&str>) -> Vec<String> {
+fn cluster_distance_filter(lines: Vec<&str>) -> Vec<Vec<&str>> {
     let mut clusters = HashMap::new();
     //let lines = lines_vector.as_slice();
-    for line in lines.iter().skip(1).step_by(2).cloned() {
-        let key = &line[0..10];
-        clusters.entry(key).or_insert(Vec::new()).push(Some(line.clone()));
+    let mut line_reader = lines.iter().cloned();
+    // while we have more lines to pull records from...
+    while let (Some(name), Some(seq)) = (line_reader.next(), line_reader.next()) {
+        let key = (seq.len(), &seq[0..10]);
+        let array = vec![name, seq];
+        // let ham: HammingRecord = HammingRecord{
+        //     header: name,
+        //     sequence: seq,
+        //     dupe_count: 0, // change later if sort is implemented
+        // };
+        // let mut ham_cluster = HammingCluster {
+        //     leader:ham,
+        //     others:Vec::new(),
+        // };
+        clusters.entry(key).or_insert(Vec::new()).push(array);
     }
-    for (prefix, cluster) in clusters{
-        // implement sort by dupe count here
-        for option in cluster
+    let mut output = Vec::new();
+    for (_key, mut cluster) in clusters{
+        // Pops Hamming records off the cluster vector and makes the new record
+        // the leader in a HammingCluster. Compares leader to other values by distance
+        // and
+        loop{
+            // if we pop a None, the vector is empty, so break
+            let lead = cluster.pop();
+            if lead.is_none() { break;}
+            let mut lead = lead.unwrap();
+            // if lead.is_none() { continue; }
+            // let group = HammingCluster {
+            //     leader: lead.unwrap(),
+            //     others: Vec::new(),
+            // };
+            // Iterate over other seqs in reverse.
+            // If the seq is within distance, swap
+            // with the last element and pop it, then
+            // append to the lead seq's vector.
+            // This works because we start at the end of the vec anyway
+            // by the time we hit an inner element within distance,
+            // we have already verified the last element is not within distance.
+            for index in (0..cluster.len()).rev() {
+                let candidate = &cluster[index];
+                // if candidate.is_none() {continue;}
+                // let other = candidate.unwrap();
+                if seqs_within_distance(candidate[1],
+                                        lead[1],
+                                        1) {
+                    // group.others.push(other)
+                    lead.extend(cluster.swap_remove(index));
+                }
+            }
+            output.push(lead)
+        };
     }
-    unimplemented!();
+    output
 }
 
 #[pyfunction]
@@ -69,7 +117,7 @@ fn bio_revcomp(sequence: String) -> String {
 }
 
 #[pyfunction]
-fn seqs_within_distance(first: String, second: String, max_distance: u32) -> bool {
+fn seqs_within_distance(first: &str, second: &str, max_distance: u32) -> bool {
     let (array_one, array_two) = (first.as_bytes(), second.as_bytes());
     if array_one.len() != array_two.len() { return false; }
     let mut distance: u32 = 0;
@@ -131,7 +179,7 @@ fn blosum_distance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_reverse_complement, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
     m.add_function(wrap_pyfunction!(fasta_reader, m)?)?;
-    //m.add_function(wrap_pyfunction!(str_hamming, m)?)?;
+    m.add_function(wrap_pyfunction!(cluster_distance_filter, m)?)?;
     m.add_function(wrap_pyfunction!(seqs_within_distance, m)?)?;
     Ok(())
 }

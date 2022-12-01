@@ -1,11 +1,11 @@
 [package]
-name = "blosum_distance"
+name = "phymmr_tools"
 version = "0.2.5"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "blosum_distance"
+name = "phymmr_tools"
 crate-type = ["cdylib"]
 
 [dependencies]

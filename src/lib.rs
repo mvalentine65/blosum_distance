@@ -174,7 +174,7 @@ fn blosum62_distance(one: String, two: String) -> PyResult<f64>{
 
 // A Python module implemented in Rust.
 #[pymodule]
-fn blosum_distance(_py: Python, m: &PyModule) -> PyResult<()> {
+fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(batch_reverse_complement, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;

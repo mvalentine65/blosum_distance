@@ -1,6 +1,6 @@
 
 
-name: Build wrap-rocks
+name: Build phymmr-tools
 
 on:
   push:

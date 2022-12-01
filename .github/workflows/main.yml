@@ -31,5 +31,5 @@ jobs:
       - name: pypi upload
         run: |
           for wheel in target/wheels/*; do
-            python3.10 -m maturin upload ${wheel} -u ${{ secrets.PYPI_USERNAME }} -p ${{ secrets.PYPI_PASSWORD }}
+            python3.10 -m maturin upload ${wheel} -u ${{ secrets.CHUBAK_PYPI_USERNAME }} -p ${{ secrets.CHUBAK_PYPI_PASSWORD }}
           done

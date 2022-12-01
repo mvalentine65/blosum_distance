@@ -151,7 +151,7 @@ fn blosum62_distance(one: String, two: String) -> PyResult<f64>{
     let mut max_second: i128 = 0;
     let length = first.iter().count();
     let allowed: HashSet<u8> = HashSet::from([65,84,67,71,73,68,82,
-        80,87,77,69,81,83,72,86,76,75,70,89,78,88]);
+        80,87,77,69,81,83,72,86,76,75,70,89,78,88, 90, 74, 66,  79, 85]);
     for i in 0..length {
         // if !(first[i] == HYPHEN || second[i] == HYPHEN) {
         if not_skip_character(first[i]) && not_skip_character(second[i]) {

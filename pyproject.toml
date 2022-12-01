@@ -4,7 +4,6 @@ build-backend = "maturin"
 
 [project]
 name = "phymmr-tools"
-authors = ["Michael Valentine", "Chubak Bidpaa"]
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",

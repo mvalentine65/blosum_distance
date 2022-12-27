@@ -3,7 +3,8 @@ extern crate pyo3;
 extern crate hashbrown;
 // extern crate rayon;
 //extern crate strsim;
-
+use std::fs::File;
+use std::io::{self, prelude::*, BufReader};
 //use bio::alphabets::dna::complement;
 use bio::io::fasta;
 use hashbrown::{HashMap, HashSet};
@@ -32,6 +33,35 @@ use pyo3::prelude::*;
 //     sequence: &'c str,
 //     dupe_count: u8,
 // }
+
+
+#[pyfunction]
+fn find_references_and_candidates(path: String) -> (Vec<String>, Vec<String>) {
+    let file = File::open(path).unwrap();
+    let reader = BufReader::new(file);
+    let mut candidates = Vec::new();
+    let mut references = Vec::new();
+    let mut reached_candidates = false;
+    let mut line = String::from("");
+    for line_in in reader.lines() {
+        line = line_in.unwrap();
+        if reached_candidates {
+            candidates.push(line);
+        }
+        else {
+            if line.starts_with(">") && !line.ends_with(".") {
+                reached_candidates = true;
+                candidates.push(line)
+            }
+            else {
+                references.push(line)
+            }
+        }
+    }
+    (references, candidates)
+}
+
+
 
 #[pyfunction]
 fn fasta_reader(path: String) -> Vec<String> {
@@ -181,5 +211,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fasta_reader, m)?)?;
     m.add_function(wrap_pyfunction!(cluster_distance_filter, m)?)?;
     m.add_function(wrap_pyfunction!(seqs_within_distance, m)?)?;
+    m.add_function(wrap_pyfunction!(find_references_and_candidates, m)?)?;
+
     Ok(())
 }

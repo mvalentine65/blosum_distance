@@ -4,7 +4,7 @@ extern crate hashbrown;
 // extern crate rayon;
 //extern crate strsim;
 use std::fs::File;
-use std::io::{self, prelude::*, BufReader};
+use std::io::{prelude::*, BufReader};
 //use bio::alphabets::dna::complement;
 use bio::io::fasta;
 use bio::scores::blosum62;
@@ -43,14 +43,14 @@ fn find_references_and_candidates(path: String) -> (Vec<String>, Vec<String>) {
     let mut candidates = Vec::new();
     let mut references = Vec::new();
     let mut reached_candidates = false;
-    let mut line = String::from("");
+    let mut line: String;
     for line_in in reader.lines() {
         line = line_in.unwrap();
         if reached_candidates {
             candidates.push(line);
         }
         else {
-            if line.starts_with(">") && !line.ends_with(".") {
+            if line.starts_with('>') && !line.ends_with('.') {
                 reached_candidates = true;
                 candidates.push(line)
             }
@@ -95,7 +95,7 @@ fn fasta_reader(path: String) -> Vec<String> {
         result.push(format!(">{}",record.id()));
         result.push(String::from_utf8(record.seq().to_vec()).unwrap());
     }
-    return result;
+    result
 }
 
 #[pyfunction]
@@ -190,18 +190,23 @@ fn not_skip_character(character: u8) -> bool {
     character != HYPHEN && character != ASTERISK
 }
 
-#[pyfunction]
-fn make_ref_distance_array_blosum62(seq1: &str, seq2: &str) -> Vec<i32> {
-    let result = seq1.as_bytes().iter()
+
+fn blosum62_check(a: u8, b: u8) -> i32 {
+    if a == 45 || b == 45 { return 0_i32; }
+    blosum62(a, b)
+}
+
+
+fn make_ref_distance_vector_blosum62(seq1: &str, seq2: &str) -> Vec<i32> {
+    seq1.as_bytes().iter()
         .zip(seq2.as_bytes().iter())
-        .filter(|(a, b)| **a != 45 && **b != 45)
         .scan(0, |state, (a, b)| {
-            *state = *state + blosum62(*a, *b);
+            *state += blosum62_check(*a, *b);
             Some(*state)
         })
-        .collect();
-    result
-    }
+        // .map(|(a,b)| blosum62(*a, *b))
+        .collect()
+}
 
 
 #[pyfunction]
@@ -211,7 +216,7 @@ fn blosum62_distance(one: String, two: String) -> PyResult<f64>{
     let mut score: i128 = 0;
     let mut max_first: i128 = 0;
     let mut max_second: i128 = 0;
-    let length = first.iter().count();
+    let length = first.len();
     let allowed: HashSet<u8> = HashSet::from([65,84,67,71,73,68,82,
         80,87,77,69,81,83,72,86,76,75,70,89,78,88, 90, 74, 66,  79, 85]);
     for i in 0..length {

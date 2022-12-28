@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, prelude::*, BufReader};
 //use bio::alphabets::dna::complement;
 use bio::io::fasta;
+use bio::scores::blosum62;
 use hashbrown::{HashMap, HashSet};
 use pyo3::prelude::*;
 // use rayon::prelude::*;
@@ -61,6 +62,28 @@ fn find_references_and_candidates(path: String) -> (Vec<String>, Vec<String>) {
     (references, candidates)
 }
 
+
+#[pyfunction]
+fn make_indices(sequence: String) -> (usize, usize) {
+    let start: usize = sequence
+        .chars()
+        .enumerate()
+        .filter(|(_,bp)| *bp != '-')
+        .map(|(index, _)|index)
+        .take(1)
+        .next()
+        .unwrap();
+    let delta_end: usize = sequence
+        .chars()
+        .rev()
+        .enumerate()
+        .filter(|(_,bp)| *bp != '-')
+        .map(|(index, _)|index)
+        .take(1)
+        .next()
+        .unwrap();
+    (start, sequence.len()-delta_end)
+}
 
 
 #[pyfunction]
@@ -160,17 +183,26 @@ fn seqs_within_distance(first: &str, second: &str, max_distance: u32) -> bool {
     true
 } 
 
-//#[pyfunction]
-//fn str_hamming(first: &str, second: &str, max_distance: u32) -> bool {
-    //let distance = hamming(first, second).unwrap_or(2) as u32;
-    //distance <= max_distance
-//}
 
 fn not_skip_character(character: u8) -> bool {
     const HYPHEN: u8 = 45;
     const ASTERISK: u8 = 42;
     character != HYPHEN && character != ASTERISK
 }
+
+#[pyfunction]
+fn make_ref_distance_array_blosum62(seq1: &str, seq2: &str) -> Vec<i32> {
+    let result = seq1.as_bytes().iter()
+        .zip(seq2.as_bytes().iter())
+        .filter(|(a, b)| **a != 45 && **b != 45)
+        .scan(0, |state, (a, b)| {
+            *state = *state + blosum62(*a, *b);
+            Some(*state)
+        })
+        .collect();
+    result
+    }
+
 
 #[pyfunction]
 fn blosum62_distance(one: String, two: String) -> PyResult<f64>{
@@ -212,6 +244,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cluster_distance_filter, m)?)?;
     m.add_function(wrap_pyfunction!(seqs_within_distance, m)?)?;
     m.add_function(wrap_pyfunction!(find_references_and_candidates, m)?)?;
+    m.add_function(wrap_pyfunction!(make_indices, m)?)?;
 
     Ok(())
 }

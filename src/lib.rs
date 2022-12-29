@@ -5,12 +5,16 @@ extern crate hashbrown;
 //extern crate strsim;
 use std::fs::File;
 use std::io::{prelude::*, BufReader};
+use std::sync::Arc;
 //use bio::alphabets::dna::complement;
 use bio::io::fasta;
 use bio::scores::blosum62;
 use hashbrown::{HashMap, HashSet};
+use itertools::Itertools;
 use pyo3::prelude::*;
-// use rayon::prelude::*;
+use rayon::iter::IntoParallelIterator;
+// use rayon::prelude::IntoParallelRefIterator;
+use rayon::prelude::*;
 //use std::collections::{HashMap, HashSet};
 //use strsim::hamming;
 
@@ -49,14 +53,12 @@ fn find_references_and_candidates(path: String) -> (Vec<String>, Vec<String>) {
         if reached_candidates {
             candidates.push(line);
         }
+        else if line.starts_with('>') && !line.ends_with('.') {
+            reached_candidates = true;
+            candidates.push(line)
+        }
         else {
-            if line.starts_with('>') && !line.ends_with('.') {
-                reached_candidates = true;
-                candidates.push(line)
-            }
-            else {
-                references.push(line)
-            }
+            references.push(line)
         }
     }
     (references, candidates)
@@ -160,7 +162,7 @@ fn cluster_distance_filter(lines: Vec<&str>) -> Vec<Vec<&str>> {
 #[pyfunction]
 fn batch_reverse_complement(list: Vec<String>) -> Vec<String> {
     list.into_iter()
-        .map(|sequence| bio_revcomp(sequence))
+        .map(bio_revcomp)
         .collect()
 }
 
@@ -197,17 +199,49 @@ fn blosum62_check(a: u8, b: u8) -> i32 {
 }
 
 
-fn make_ref_distance_vector_blosum62(seq1: &str, seq2: &str) -> Vec<i32> {
-    seq1.as_bytes().iter()
+fn self_distance_vector(seq: &str) -> Vec<i32> {
+    seq.as_bytes().iter()
+        .scan(0_i32,|state, bp| {
+            *state += blosum62_check(*bp, *bp);
+            Some(*state)
+        })
+        .collect()
+}
+
+
+fn make_ref_distance_vector_blosum62(seq1: &str, seq2: &str) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    let numerator = seq1.as_bytes().iter()
         .zip(seq2.as_bytes().iter())
         .scan(0, |state, (a, b)| {
             *state += blosum62_check(*a, *b);
             Some(*state)
         })
         // .map(|(a,b)| blosum62(*a, *b))
-        .collect()
+        .collect();
+        (numerator, self_distance_vector(seq1), self_distance_vector(seq2))
 }
 
+
+// fn make_ref_distance_matrix(ref_seq: &str, ref_vector: Arc<Vec<&str>>) -> Vec<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+//     ref_vector
+//         .par_iter()
+//         .map(|ref_seq2| make_ref_distance_vector_blosum62(ref_seq, ref_seq2))
+//         .collect()
+// }
+
+
+fn make_ref_distance_matrix_supervec(refs: Vec<&str>) -> Vec<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+    // let reference_vector = Arc::new(refs);
+    // let ref_matrix: Vec<Vec<Vec<i32>>> = reference_vector.par_iter()
+    //     .map(|(ref_seq)| make_ref_distance_matrix(ref_seq, reference_vector.clone()))
+    //     .collect();
+    // ref_matrix
+    refs.iter()
+        .combinations(2)
+        .par_bridge()
+        .map(|seq_vec| make_ref_distance_vector_blosum62(&seq_vec[0], &seq_vec[1]))
+        .collect()
+}
 
 #[pyfunction]
 fn blosum62_distance(one: String, two: String) -> PyResult<f64>{
@@ -253,3 +287,10 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
 
     Ok(())
 }
+
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//
+//     fn test_ref_distance_array
+// }

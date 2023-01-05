@@ -1,22 +1,19 @@
 extern crate bio;
 extern crate pyo3;
 extern crate hashbrown;
-// extern crate rayon;
-//extern crate strsim;
+
+// use statrs::statistics::OrderStatistics;
+// use statrs::statistics::Data;
 use std::fs::File;
 use std::io::{prelude::*, BufReader};
-use std::sync::Arc;
+// use std::sync::Arc;
 //use bio::alphabets::dna::complement;
 use bio::io::fasta;
 use bio::scores::blosum62;
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
 use pyo3::prelude::*;
-use rayon::iter::IntoParallelIterator;
-// use rayon::prelude::IntoParallelRefIterator;
-use rayon::prelude::*;
-//use std::collections::{HashMap, HashSet};
-//use strsim::hamming;
+// use rayon::prelude::*;
 
 
 // Lifetime annotations for object lifetime c
@@ -199,57 +196,80 @@ fn blosum62_check(a: u8, b: u8) -> i32 {
 }
 
 
-fn self_distance_vector(seq: &str) -> Vec<i32> {
-    seq.as_bytes().iter()
-        .scan(0_i32,|state, bp| {
-            *state += blosum62_check(*bp, *bp);
-            Some(*state)
-        })
-        .collect()
+fn blosum62_self_check(a: u8, b: u8) -> i32 {
+    if a == 45 || b == 45 { return 0_i32; }
+    blosum62(a,a)
 }
 
 
-fn make_ref_distance_vector_blosum62(seq1: &str, seq2: &str) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+fn self_distance_vectors(seq1: &str, seq2: &str) -> (Vec<i32>, Vec<i32>) {
+    (seq1.as_bytes().iter().zip(seq2.as_bytes().iter())
+        .scan(0_i32,|state, (a,b)| {
+            *state += blosum62_self_check(*a, *b);
+            Some(*state)
+        })
+        .collect(),
+        seq2.as_bytes().iter().zip(seq1.as_bytes().iter())
+            .scan(0_i32, | state, (a , b)| {
+                *state += blosum62_self_check(*a, *b);
+                Some(*state)
+            })
+            .collect())
+}
+
+
+#[pyfunction]
+fn make_ref_distance_vector_blosum62(seq1: &str, seq2: &str) -> (Vec<i32>, (Vec<i32>, Vec<i32>)) {
     let numerator = seq1.as_bytes().iter()
         .zip(seq2.as_bytes().iter())
         .scan(0, |state, (a, b)| {
             *state += blosum62_check(*a, *b);
             Some(*state)
         })
-        // .map(|(a,b)| blosum62(*a, *b))
         .collect();
-        (numerator, self_distance_vector(seq1), self_distance_vector(seq2))
+        (numerator, self_distance_vectors(seq1,seq2))
 }
 
 
-// fn make_ref_distance_matrix(ref_seq: &str, ref_vector: Arc<Vec<&str>>) -> Vec<(Vec<i32>, Vec<i32>, Vec<i32>)> {
-//     ref_vector
-//         .par_iter()
-//         .map(|ref_seq2| make_ref_distance_vector_blosum62(ref_seq, ref_seq2))
-//         .collect()
-// }
-
-
-fn make_ref_distance_matrix_supervec(refs: Vec<&str>) -> Vec<(Vec<i32>, Vec<i32>, Vec<i32>)> {
-    // let reference_vector = Arc::new(refs);
-    // let ref_matrix: Vec<Vec<Vec<i32>>> = reference_vector.par_iter()
-    //     .map(|(ref_seq)| make_ref_distance_matrix(ref_seq, reference_vector.clone()))
-    //     .collect();
-    // ref_matrix
+#[pyfunction]
+fn make_ref_distance_matrix_supervector(refs: Vec<&str>) -> Vec<(Vec<i32>, (Vec<i32>, Vec<i32>))> {
     refs.iter()
         .combinations(2)
-        .par_bridge()
+        // .iter()
         .map(|seq_vec| make_ref_distance_vector_blosum62(&seq_vec[0], &seq_vec[1]))
         .collect()
 }
+
+
+fn extract_distance(cross_distance: &Vec<i32>, max_vec1: &Vec<i32>, max_vec2: &Vec<i32>, start_index: usize, stop_index: usize) -> f64 {
+    let denominator = match start_index {
+        0 => std::cmp::max(max_vec1[stop_index-1], max_vec2[stop_index-1]),
+        _ => std::cmp::max(max_vec1[stop_index-1] - max_vec1[start_index-1], max_vec2[stop_index-1] - max_vec2[start_index-1])
+    };
+    let numerator = match start_index {
+        0 => cross_distance[stop_index-1],
+        _ => cross_distance[stop_index-1] - cross_distance[start_index-1]
+    };
+    1.0_f64 - (numerator as f64 / denominator as f64)
+}
+
+
+#[pyfunction]
+fn ref_index_vector (supervector: Vec<(Vec<i32>, (Vec<i32>, Vec<i32>))>, start: usize, end: usize) -> Vec<f64> {
+    supervector.iter()
+        .map(|(cross, (max1, max2))| extract_distance(cross, max1, max2, start, end))
+        .collect()
+}
+
+
 
 #[pyfunction]
 fn blosum62_distance(one: String, two: String) -> PyResult<f64>{
     let first: &[u8] = one.as_bytes();
     let second: &[u8] = two.as_bytes();
-    let mut score: i128 = 0;
-    let mut max_first: i128 = 0;
-    let mut max_second: i128 = 0;
+    let mut score = 0;
+    let mut max_first = 0;
+    let mut max_second = 0;
     let length = first.len();
     let allowed: HashSet<u8> = HashSet::from([65,84,67,71,73,68,82,
         80,87,77,69,81,83,72,86,76,75,70,89,78,88, 90, 74, 66,  79, 85]);
@@ -263,11 +283,14 @@ fn blosum62_distance(one: String, two: String) -> PyResult<f64>{
                 panic!("second[i] {} not in allowed\n{}", second[i] as char, two);
             }
             // println!("score = {}\nmax_first = {}\nmax_second = {}\n first[i] = {}\n second[i] = {}\n",score,max_first,max_second,first[i],second[i]);
-            score += bio::scores::blosum62(first[i], second[i]) as i128;
-            max_first += bio::scores::blosum62(first[i], first[i]) as i128;
-            max_second += bio::scores::blosum62(second[i], second[i]) as i128;
+            score += bio::scores::blosum62(first[i], second[i]);
+            max_first += bio::scores::blosum62(first[i], first[i]);
+            max_second += bio::scores::blosum62(second[i], second[i]);
         }
     };
+    // println!("score: {}", score);
+    // println!("max_first: {}", max_first);
+    // println!("max_second: {}", max_second);
     let maximum_score = std::cmp::max(max_first, max_second);
     Ok(1.0 - (score as f64 / maximum_score as f64))
 }
@@ -284,6 +307,9 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(seqs_within_distance, m)?)?;
     m.add_function(wrap_pyfunction!(find_references_and_candidates, m)?)?;
     m.add_function(wrap_pyfunction!(make_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(make_ref_distance_matrix_supervector, m)?)?;
+    m.add_function(wrap_pyfunction!(make_ref_distance_vector_blosum62, m)?)?;
+    m.add_function(wrap_pyfunction!(ref_index_vector, m)?)?;
 
     Ok(())
 }

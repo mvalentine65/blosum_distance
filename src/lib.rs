@@ -1,7 +1,12 @@
+#![allow(unused)]
+
 extern crate bio;
 extern crate pyo3;
 extern crate hashbrown;
 
+
+use core::num;
+use std::borrow::BorrowMut;
 // use statrs::statistics::OrderStatistics;
 // use statrs::statistics::Data;
 use std::fs::File;
@@ -10,9 +15,13 @@ use std::io::{prelude::*, BufReader};
 //use bio::alphabets::dna::complement;
 use bio::io::fasta;
 use bio::scores::blosum62;
-use hashbrown::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use itertools::Itertools;
 use pyo3::prelude::*;
+use std::io::IoSliceMut;
+use proc_utils::{add_x_members, repeat_across_x_times, repeat_across_x_times_and_create_struct};
+use std::ptr::addr_of_mut;
+
 // use rayon::prelude::*;
 
 
@@ -35,6 +44,51 @@ use pyo3::prelude::*;
 //     sequence: &'c str,
 //     dupe_count: u8,
 // }
+
+
+macro_rules! str_make  {
+    ($s:literal) => {
+        String::from($s)
+    };
+}
+
+
+macro_rules! hm_make {
+    (
+        $key_type:ty, 
+        $value_type:ty, 
+        $($key:expr => $value:expr), *) => {
+            {
+                let mut hm = HashMap::<$key_type, $value_type>::new();
+
+                $ 
+                (
+                    hm.insert($key, $value);
+                )
+                *
+
+                hm
+            }
+            
+    };
+    (
+        $key_type:ty, 
+        $value_type:ty, 
+        $($key:literal => $value:literal), *) => {
+            {
+                let mut hm = HashMap::<$key_type, $value_type>::new();
+
+                $ 
+                (
+                    hm.insert($key, $value);
+                )
+                *
+
+                hm
+            }
+            
+    };
+}
 
 
 #[pyfunction]
@@ -182,6 +236,123 @@ fn seqs_within_distance(first: &str, second: &str, max_distance: u32) -> bool {
     true
 } 
 
+#[add_x_members(buff_*: Vec<u8>, => 256)]
+struct Buffers { }
+
+
+impl Buffers {
+    pub fn new() -> Self {
+        repeat_across_x_times! {
+            let buff_* = vec![0u8; 8192]; @ 256
+        };
+
+        repeat_across_x_times_and_create_struct!(
+            Self { * } @ buff_*, @ 256
+        )
+    }
+}
+
+struct FastLineReader {
+    bufreader: BufReader<File>,
+    iovecs: Vec<IoSliceMut<'static>>,
+    str_buffers: Vec<String>,
+    remaining: usize,
+}
+
+impl FastLineReader {
+    pub fn new(path: String, buffers_ptr: *mut Buffers) -> Self {
+        println!("Starting new FastLineReader instance on path {path}");
+        
+        let buffers: &mut Buffers= unsafe { &mut *buffers_ptr };
+
+        let bufreader = BufReader::new(File::open(path).expect("Error opening output file"));
+
+        let mut iovecs: Vec<IoSliceMut<'static>> = Vec::new();
+
+        repeat_across_x_times! {
+            iovecs.push(IoSliceMut::new(&mut buffers.buff_*)); @ 256
+        };
+        
+        let str_buffers = vec![str_make!(""); 256];
+
+        Self { bufreader, iovecs, str_buffers, remaining: 0usize }
+
+    }
+    
+    pub fn fill_and_get_lines(&mut self, index: usize) -> Vec<String> {
+        let mut vec_str = Vec::<String>::new();
+        let iovec = self.iovecs.get(index).expect("Index exceeds for iovecs");
+        let buffer = self.str_buffers.get_mut(index).expect("Error getting string buffer");
+
+        iovec
+            .iter()
+            .cloned()
+            .for_each(|c| {
+                if c == 10 {
+                    vec_str.push(buffer.clone());
+                    buffer.clear();
+                }
+
+                buffer.push(c as char);
+            });
+
+        vec_str
+    }
+
+    pub fn read_batch(&mut self) -> Vec<String> {
+        self.remaining = self.bufreader.read_vectored(&mut self.iovecs).expect("Error with Vector Read");
+        
+        let ret_list = (0..256)
+                                .into_iter()
+                                .map(|i| self.fill_and_get_lines(i))
+                                .flatten()
+                                .collect::<Vec<_>>();
+                                
+
+
+        ret_list
+    }
+}
+
+#[pyclass]
+struct VecIO {
+    freader: Option<FastLineReader>,
+    buffers: Buffers,
+}
+
+#[pymethods]
+impl VecIO {
+    #[new]
+    pub fn new() -> Self {
+        Self { buffers: Buffers::new(), freader: None }
+    }
+
+    pub fn init(&mut self, path: String) {
+        let buffers_ptr: *mut Buffers = addr_of_mut!(self.buffers);
+
+        self.freader = Some(FastLineReader::new(path, buffers_ptr));
+    }
+    
+    pub fn is_done(&mut self) -> bool {
+        let derefed = self.freader.as_mut().unwrap();
+
+        derefed.remaining != 8192
+    }
+    
+    pub fn get_next_batch(&mut self) -> Vec<String> {
+        let derefed = self.freader.as_mut().unwrap();
+
+        derefed.read_batch()
+    }
+}
+
+#[pyfunction]
+fn get_vecio(path: String) -> VecIO {
+    let mut vio = VecIO::new();
+    vio.init(path);
+
+    vio
+}
 
 fn not_skip_character(character: u8) -> bool {
     const HYPHEN: u8 = 45;
@@ -296,6 +467,7 @@ fn blosum62_distance(one: String, two: String) -> PyResult<f64>{
 }
 
 
+
 // A Python module implemented in Rust.
 #[pymodule]
 fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
@@ -310,6 +482,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(make_ref_distance_matrix_supervector, m)?)?;
     m.add_function(wrap_pyfunction!(make_ref_distance_vector_blosum62, m)?)?;
     m.add_function(wrap_pyfunction!(ref_index_vector, m)?)?;
+    m.add_function(wrap_pyfunction!(get_vecio, m)?)?;
 
     Ok(())
 }

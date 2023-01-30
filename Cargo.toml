@@ -1,6 +1,6 @@
 [package]
 name = "phymmr_tools"
-version = "0.3.2"
+version = "0.3.4"
 edition = "2021"
 exclude = ["*.fa,","*.fa/","*.fa.zip","*.txt","*.csv",".idea","test*.py"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.16.3", features = ["extension-module"] }
 bio = "*"
+bytelines = "*"
 hashbrown = {version = "0.12.3", features = ["rayon"]}
 itertools = "0.10.5"
 #rayon = "1.5.3"

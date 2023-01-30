@@ -4,6 +4,7 @@ extern crate bio;
 extern crate hashbrown;
 extern crate pyo3;
 
+use bytelines::*;
 use core::num;
 use std::borrow::BorrowMut;
 // use statrs::statistics::OrderStatistics;
@@ -86,6 +87,46 @@ macro_rules! hm_make {
     };
 }
 
+
+#[pyclass]
+struct DiamondReader{
+    // file: File,
+    reader: BufReader<File>,
+    // output: Vec<Vec<u8>>,
+}
+#[pymethods]
+impl DiamondReader {
+#[new]
+    fn new(path: &str) -> Self {
+        let mut reader = BufReader::new(File::open(path).expect("Cannot open diamond file."));
+        DiamondReader {
+            reader,
+        }
+    }
+
+    fn readline(&mut self) -> Option<Vec<String>> {
+        let mut vec: Vec<String> = Vec::with_capacity(11);
+        // check for EOF. If size returned is 0, EOF was hit.
+        let mut word = vec![];
+        let eof = self.reader.read_until(b'\t', &mut word).expect("Cant read opened diamond file.");
+        if eof == 0 {return None;}
+        word.pop();
+        vec.push(String::from_utf8(word).expect("Invalid byte in diamond file"));
+        for _ in 0..9 {
+            word = vec![];
+            self.reader.read_until(b'\t', &mut word).expect("Cant read opened diamond file.");
+            word.pop();
+            vec.push(String::from_utf8(word).expect("Invalid byte in diamond file"))
+        };
+        word = vec![];
+        self.reader.read_until(b'\n',  &mut word).expect("Cant read opened diamond file.");
+        word.pop();
+        vec.push(String::from_utf8(word).expect("Invalid byte in diamond file"));
+        Some(vec)
+    }
+
+}
+
 #[pyfunction]
 fn find_references_and_candidates(path: String) -> (Vec<String>, Vec<String>) {
     let file = File::open(path).unwrap();
@@ -107,6 +148,7 @@ fn find_references_and_candidates(path: String) -> (Vec<String>, Vec<String>) {
     }
     (references, candidates)
 }
+
 
 #[pyfunction]
 fn make_indices(sequence: String) -> (usize, usize) {
@@ -479,7 +521,7 @@ fn ref_index_vector(
 }
 
 #[pyfunction]
-fn blosum62_distance(one: String, two: String) -> PyResult<f64> {
+fn blosum62_distance(one: String, two: String) -> f64 {
     let first: &[u8] = one.as_bytes();
     let second: &[u8] = two.as_bytes();
     let mut score = 0;
@@ -488,28 +530,39 @@ fn blosum62_distance(one: String, two: String) -> PyResult<f64> {
     let length = first.len();
     let allowed: HashSet<u8> = HashSet::from([
         65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
-        66, 79, 85,
+        66, 79, 85,42
     ]);
     for i in 0..length {
-        // if !(first[i] == HYPHEN || second[i] == HYPHEN) {
-        if not_skip_character(first[i]) && not_skip_character(second[i]) {
-            if !(allowed.contains(&first[i])) {
-                panic!("first[i]  {} not in allowed\n{}", first[i] as char, one);
+        let mut char1 = first[i];
+        let mut char2 = second[i];
+        if first[i] == 45 {
+            char1 = b'*';
             }
-            if !(allowed.contains(&second[i])) {
-                panic!("second[i] {} not in allowed\n{}", second[i] as char, two);
+        if second[i] == 45 {
+            char2 = b'*';
+        }
+        // if not_skip_character(first[i]) && not_skip_character(second[i]) {
+            if !(allowed.contains(&char1)) {
+                panic!("first[i]  {} not in allowed\n{}", char1 as char, one);
+            }
+            if !(allowed.contains(&char2)) {
+                panic!("second[i] {} not in allowed\n{}", char2 as char, two);
             }
             // println!("score = {}\nmax_first = {}\nmax_second = {}\n first[i] = {}\n second[i] = {}\n",score,max_first,max_second,first[i],second[i]);
-            score += bio::scores::blosum62(first[i], second[i]);
-            max_first += bio::scores::blosum62(first[i], first[i]);
-            max_second += bio::scores::blosum62(second[i], second[i]);
-        }
+            score += bio::scores::blosum62(char1, char2);
+            max_first += bio::scores::blosum62(char1, char1);
+            max_second += bio::scores::blosum62(char2, char2);
+        // }
+        // else if not_skip_character(first[i]) {
+            // second[i] is a hyphen, penalty of -4
+        // }
     }
     // println!("score: {}", score);
     // println!("max_first: {}", max_first);
     // println!("max_second: {}", max_second);
+    // (score, max_first, max_second)
     let maximum_score = std::cmp::max(max_first, max_second);
-    Ok(1.0 - (score as f64 / maximum_score as f64))
+    1.0_f64 - (score as f64 / maximum_score as f64)
 }
 
 // A Python module implemented in Rust.
@@ -527,13 +580,17 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(make_ref_distance_vector_blosum62, m)?)?;
     m.add_function(wrap_pyfunction!(ref_index_vector, m)?)?;
     m.add_function(wrap_pyfunction!(get_vecio, m)?)?;
-
+    m.add_class::<DiamondReader>()?;
     Ok(())
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     fn test_ref_distance_array
-// }
+#[cfg(test)]
+mod tests {
+    use crate::blosum62_distance;
+
+    #[test]
+    fn test_blosum62_gap_penalty() {
+        let result = blosum62_distance(String::from("A"),String::from("-"));
+        assert_eq!(result, 2.0)
+    }
+}

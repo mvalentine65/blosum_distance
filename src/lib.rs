@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 extern crate bio;
-extern crate hashbrown;
+// extern crate hashbrown;
 extern crate pyo3;
 
 use bytelines::*;
@@ -21,6 +21,8 @@ use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::IoSliceMut;
 use std::ptr::addr_of_mut;
+// use bio::alignment::distance::hamming;
+use bio::alignment::distance::simd::hamming;
 
 // use rayon::prelude::*;
 
@@ -171,6 +173,7 @@ fn make_indices(sequence: String) -> (usize, usize) {
         .unwrap();
     (start, sequence.len() - delta_end)
 }
+
 
 #[pyfunction]
 fn fasta_reader(path: String) -> Vec<String> {
@@ -520,6 +523,25 @@ fn ref_index_vector(
         .collect()
 }
 
+
+fn find_indices(sequence: &[u8], gap: u8) -> (usize, usize) {
+    // let start = sequence.find(|c: char| c != '-').unwrap();
+    // let end = sequence.rfind(|c: char| c != '-').unwrap();
+    (sequence.iter().position(|c: &u8| *c != gap).unwrap(), sequence.iter().rposition(|c: &u8| *c != gap).unwrap()+1)
+}
+
+
+#[pyfunction]
+fn constrained_distance(consensus: &[u8], candidate: &[u8]) -> u64 {
+    let (start, end) = find_indices(candidate,b'-');
+    let con_slice = &consensus[start..end];
+    let can_slice = &candidate[start..end];
+    // let mask = &vec![b'X';con_slice.len()];
+    // hamming(con_slice, can_slice) - (end - start) as u64 + hamming(con_slice, mask)
+    hamming(con_slice, can_slice) - con_slice.iter().filter(|c: &&u8| **c == b'X').count() as u64
+
+}
+
 #[pyfunction]
 fn blosum62_distance(one: String, two: String) -> f64 {
     let first: &[u8] = one.as_bytes();
@@ -580,6 +602,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(make_ref_distance_vector_blosum62, m)?)?;
     m.add_function(wrap_pyfunction!(ref_index_vector, m)?)?;
     m.add_function(wrap_pyfunction!(get_vecio, m)?)?;
+    m.add_function(wrap_pyfunction!(constrained_distance, m)?)?;
     m.add_class::<DiamondReader>()?;
     Ok(())
 }

@@ -577,15 +577,15 @@ fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
         }
     }
     let mut output = Vec::<u8>::with_capacity(total_at_position.len());
-    for (total, counts) in total_at_position.iter().zip(counts_at_position.iter()) {
-        if *total == 0 {
-            output.push(b'-');
-            continue;
+    for ((i, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
+        if total == 0 {
+                output.push(b'X');
+                continue;
         } // if no characters at position, continue
         let max_count:u32 = 0;
         let mut winner = b'X';  // default to X if no winner found
         for (index, count) in enumerate(counts) {
-            if *count as f64 / *total as f64 > threshold {
+            if *count as f64 / total as f64 > threshold {
                 if *count > max_count {
                     max_count == *count;
                     if index != 26 { winner = index as u8 +ASCII_OFFSET;}

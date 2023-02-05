@@ -15,7 +15,7 @@ use std::io::{prelude::*, BufReader};
 //use bio::alphabets::dna::complement;
 use bio::io::fasta;
 use bio::scores::blosum62;
-use itertools::Itertools;
+use itertools::{enumerate, Itertools};
 use proc_utils::{add_x_members, repeat_across_x_times, repeat_across_x_times_and_create_struct};
 use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -532,15 +532,72 @@ fn find_indices(sequence: &[u8], gap: u8) -> (usize, usize) {
 
 
 #[pyfunction]
-fn constrained_distance(consensus: &[u8], candidate: &[u8]) -> u64 {
+fn constrained_distance_bytes(consensus: &[u8], candidate: &[u8]) -> u64 {
     let (start, end) = find_indices(candidate,b'-');
     let con_slice = &consensus[start..end];
     let can_slice = &candidate[start..end];
-    // let mask = &vec![b'X';con_slice.len()];
-    // hamming(con_slice, can_slice) - (end - start) as u64 + hamming(con_slice, mask)
     hamming(con_slice, can_slice) - con_slice.iter().filter(|c: &&u8| **c == b'X').count() as u64
-
 }
+
+
+#[pyfunction]
+fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
+    let con = consensus.as_bytes();
+    let can = candidate.as_bytes();
+    let (start, end) = find_indices(can, b'-');
+    hamming(&con[start..end], &can[start..end]) - con.iter().filter(|c: &&u8| **c == b'X').count() as u64
+}
+
+
+#[pyfunction]
+fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
+    let first = &sequences[0];
+    let mut total_at_position = vec![0_u32;first.len()];
+    let mut counts_at_position = vec![[0_u32;27];first.len()];
+    const ASCII_OFFSET: u8= 65;
+    const HYPHEN:u8= 45;
+    const ASTERISK:u8= 42;
+    let mut min = usize::MAX;
+    let mut max:usize = 0;
+    for sequence in sequences.iter() {
+        let seq = sequence.as_bytes();
+        let (start, end) = find_indices(seq, b'-');
+        if start < min {min == start;}
+        if end > max {max == end;}
+        let seq = &seq[..];
+        for index in start..end {
+            if index == seq.len() {continue;}
+            total_at_position[index] += 1;
+            if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
+                // if seq[index]-ASCII_OFFSET == 233 {println!("{}",seq[index]);}
+                counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += 1;
+            } else {
+                counts_at_position[index][26] += 1;
+            }
+        }
+    }
+    let mut output = Vec::<u8>::with_capacity(total_at_position.len());
+    for (total, counts) in total_at_position.iter().zip(counts_at_position.iter()) {
+        if *total == 0 {
+            output.push(b'-');
+            continue;
+        } // if no characters at position, continue
+        let max_count:u32 = 0;
+        let mut winner = b'X';  // default to X if no winner found
+        for (index, count) in enumerate(counts) {
+            if *count as f64 / *total as f64 > threshold {
+                if *count > max_count {
+                    max_count == *count;
+                    if index != 26 { winner = index as u8 +ASCII_OFFSET;}
+                    else {winner = HYPHEN;}
+                }
+            }
+        }
+        output.push(winner);
+    }
+    String::from_utf8(output).unwrap()
+}
+
 
 #[pyfunction]
 fn blosum62_distance(one: String, two: String) -> f64 {
@@ -603,6 +660,9 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ref_index_vector, m)?)?;
     m.add_function(wrap_pyfunction!(get_vecio, m)?)?;
     m.add_function(wrap_pyfunction!(constrained_distance, m)?)?;
+    m.add_function(wrap_pyfunction!(constrained_distance_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(dumb_consensus, m)?)?;
+
     m.add_class::<DiamondReader>()?;
     Ok(())
 }

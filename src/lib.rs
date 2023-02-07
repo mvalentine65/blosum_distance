@@ -542,10 +542,19 @@ fn constrained_distance_bytes(consensus: &[u8], candidate: &[u8]) -> u64 {
 
 #[pyfunction]
 fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
-    let con = consensus.as_bytes();
     let can = candidate.as_bytes();
-    let (start, end) = find_indices(can, b'-');
-    hamming(&con[start..end], &can[start..end]) - con.iter().filter(|c: &&u8| **c == b'X').count() as u64
+    let con = consensus.as_bytes();
+
+    let (start, end) = find_indices(candidate.as_bytes(), b'-');
+    let con = &con[start..end];
+    let can = &can[start..end];
+    let hamming_distance = hamming(con, can);
+    let blank_count = con.iter().filter(|c: &&u8| **c == b'X').count() as u64;
+    return match hamming_distance > blank_count {
+        true => hamming_distance - blank_count,
+        false => 0
+    };
+    // hamming(&con[start..end], &can[start..end]) - con.iter().filter(|c: &&u8| **c == b'X').count() as u64
 }
 
 

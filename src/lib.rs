@@ -523,13 +523,14 @@ fn ref_index_vector(
         .collect()
 }
 
-
 fn find_indices(sequence: &[u8], gap: u8) -> (usize, usize) {
-    // let start = sequence.find(|c: char| c != '-').unwrap();
-    // let end = sequence.rfind(|c: char| c != '-').unwrap();
-    (sequence.iter().position(|c: &u8| *c != gap).unwrap(), sequence.iter().rposition(|c: &u8| *c != gap).unwrap()+1)
+    (sequence.iter().position(|c: &u8| *c != gap).unwrap_or(0), sequence.iter().rposition(|c: &u8| *c != gap).unwrap_or(0)+1)
 }
 
+#[pyfunction]
+fn find_index_pair(sequence: &str, gap: char) -> (usize, usize) {
+    find_indices(sequence.as_bytes(), gap as u8)
+}
 
 #[pyfunction]
 fn constrained_distance_bytes(consensus: &[u8], candidate: &[u8]) -> u64 {
@@ -539,6 +540,11 @@ fn constrained_distance_bytes(consensus: &[u8], candidate: &[u8]) -> u64 {
     hamming(con_slice, can_slice) - con_slice.iter().filter(|c: &&u8| **c == b'X').count() as u64
 }
 
+
+#[pyfunction]
+fn has_data(sequence: &str, gap: char) -> bool{
+    sequence.as_bytes().iter().any(|x| *x != gap as u8)
+}
 
 #[pyfunction]
 fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
@@ -671,6 +677,8 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(constrained_distance, m)?)?;
     m.add_function(wrap_pyfunction!(constrained_distance_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(dumb_consensus, m)?)?;
+    m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
+    m.add_function(wrap_pyfunction!(has_data, m)?)?;
 
     m.add_class::<DiamondReader>()?;
     Ok(())

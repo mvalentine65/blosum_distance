@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::to_string;
 
 #[pyclass]
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -43,7 +44,7 @@ pub struct Hit {
     #[pyo3(get, set)]
     evalue: f64,
     #[pyo3(get, set)]
-    score: f64,
+    score: f32,
     #[pyo3(get, set)]
     qstart: u16,
     #[pyo3(get, set)]
@@ -53,7 +54,7 @@ pub struct Hit {
     #[pyo3(get, set)]
     send: u16,
     #[pyo3(get, set)]
-    pident: f64,
+    pident: f32,
     #[pyo3(get, set)]
     reftaxon: String,
     #[pyo3(get, set)]
@@ -107,7 +108,7 @@ impl Hit {
             target: ref_header.clone(),
             gene: gene,
             reftaxon: reftaxon,
-            score: score.parse::<f64>().unwrap(),
+            score: score.parse::<f32>().unwrap(),
             qstart: _qstart,
             qend: _qend,
             evalue: evaule.parse::<f64>().unwrap(),
@@ -116,7 +117,7 @@ impl Hit {
             sstart: sstart,
             send: send,
             seq: None,
-            pident: pident.parse::<f64>().unwrap(),
+            pident: pident.parse::<f32>().unwrap(),
             reference_hits: vec![ReferenceHit {
                 target: ref_header,
                 sstart,

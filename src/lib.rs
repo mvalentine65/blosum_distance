@@ -1,15 +1,16 @@
-#![allow(unused)]
-
+// #![allow(unused)]
+mod hit;
 extern crate bio;
 
 extern crate pyo3;
 
 use bio::alignment::distance::simd::hamming;
-use bio::io::fasta;
 use bio::scores::blosum62;
 use itertools::{enumerate, Itertools};
+use hit::Hit;
+use hit::ReferenceHit;
 use pyo3::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{prelude::*, BufReader};
 
@@ -280,6 +281,8 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dumb_consensus, m)?)?;
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
+    m.add_class::<Hit>()?;
+    m.add_class::<ReferenceHit>()?;
     Ok(())
 }
 

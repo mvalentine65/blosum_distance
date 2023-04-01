@@ -37,7 +37,7 @@ pub struct Hit {
     #[pyo3(get, set)]
     target: String,
     #[pyo3(get, set)]
-    gene: String,
+    gene: Option<String>,
     #[pyo3(get, set)]
     frame: i8,
     #[pyo3(get, set)]
@@ -55,7 +55,7 @@ pub struct Hit {
     #[pyo3(get, set)]
     pident: f32,
     #[pyo3(get, set)]
-    reftaxon: String,
+    reftaxon: Option<String>,
     #[pyo3(get, set)]
     kick: bool,
     #[pyo3(get, set)]
@@ -82,8 +82,6 @@ impl Hit {
         sstart: String,
         send: String,
         pident: String,
-        gene: String,
-        reftaxon: String,
     ) -> Self {
         let _qstart;
         let _qend;
@@ -105,8 +103,8 @@ impl Hit {
         Self {
             header: header,
             target: ref_header.clone(),
-            gene: gene,
-            reftaxon: reftaxon,
+            gene: None,
+            reftaxon: None,
             score: score.parse::<f32>().unwrap(),
             qstart: _qstart,
             qend: _qend,

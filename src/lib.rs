@@ -1,4 +1,3 @@
-// #![allow(unused)]
 mod hit;
 extern crate bio;
 
@@ -47,11 +46,11 @@ fn bio_revcomp(sequence: String) -> String {
     String::from_utf8(bio::alphabets::dna::revcomp(sequence.into_bytes())).unwrap()
 }
 
-fn not_skip_character(character: u8) -> bool {
-    const HYPHEN: u8 = 45;
-    const ASTERISK: u8 = 42;
-    character != HYPHEN && character != ASTERISK
-}
+// fn not_skip_character(character: u8) -> bool {
+//     const HYPHEN: u8 = 45;
+//     const ASTERISK: u8 = 42;
+//     character != HYPHEN && character != ASTERISK
+// }
 
 fn blosum62_check(a: u8, b: u8) -> i32 {
     if a == 45 || b == 45 {
@@ -177,10 +176,10 @@ fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
     let can = &can[start..end];
     let hamming_distance = hamming(con, can);
     let blank_count = con.iter().filter(|c: &&u8| **c == b'X').count() as u64;
-    return match hamming_distance > blank_count {
+    match hamming_distance > blank_count {
         true => hamming_distance - blank_count,
         false => 0
-    };
+    }
 }
 
 
@@ -197,9 +196,9 @@ fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
     for sequence in sequences.iter() {
         let seq = sequence.as_bytes();
         let (start, end) = find_indices(seq, b'-');
-        if start < min {min == start;}
-        if end > max {max == end;}
-        let seq = &seq[..];
+        if start < min {min = start;}
+        if end > max {max = end;}
+        // let seq = &seq[..];
         for index in start..end {
             if index == seq.len() {continue;}
             total_at_position[index] += 1;
@@ -212,17 +211,17 @@ fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
         }
     }
     let mut output = Vec::<u8>::with_capacity(total_at_position.len());
-    for ((i, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
+    for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
         if total == 0 {
                 output.push(b'X');
                 continue;
         } // if no characters at position, continue
-        let max_count:u32 = 0;
+        let mut max_count:u32 = 0;
         let mut winner = b'X';  // default to X if no winner found
         for (index, count) in enumerate(counts) {
             if *count as f64 / total as f64 > threshold {
                 if *count > max_count {
-                    max_count == *count;
+                    max_count = *count;
                     if index != 26 { winner = index as u8 +ASCII_OFFSET;}
                     else {winner = HYPHEN;}
                 }

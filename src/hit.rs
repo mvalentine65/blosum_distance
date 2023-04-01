@@ -5,18 +5,15 @@ use serde::Serialize;
 #[pyclass]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReferenceHit {
-    #[pyo3(get, set)]
     target: String,
-    #[pyo3(get, set)]
-    sstart: u16,
-    #[pyo3(get, set)]
-    send: u16,
+    sstart: i32,
+    send: i32,
 }
 
 #[pymethods]
 impl ReferenceHit {
     #[new]
-    fn new(target: String, sstart: u16, send: u16) -> Self {
+    fn new(target: String, sstart: i32, send: i32) -> Self {
         Self {
             target,
             sstart,
@@ -45,13 +42,13 @@ pub struct Hit {
     #[pyo3(get, set)]
     score: f32,
     #[pyo3(get, set)]
-    qstart: u16,
+    qstart: i16,
     #[pyo3(get, set)]
-    qend: u16,
+    qend: i16,
     #[pyo3(get, set)]
-    sstart: u16,
+    sstart: i32,
     #[pyo3(get, set)]
-    send: u16,
+    send: i32,
     #[pyo3(get, set)]
     pident: f32,
     #[pyo3(get, set)]
@@ -61,7 +58,7 @@ pub struct Hit {
     #[pyo3(get, set)]
     seq: Option<String>,
     #[pyo3(get, set)]
-    length: u16,
+    length: i32,
     #[pyo3(get, set)]
     full_header: String,
     #[pyo3(get, set)]
@@ -74,30 +71,30 @@ impl Hit {
     fn new(
         header: String,
         ref_header: String,
-        frame: String,
-        evaule: String,
-        score: String,
-        qstart: String,
-        qend: String,
-        sstart: String,
-        send: String,
-        pident: String,
+        frame: i8,
+        evaule: f64,
+        score: f32,
+        qstart: i16,
+        qend: i16,
+        sstart: i32,
+        send: i32,
+        pident: f32,
     ) -> Self {
         let _qstart;
         let _qend;
         let _full_header;
-        let frame = frame.parse::<i8>().unwrap();
-        let sstart = sstart.parse::<u16>().unwrap();
-        let send= send.parse::<u16>().unwrap();
+        let frame = frame;
+        let sstart = sstart;
+        let send = send;
         if frame >= 0 {
             // normal values
-            _qstart = qstart.parse::<u16>().unwrap();
-            _qend = qend.parse::<u16>().unwrap();
+            _qstart = qstart;
+            _qend = qend;
             _full_header = format!("{}|[translate({})]", header, frame);
         } else {
             // frame < 0, so reverse and mark as revcomp
-            _qstart = qend.parse::<u16>().unwrap();
-            _qend = qstart.parse::<u16>().unwrap();
+            _qstart = qend;
+            _qend = qstart;
             _full_header = format!("{}|[revcomp]:[translate({})]", header, frame.abs());
         };
         Self {
@@ -105,25 +102,26 @@ impl Hit {
             target: ref_header.clone(),
             gene: None,
             reftaxon: None,
-            score: score.parse::<f32>().unwrap(),
+            score: score,
             qstart: _qstart,
             qend: _qend,
-            evalue: evaule.parse::<f64>().unwrap(),
+            evalue: evaule,
             kick: false,
             frame: frame,
             sstart: sstart,
             send: send,
             seq: None,
-            pident: pident.parse::<f32>().unwrap(),
+            pident: pident,
             reference_hits: vec![ReferenceHit {
                 target: ref_header,
                 sstart,
                 send,
             }],
-            length: _qend - _qstart + 1,
+            length: _qend as i32 - _qstart as i32 + 1,
             full_header: _full_header,
         }
     }
+
 
     fn convert_reference_hits(&self) -> Vec<String> {
         self.reference_hits

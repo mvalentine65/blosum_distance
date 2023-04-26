@@ -8,6 +8,7 @@ use bio::scores::blosum62;
 use itertools::{enumerate, Itertools};
 use hit::Hit;
 use hit::ReferenceHit;
+// use hit::hit_from_series;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
@@ -268,6 +269,42 @@ fn blosum62_distance(one: String, two: String) -> f64 {
     1.0_f64 - (score as f64 / maximum_score as f64)
 }
 
+
+#[pyfunction]
+fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
+    let cand_bytes: &[u8] = candidate.as_bytes();
+    let ref_bytes: &[u8] = reference.as_bytes();
+    let mut score = 0;
+    let mut max_first = 0;
+    let mut max_second = 0;
+    let length = cand_bytes.len();
+    let allowed: HashSet<u8> = HashSet::from([
+        65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
+        66, 79, 85,42
+    ]);
+    for i in 0..length {
+        let mut char1 = cand_bytes[i];
+        let char2 = ref_bytes[i];
+        if cand_bytes[i] == 45 {
+            char1 = b'*';
+        }
+        if ref_bytes[i] == 45 {
+            continue;
+        }
+        if !(allowed.contains(&char1)) {
+            panic!("first[i]  {} not in allowed\n{}", char1 as char, candidate);
+        }
+        if !(allowed.contains(&char2)) {
+            panic!("second[i] {} not in allowed\n{}", char2 as char, reference);
+        }
+        score += bio::scores::blosum62(char1, char2);
+        max_first += bio::scores::blosum62(char1, char1);
+        max_second += bio::scores::blosum62(char2, char2);
+    }
+    let maximum_score = std::cmp::max(max_first, max_second);
+    1.0_f64 - (score as f64 / maximum_score as f64)
+}
+
 // A Python module implemented in Rust.
 #[pymodule]
 fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
@@ -282,8 +319,11 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;
+    // m.add_function(wrap_pyfunction!(hit_from_series, m)?)?;
+
     Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {

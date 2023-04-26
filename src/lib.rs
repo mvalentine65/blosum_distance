@@ -317,6 +317,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dumb_consensus, m)?)?;
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
+    m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference,m)?)?;
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;
     // m.add_function(wrap_pyfunction!(hit_from_series, m)?)?;

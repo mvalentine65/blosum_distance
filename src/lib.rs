@@ -269,6 +269,41 @@ fn blosum62_distance(one: String, two: String) -> f64 {
     1.0_f64 - (score as f64 / maximum_score as f64)
 }
 
+#[pyfunction]
+fn blosum62_distance_ignore_columns(one: String, two: String, ignored: HashSet<usize>) -> f64 {
+    let first: &[u8] = one.as_bytes();
+    let second: &[u8] = two.as_bytes();
+    let mut score = 0;
+    let mut max_first = 0;
+    let mut max_second = 0;
+    let length = first.len();
+    let allowed: HashSet<u8> = HashSet::from([
+        65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
+        66, 79, 85,42
+    ]);
+    for i in 0..length {
+        if ignored.contains(&i){ continue; }
+        let mut char1 = first[i];
+        let mut char2 = second[i];
+        if first[i] == 45 {
+            char1 = b'*';
+        }
+        if second[i] == 45 {
+            char2 = b'*';
+        }
+        if !(allowed.contains(&char1)) {
+            panic!("first[i]  {} not in allowed\n{}", char1 as char, one);
+        }
+        if !(allowed.contains(&char2)) {
+            panic!("second[i] {} not in allowed\n{}", char2 as char, two);
+        }
+        score += bio::scores::blosum62(char1, char2);
+        max_first += bio::scores::blosum62(char1, char1);
+        max_second += bio::scores::blosum62(char2, char2);
+    }
+    let maximum_score = std::cmp::max(max_first, max_second);
+    1.0_f64 - (score as f64 / maximum_score as f64)
+}
 
 #[pyfunction]
 fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
@@ -318,6 +353,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference,m)?)?;
+    m.add_function(wrap_pyfunction!(blosum62_distance_ignore_columns, m)?)?;
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;
     // m.add_function(wrap_pyfunction!(hit_from_series, m)?)?;

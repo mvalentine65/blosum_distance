@@ -1,8 +1,9 @@
 [package]
 name = "phymmr_tools"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2021"
-exclude = ["*.fa,","*.fa/","*.fa.zip","*.txt","*.csv",".idea","test*.py",'*.json','docker', 'phymmr','PhyMMR','*.tsv']
+#exclude = ["*.fa,","*.fa/","*.fa.zip","*.txt","*.csv",".idea","test*.py",'*.json','docker', 'phymmr','PhyMMR','*.tsv']
+include = ["/src"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "phymmr_tools"

@@ -1,5 +1,4 @@
 use pyo3::prelude::*;
-// use pyo3::types::PyDict;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -143,18 +142,3 @@ impl Hit {
         serde_json::to_string(&dict).unwrap()
     }
 }
-
-// #[pyfunction]
-// pub fn hit_from_series(row: Vec<>) -> Hit {
-//     Hit::new(row.get_item("header").unwrap().extract().unwrap(),
-//              row.get_item("target").unwrap().extract().unwrap(),
-//              row.get_item("frame").unwrap().extract().unwrap(),
-//              row.get_item("evalue").unwrap().extract().unwrap(),
-//              row.get_item("score").unwrap().extract().unwrap(),
-//              row.get_item("qstart").unwrap().extract().unwrap(),
-//              row.get_item("qend").unwrap().extract().unwrap(),
-//              row.get_item("sstart").unwrap().extract().unwrap(),
-//              row.get_item("send").unwrap().extract().unwrap(),
-//              row.get_item("pident").unwrap().extract().unwrap(),
-//     )
-// }

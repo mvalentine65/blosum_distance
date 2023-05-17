@@ -94,41 +94,90 @@ fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
     String::from_utf8(output).unwrap()
 }
 
-
 #[pyfunction]
-fn blosum62_distance(one: String, two: String) -> f64 {
-    let first: &[u8] = one.as_bytes();
-    let second: &[u8] = two.as_bytes();
-    let mut score = 0;
-    let mut max_first = 0;
-    let mut max_second = 0;
-    let length = first.len();
-    let allowed: HashSet<u8> = HashSet::from([
-        65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
-        66, 79, 85,42
-    ]);
-    for i in 0..length {
-        let mut char1 = first[i];
-        let mut char2 = second[i];
-        if first[i] == 45 {
-            char1 = b'*';
+fn dumb_consensus_dupe(sequences: Vec<(&str, u32)>, threshold: f64) -> String {
+    let (first, _) = &sequences[0];
+    let mut total_at_position = vec![0_u32;first.len()];
+    let mut counts_at_position = vec![[0_u32;27];first.len()];
+    const ASCII_OFFSET: u8= 65;
+    const HYPHEN:u8= 45;
+    const ASTERISK:u8= 42;
+    let mut min = usize::MAX;
+    let mut max:usize = 0;
+    for (sequence, count) in sequences.iter() {
+        let seq = sequence.as_bytes();
+        let (start, end) = find_indices(seq, b'-');
+        if start < min {min = start;}
+        if end > max {max = end;}
+        // let seq = &seq[..];
+        for index in start..end {
+            if index == seq.len() {continue;}
+            total_at_position[index] += count;
+            if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
+                // if seq[index]-ASCII_OFFSET == 233 {println!("{}",seq[index]);}
+                counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += count;
+            } else {
+                counts_at_position[index][26] += count;
             }
-        if second[i] == 45 {
-            char2 = b'*';
         }
-            if !(allowed.contains(&char1)) {
-                panic!("first[i]  {} not in allowed\n{}", char1 as char, one);
-            }
-            if !(allowed.contains(&char2)) {
-                panic!("second[i] {} not in allowed\n{}", char2 as char, two);
-            }
-            score += bio::scores::blosum62(char1, char2);
-            max_first += bio::scores::blosum62(char1, char1);
-            max_second += bio::scores::blosum62(char2, char2);
     }
-    let maximum_score = std::cmp::max(max_first, max_second);
-    1.0_f64 - (score as f64 / maximum_score as f64)
+    let mut output = Vec::<u8>::with_capacity(total_at_position.len());
+    for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
+        if total == 0 {
+                output.push(b'X');
+                continue;
+        } // if no characters at position, continue
+        let mut max_count:u32 = 0;
+        let mut winner = b'X';  // default to X if no winner found
+        for (index, count) in enumerate(counts) {
+            if *count as f64 / total as f64 > threshold {
+                if *count > max_count {
+                    max_count = *count;
+                    if index != 26 { winner = index as u8 +ASCII_OFFSET;}
+                    else {winner = HYPHEN;}
+                }
+            }
+        }
+        output.push(winner);
+    }
+    String::from_utf8(output).unwrap()
 }
+
+
+    #[pyfunction]
+    fn blosum62_distance(one: String, two: String) -> f64 {
+        let first: &[u8] = one.as_bytes();
+        let second: &[u8] = two.as_bytes();
+        let mut score = 0;
+        let mut max_first = 0;
+        let mut max_second = 0;
+        let length = first.len();
+        let allowed: HashSet<u8> = HashSet::from([
+            65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
+            66, 79, 85,42
+        ]);
+        for i in 0..length {
+            let mut char1 = first[i];
+            let mut char2 = second[i];
+            if first[i] == 45 {
+                char1 = b'*';
+                }
+            if second[i] == 45 {
+                char2 = b'*';
+            }
+                if !(allowed.contains(&char1)) {
+                    panic!("first[i]  {} not in allowed\n{}", char1 as char, one);
+                }
+                if !(allowed.contains(&char2)) {
+                    panic!("second[i] {} not in allowed\n{}", char2 as char, two);
+                }
+                score += bio::scores::blosum62(char1, char2);
+                max_first += bio::scores::blosum62(char1, char1);
+                max_second += bio::scores::blosum62(char2, char2);
+        }
+        let maximum_score = std::cmp::max(max_first, max_second);
+        1.0_f64 - (score as f64 / maximum_score as f64)
+    }
 
 #[pyfunction]
 fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
@@ -172,6 +221,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
     m.add_function(wrap_pyfunction!(constrained_distance, m)?)?;
     m.add_function(wrap_pyfunction!(dumb_consensus, m)?)?;
+    m.add_function(wrap_pyfunction!(dumb_consensus_dupe, m)?)?;
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference,m)?)?;

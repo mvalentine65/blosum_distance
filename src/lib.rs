@@ -95,10 +95,10 @@ fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
 }
 
 #[pyfunction]
-fn dumb_consensus_dupe(sequences: Vec<(&str, u32)>, threshold: f64) -> String {
+fn dumb_consensus_dupe(sequences: Vec<(&str, f64)>, threshold: f64) -> String {
     let (first, _) = &sequences[0];
-    let mut total_at_position = vec![0_u32;first.len()];
-    let mut counts_at_position = vec![[0_u32;27];first.len()];
+    let mut total_at_position = vec![0_f64;first.len()];
+    let mut counts_at_position = vec![[0_f64;27];first.len()];
     const ASCII_OFFSET: u8= 65;
     const HYPHEN:u8= 45;
     const ASTERISK:u8= 42;
@@ -106,31 +106,32 @@ fn dumb_consensus_dupe(sequences: Vec<(&str, u32)>, threshold: f64) -> String {
     let mut max:usize = 0;
     for (sequence, count) in sequences.iter() {
         let seq = sequence.as_bytes();
+        let increment = 1.0 / count;
         let (start, end) = find_indices(seq, b'-');
         if start < min {min = start;}
         if end > max {max = end;}
         // let seq = &seq[..];
         for index in start..end {
             if index == seq.len() {continue;}
-            total_at_position[index] += count;
+            total_at_position[index] += increment;
             if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
                 // if seq[index]-ASCII_OFFSET == 233 {println!("{}",seq[index]);}
-                counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += count;
+                counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += increment;
             } else {
-                counts_at_position[index][26] += count;
+                counts_at_position[index][26] += increment;
             }
         }
     }
     let mut output = Vec::<u8>::with_capacity(total_at_position.len());
     for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
-        if total == 0 {
+        if total == 0.0 {
                 output.push(b'X');
                 continue;
         } // if no characters at position, continue
-        let mut max_count:u32 = 0;
+        let mut max_count:f64 = 0.0;
         let mut winner = b'X';  // default to X if no winner found
         for (index, count) in enumerate(counts) {
-            if *count as f64 / total as f64 > threshold {
+            if *count / total > threshold {
                 if *count > max_count {
                     max_count = *count;
                     if index != 26 { winner = index as u8 +ASCII_OFFSET;}

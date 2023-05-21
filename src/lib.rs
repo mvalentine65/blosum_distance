@@ -29,6 +29,27 @@ fn has_data(sequence: &str, gap: char) -> bool{
     sequence.as_bytes().iter().any(|x| *x != gap as u8)
 }
 
+
+#[pyfunction]
+fn simd_hamming(one: &str, two: &str) -> u64 {
+    return hamming(one.as_ref(), two.as_ref())
+}
+
+#[pyfunction]
+fn score_splits(ref_slice: &str, splits: Vec<(&str, u64)>) -> u64 {
+    let mut min_distance: u64 = ref_slice.len() as u64;
+    let mut winning_index: u64 = 0;
+    let mut current: u64 = ref_slice.len() as u64;
+    for (seq, index) in splits {
+        current = simd_hamming(ref_slice, seq);
+        if current < min_distance {
+            min_distance = current;
+            winning_index = index;
+        }
+    }
+    winning_index
+}
+
 #[pyfunction]
 fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
     let can = candidate.as_bytes();
@@ -225,6 +246,8 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference,m)?)?;
+    m.add_function(wrap_pyfunction!(score_splits,m)?)?;
+    m.add_function(wrap_pyfunction!(simd_hamming,m)?)?;
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;
     Ok(())

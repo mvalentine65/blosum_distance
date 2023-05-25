@@ -20,8 +20,12 @@ fn find_indices(sequence: &[u8], gap: u8) -> (usize, usize) {
 }
 
 #[pyfunction]
-fn find_index_pair(sequence: &str, gap: char) -> (usize, usize) {
-    find_indices(sequence.as_bytes(), gap as u8)
+fn find_index_pair(sequence: &str, gap: &str) -> (usize, usize) {
+    if gap.len() != 1 {
+        panic!("Gap character must be a single character");
+    }
+    let gap_char = gap.as_bytes()[0];
+    find_indices(sequence.as_bytes(), gap_char)
 }
 
 #[pyfunction]
@@ -165,40 +169,40 @@ fn dumb_consensus_dupe(sequences: Vec<(&str, u32)>, threshold: f64) -> String {
 }
 
 
-    #[pyfunction]
-    fn blosum62_distance(one: String, two: String) -> f64 {
-        let first: &[u8] = one.as_bytes();
-        let second: &[u8] = two.as_bytes();
-        let mut score = 0;
-        let mut max_first = 0;
-        let mut max_second = 0;
-        let length = first.len();
-        let allowed: HashSet<u8> = HashSet::from([
-            65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
-            66, 79, 85,42
-        ]);
-        for i in 0..length {
-            let mut char1 = first[i];
-            let mut char2 = second[i];
-            if first[i] == 45 {
-                char1 = b'*';
-                }
-            if second[i] == 45 {
-                char2 = b'*';
+#[pyfunction]
+fn blosum62_distance(one: String, two: String) -> f64 {
+    let first: &[u8] = one.as_bytes();
+    let second: &[u8] = two.as_bytes();
+    let mut score = 0;
+    let mut max_first = 0;
+    let mut max_second = 0;
+    let length = first.len();
+    let allowed: HashSet<u8> = HashSet::from([
+        65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
+        66, 79, 85,42
+    ]);
+    for i in 0..length {
+        let mut char1 = first[i];
+        let mut char2 = second[i];
+        if first[i] == 45 {
+            char1 = b'*';
             }
-                if !(allowed.contains(&char1)) {
-                    panic!("first[i]  {} not in allowed\n{}", char1 as char, one);
-                }
-                if !(allowed.contains(&char2)) {
-                    panic!("second[i] {} not in allowed\n{}", char2 as char, two);
-                }
-                score += bio::scores::blosum62(char1, char2);
-                max_first += bio::scores::blosum62(char1, char1);
-                max_second += bio::scores::blosum62(char2, char2);
+        if second[i] == 45 {
+            char2 = b'*';
         }
-        let maximum_score = std::cmp::max(max_first, max_second);
-        1.0_f64 - (score as f64 / maximum_score as f64)
+            if !(allowed.contains(&char1)) {
+                panic!("first[i]  {} not in allowed\n{}", char1 as char, one);
+            }
+            if !(allowed.contains(&char2)) {
+                panic!("second[i] {} not in allowed\n{}", char2 as char, two);
+            }
+            score += bio::scores::blosum62(char1, char2);
+            max_first += bio::scores::blosum62(char1, char1);
+            max_second += bio::scores::blosum62(char2, char2);
     }
+    let maximum_score = std::cmp::max(max_first, max_second);
+    1.0_f64 - (score as f64 / maximum_score as f64)
+}
 
 #[pyfunction]
 fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
@@ -235,6 +239,68 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
     1.0_f64 - (score as f64 / maximum_score as f64)
 }
 
+
+#[pyfunction]
+fn delete_empty_columns(raw_fed_sequences: Vec<&str>) -> (Vec<String>, Vec<usize>) {
+    let mut result = Vec::<String>::with_capacity(raw_fed_sequences.len());
+    let mut headers = Vec::<&str>::with_capacity(raw_fed_sequences.len() / 2 + 1);
+    let mut sequences= Vec::<&[u8]>::with_capacity(raw_fed_sequences.len() / 2 + 1);
+    for i in (1..raw_fed_sequences.len()).step_by(2) {
+        headers.push(raw_fed_sequences[i-1]);
+        sequences.push(raw_fed_sequences[i].as_bytes())
+    }
+    if sequences.is_empty() {
+        return (result, Vec::<usize>::new());
+    }
+    let mut positions_to_keep: Vec<usize> = Vec::with_capacity(sequences[0].len());
+    for i in 0..sequences[0].len() {
+        for sequence in &sequences {
+            if sequence[i] != b'-' {
+                positions_to_keep.push(i);
+                break;
+            }
+        }
+    }
+    let mut temp = Vec::<u8>::with_capacity(sequences[0].len());
+    for i in 0..sequences.len() {
+        temp = positions_to_keep.iter()
+            .map(|index|sequences[i][*index])
+            .collect();
+        result.push(headers[i].to_string());
+        result.push(String::from_utf8(temp).unwrap());
+    }
+    (result, positions_to_keep)
+}
+
+// fn delete_empty_columns(raw_input_seqs: Vec<&str>, verbose: bool) -> (Vec<String>, Vec<u32>) {
+//     let mut result = Vec::<String>::new();
+//     let sequences = raw_input_seqs.iter()
+//         .skip(1)
+//         .step_by(2)
+//         .map(|seq| seq.as_bytes())
+//         .collect();
+//     let length: usize = sequences[0].len();
+//     let mut positions_to_keep = HashSet::<usize>::new();
+//     for i in 0..length{
+//         for sequence in sequences {
+//             if sequence[i] != b'-' {
+//                 positions_to_keep.insert(i);
+//                 break;
+//             }
+//         }
+//     }
+//     let sequences = sequences.iter()
+//         .
+//     for (header, sequence) in raw_input_seqs.iter().step_by(2).zip(sequences.iter()) {
+//         result.push(header.to_string());
+//         result.push()
+//     }
+//     for i in 0..length {
+//         for sequence in raw_input_seqs:
+//
+//     }
+//     unimplemented!()
+// }
 // A Python module implemented in Rust.
 #[pymodule]
 fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
@@ -248,6 +314,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference,m)?)?;
     m.add_function(wrap_pyfunction!(score_splits,m)?)?;
     m.add_function(wrap_pyfunction!(simd_hamming,m)?)?;
+    m.add_function(wrap_pyfunction!(delete_empty_columns,m)?)?;
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;
     Ok(())

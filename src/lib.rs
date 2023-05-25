@@ -1,12 +1,14 @@
 mod hit;
+mod flexcull;
 extern crate bio;
 
 extern crate pyo3;
 
 use bio::alignment::distance::simd::hamming;
-use itertools::enumerate;
+use flexcull::*;
 use hit::Hit;
 use hit::ReferenceHit;
+use itertools::enumerate;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 
@@ -315,6 +317,10 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(score_splits,m)?)?;
     m.add_function(wrap_pyfunction!(simd_hamming,m)?)?;
     m.add_function(wrap_pyfunction!(delete_empty_columns,m)?)?;
+    m.add_function(wrap_pyfunction!(join_by_tripled_index,m)?)?;
+    m.add_function(wrap_pyfunction!(join_with_exclusions,m)?)?;
+    m.add_function(wrap_pyfunction!(join_triplets_with_exclusions,m)?)?;
+
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;
     Ok(())

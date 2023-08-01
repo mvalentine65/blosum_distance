@@ -11,7 +11,7 @@ use hit::ReferenceHit;
 use itertools::enumerate;
 use pyo3::prelude::*;
 use std::collections::HashSet;
-use std::fmt::format;
+
 
 #[pyclass]
 struct LocationData {
@@ -131,7 +131,7 @@ fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
 
     String::from_utf8(output).unwrap()
 }
-fn weigh_winner(letters: &[u32;27]) -> LocationData {
+fn make_location_data(letters: &[u32;27]) -> LocationData {
     let averages: Vec<&u32> = letters.iter()
         .filter(|x| **x > 0)
         .collect();
@@ -143,17 +143,60 @@ fn weigh_winner(letters: &[u32;27]) -> LocationData {
     }
 }
 
-fn excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
+fn _excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
+    let STEP = 16_usize;
     let mut percent_invalid = 1.0_f64;
+    let mut num_invalid = 0;
+    let mut denominator = 0;
     let length = consensus.len();
-    let mut end = length - 16;
-    while end > 0 && percent_invalid > limit{
-        percent_invalid = consensus[end..length].bytes().filter(|x| *x == b'X').count() as f64 / (length-end) as f64;
+    let mut end = length;
+    let mut start = length - STEP;
+    while percent_invalid > limit {
+        num_invalid += consensus[start..end].bytes().filter(|x| *x == b'X').count();
+        denominator += STEP;
+        percent_invalid = num_invalid as f64 / denominator as f64;
+
+        if start == 0 && percent_invalid > limit {
+            break;
+        } // prevent underflow
+        if start < 16 {
+            start = 0;
+        } else {
+            start -= 16;
+        }
         end -= 16;
-        // println!("{},{}", percent_invalid, end);
     }
-    (consensus[0..end].to_string(), length-end)
+    (consensus[0..start].to_string(), length-start)
 }
+
+#[pyfunction]
+fn excise_consensus_tail(consensus: String, limit: f64) -> (String, usize) {
+    let STEP = 16_usize;
+    let mut percent_invalid = 1.0_f64;
+    let mut num_invalid = 0;
+    let mut denominator = 0;
+    let length = consensus.len();
+    let mut end = length;
+    let mut start = length - STEP;
+    while percent_invalid > limit {
+        num_invalid += consensus[start..end].bytes().filter(|x| *x == b'X').count();
+        denominator += STEP;
+        percent_invalid = num_invalid as f64 / denominator as f64;
+
+        if start == 0 && percent_invalid > limit {
+            break;
+        } // prevent underflow
+        if start < 16 {
+            start = 0;
+        } else {
+            start -= 16;
+        }
+        end -= 16;
+    }
+    (consensus[0..start].to_string(), length-start)
+}
+
+
 
 #[pyfunction]
 fn dumb_consensus_with_excise(sequences: Vec<&str>, threshold: f64, ) -> (String, usize, String) {
@@ -208,7 +251,7 @@ fn dumb_consensus_with_excise(sequences: Vec<&str>, threshold: f64, ) -> (String
     //     .map(|letters| weigh_winner(letters))
     //     .collect();
     let consensus = String::from_utf8(output).unwrap();
-    let (excised, cut_length) = excise_consensus_tail(&consensus, 0.40);
+    let (excised, cut_length) = _excise_consensus_tail(&consensus, 0.40);
     (excised, cut_length, consensus)
 }
 
@@ -404,6 +447,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dumb_consensus, m)?)?;
     m.add_function(wrap_pyfunction!(dumb_consensus_with_excise, m)?)?;
     m.add_function(wrap_pyfunction!(dumb_consensus_dupe, m)?)?;
+    m.add_function(wrap_pyfunction!(excise_consensus_tail, m)?)?;
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference,m)?)?;

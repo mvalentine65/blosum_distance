@@ -208,7 +208,7 @@ fn dumb_consensus_with_excise(sequences: Vec<&str>, threshold: f64, ) -> (String
     //     .map(|letters| weigh_winner(letters))
     //     .collect();
     let consensus = String::from_utf8(output).unwrap();
-    let (excised, cut_length) = excise_consensus_tail(&consensus, 0.35);
+    let (excised, cut_length) = excise_consensus_tail(&consensus, 0.40);
     (excised, cut_length, consensus)
 }
 

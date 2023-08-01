@@ -156,7 +156,7 @@ fn excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
 }
 
 #[pyfunction]
-fn dumb_consensus_with_excise(sequences: Vec<&str>, threshold: f64, ) -> (String, usize) {
+fn dumb_consensus_with_excise(sequences: Vec<&str>, threshold: f64, ) -> (String, usize, String) {
     let first = &sequences[0];
     let mut total_at_position = vec![0_u32;first.len()];
     let mut counts_at_position = vec![[0_u32;27];first.len()];
@@ -207,7 +207,9 @@ fn dumb_consensus_with_excise(sequences: Vec<&str>, threshold: f64, ) -> (String
     // let locations: Vec<LocationData> = counts_at_position.iter()
     //     .map(|letters| weigh_winner(letters))
     //     .collect();
-    excise_consensus_tail(&String::from_utf8(output).unwrap(), 0.35)
+    let consensus = String::from_utf8(output).unwrap();
+    let (excised, cut_length) = excise_consensus_tail(&consensus, 0.35);
+    (excised, cut_length, consensus)
 }
 
 

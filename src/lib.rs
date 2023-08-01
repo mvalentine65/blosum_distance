@@ -11,6 +11,15 @@ use hit::ReferenceHit;
 use itertools::enumerate;
 use pyo3::prelude::*;
 use std::collections::HashSet;
+use std::fmt::format;
+
+#[pyclass]
+struct LocationData {
+    winning_count: u32,
+    unique_chars: u8,
+    mean: f64,
+}
+
 
 #[pyfunction]
 fn bio_revcomp(sequence: String) -> String {
@@ -116,10 +125,91 @@ fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
                 }
             }
         }
+
         output.push(winner);
     }
+
     String::from_utf8(output).unwrap()
 }
+fn weigh_winner(letters: &[u32;27]) -> LocationData {
+    let averages: Vec<&u32> = letters.iter()
+        .filter(|x| **x > 0)
+        .collect();
+    // let mean = averages.iter().map(|x| **x).sum::<u32>() as f64 / averages.len() as f64;
+    LocationData {
+        winning_count: **averages.iter().max().unwrap(),
+        unique_chars: averages.len() as u8,
+        mean: averages.iter().map(|x| **x).sum::<u32>() as f64 / averages.len() as f64,
+    }
+}
+
+fn excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
+    let mut percent_invalid = 1.0_f64;
+    let length = consensus.len();
+    let mut end = length - 16;
+    while end > 0 && percent_invalid > limit{
+        percent_invalid = consensus[end..length].bytes().filter(|x| *x == b'X').count() as f64 / (length-end) as f64;
+        end -= 16;
+        // println!("{},{}", percent_invalid, end);
+    }
+    (consensus[0..end].to_string(), length-end)
+}
+
+#[pyfunction]
+fn dumb_consensus_with_excise(sequences: Vec<&str>, threshold: f64, ) -> (String, usize) {
+    let first = &sequences[0];
+    let mut total_at_position = vec![0_u32;first.len()];
+    let mut counts_at_position = vec![[0_u32;27];first.len()];
+    const ASCII_OFFSET: u8= 65;
+    const HYPHEN:u8= 45;
+    const ASTERISK:u8= 42;
+    let mut min = usize::MAX;
+    let mut max:usize = 0;
+    for sequence in sequences.iter() {
+        let seq = sequence.as_bytes();
+        let (start, end) = find_indices(seq, b'-');
+        if start < min {min = start;}
+        if end > max {max = end;}
+        // let seq = &seq[..];
+        for index in start..end {
+            if index == seq.len() {continue;}
+            total_at_position[index] += 1;
+            if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
+                // if seq[index]-ASCII_OFFSET == 233 {println!("{}",seq[index]);}
+                counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += 1;
+            } else {
+                counts_at_position[index][26] += 1;
+            }
+        }
+    }
+    let mut output = Vec::<u8>::with_capacity(total_at_position.len());
+    // let mut ratios = Vec::<u8>::with_capacity(total_at_position.len());
+    // let mut ratio = Vec::<u8>::with_capacity(to)
+    for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
+        if total == 0 {
+            output.push(b'X');
+            continue;
+        } // if no characters at position, continue
+        let mut max_count:u32 = 0;
+        let mut winner = b'X';  // default to X if no winner found
+        for (index, count) in enumerate(counts) {
+            if *count as f64 / total as f64 > threshold {
+                if *count > max_count {
+                    max_count = *count;
+                    if index != 26 { winner = index as u8 +ASCII_OFFSET;}
+                    else {winner = HYPHEN;}
+                }
+            }
+        }
+
+        output.push(winner);
+    }
+    // let locations: Vec<LocationData> = counts_at_position.iter()
+    //     .map(|letters| weigh_winner(letters))
+    //     .collect();
+    excise_consensus_tail(&String::from_utf8(output).unwrap(), 0.35)
+}
+
 
 #[pyfunction]
 fn dumb_consensus_dupe(sequences: Vec<(&str, u32)>, threshold: f64) -> String {
@@ -310,6 +400,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
     m.add_function(wrap_pyfunction!(constrained_distance, m)?)?;
     m.add_function(wrap_pyfunction!(dumb_consensus, m)?)?;
+    m.add_function(wrap_pyfunction!(dumb_consensus_with_excise, m)?)?;
     m.add_function(wrap_pyfunction!(dumb_consensus_dupe, m)?)?;
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
@@ -320,6 +411,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(join_by_tripled_index,m)?)?;
     m.add_function(wrap_pyfunction!(join_with_exclusions,m)?)?;
     m.add_function(wrap_pyfunction!(join_triplets_with_exclusions,m)?)?;
+
 
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;

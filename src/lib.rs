@@ -199,7 +199,7 @@ fn excise_consensus_tail(consensus: String, limit: f64) -> (String, usize) {
 
 
 #[pyfunction]
-fn dumb_consensus_with_excise(sequences: Vec<&str>, threshold: f64, ) -> (String, usize, String) {
+fn dumb_consensus_with_excise(sequences: Vec<&str>, consensus_threshold: f64, excise_threshold: f64) -> (String, usize, String) {
     let first = &sequences[0];
     let mut total_at_position = vec![0_u32;first.len()];
     let mut counts_at_position = vec![[0_u32;27];first.len()];
@@ -236,7 +236,7 @@ fn dumb_consensus_with_excise(sequences: Vec<&str>, threshold: f64, ) -> (String
         let mut max_count:u32 = 0;
         let mut winner = b'X';  // default to X if no winner found
         for (index, count) in enumerate(counts) {
-            if *count as f64 / total as f64 > threshold {
+            if *count as f64 / total as f64 > consensus_threshold {
                 if *count > max_count {
                     max_count = *count;
                     if index != 26 { winner = index as u8 +ASCII_OFFSET;}
@@ -251,7 +251,7 @@ fn dumb_consensus_with_excise(sequences: Vec<&str>, threshold: f64, ) -> (String
     //     .map(|letters| weigh_winner(letters))
     //     .collect();
     let consensus = String::from_utf8(output).unwrap();
-    let (excised, cut_length) = _excise_consensus_tail(&consensus, 0.40);
+    let (excised, cut_length) = _excise_consensus_tail(&consensus, excise_threshold);
     (excised, cut_length, consensus)
 }
 

@@ -144,56 +144,40 @@ fn make_location_data(letters: &[u32;27]) -> LocationData {
 }
 
 fn _excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
-    let STEP = 16_usize;
+    let mut step = 16_usize;
     let mut percent_invalid = 1.0_f64;
     let mut num_invalid = 0;
     let mut denominator = 0;
     let length = consensus.len();
     let mut end = length;
-    let mut start = length - STEP;
+    let mut start = length - step;
     while percent_invalid > limit {
-        num_invalid += consensus[start..end].bytes().filter(|x| *x == b'X').count();
-        denominator += STEP;
+        num_invalid += consensus[start..end].bytes().filter(|&x| x == b'X').count();
+        denominator += step;
         percent_invalid = num_invalid as f64 / denominator as f64;
-
+        if percent_invalid < limit {
+            break;
+        }
         if start == 0 && percent_invalid > limit {
             break;
         } // prevent underflow
         if start < 16 {
+            end -= start;
+            step = start;
             start = 0;
         } else {
-            start -= 16;
+            start -= step;
+            end -= step;
         }
-        end -= 16;
     }
-    (consensus[0..start].to_string(), length-start)
+    // single character pass on last block to find a more exact location
+
+    (consensus[0..end].to_string(), end)
 }
 
 #[pyfunction]
 fn excise_consensus_tail(consensus: String, limit: f64) -> (String, usize) {
-    let STEP = 16_usize;
-    let mut percent_invalid = 1.0_f64;
-    let mut num_invalid = 0;
-    let mut denominator = 0;
-    let length = consensus.len();
-    let mut end = length;
-    let mut start = length - STEP;
-    while percent_invalid > limit {
-        num_invalid += consensus[start..end].bytes().filter(|x| *x == b'X').count();
-        denominator += STEP;
-        percent_invalid = num_invalid as f64 / denominator as f64;
-
-        if start == 0 && percent_invalid > limit {
-            break;
-        } // prevent underflow
-        if start < 16 {
-            start = 0;
-        } else {
-            start -= 16;
-        }
-        end -= 16;
-    }
-    (consensus[0..start].to_string(), length-start)
+    _excise_consensus_tail(&consensus, limit)
 }
 
 

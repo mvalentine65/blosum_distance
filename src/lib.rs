@@ -12,15 +12,6 @@ use itertools::enumerate;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 
-
-#[pyclass]
-struct LocationData {
-    winning_count: u32,
-    unique_chars: u8,
-    mean: f64,
-}
-
-
 #[pyfunction]
 fn bio_revcomp(sequence: String) -> String {
     String::from_utf8(bio::alphabets::dna::revcomp(sequence.into_bytes())).unwrap()
@@ -131,17 +122,17 @@ fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
 
     String::from_utf8(output).unwrap()
 }
-fn make_location_data(letters: &[u32;27]) -> LocationData {
-    let averages: Vec<&u32> = letters.iter()
-        .filter(|x| **x > 0)
-        .collect();
-    // let mean = averages.iter().map(|x| **x).sum::<u32>() as f64 / averages.len() as f64;
-    LocationData {
-        winning_count: **averages.iter().max().unwrap(),
-        unique_chars: averages.len() as u8,
-        mean: averages.iter().map(|x| **x).sum::<u32>() as f64 / averages.len() as f64,
-    }
-}
+// fn make_location_data(letters: &[u32;27]) -> LocationData {
+//     let averages: Vec<&u32> = letters.iter()
+//         .filter(|x| **x > 0)
+//         .collect();
+//     // let mean = averages.iter().map(|x| **x).sum::<u32>() as f64 / averages.len() as f64;
+//     LocationData {
+//         winning_count: **averages.iter().max().unwrap(),
+//         unique_chars: averages.len() as u8,
+//         mean: averages.iter().map(|x| **x).sum::<u32>() as f64 / averages.len() as f64,
+//     }
+// }
 
 fn _excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
     let step = 16_usize;
@@ -152,8 +143,8 @@ fn _excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
     let mut end = length;
     let mut start = length - step;
     while start >= step && percent_invalid > limit {
-        num_invalid += consensus[start..end].bytes().filter(|&x| x == b'X').count();
-        denominator += step;
+        num_invalid = consensus[start..end].bytes().filter(|&x| x == b'X').count();
+        denominator = step;
         percent_invalid = num_invalid as f64 / denominator as f64;
         if percent_invalid < limit {
             break;
@@ -177,6 +168,41 @@ fn excise_consensus_tail(consensus: String, limit: f64) -> (String, usize) {
     _excise_consensus_tail(&consensus, limit)
 }
 
+fn detect_bad_regions(consensus: &String, limit: f32) -> Vec<(usize, usize)> {
+    let mut previous_ratio = 0_f32;
+    let mut current_ratio = 0_f32;
+
+    let mut num_x = 0_usize;
+    let mut last_x;
+    let mut beginning: Option<usize> = None;
+    let mut total = 0_usize;
+
+    let mut output: Vec<(usize, usize)> = Vec::new();
+    let bytes = consensus.as_bytes();
+    let (start, end) = find_indices(bytes, b'X');
+
+    for i in start..end {
+        previous_ratio = current_ratio;
+        if bytes[i] == b'X'{
+            num_x += 1;
+            last_x = i;
+            match beginning  { // if begging is None, this is the start of a region
+                None => beginning = Some(i),
+                _ => ()
+            }
+        }
+        total += 1;
+        current_ratio = num_x as f32 /total as f32;
+        // if this condition triggers, we have just exited a region
+        // reset values and look for last X character as the end of the region
+        if current_ratio < limit && previous_ratio >= limit {
+
+        }
+    }
+
+
+    output
+}
 
 
 #[pyfunction]
@@ -390,41 +416,95 @@ fn delete_empty_columns(raw_fed_sequences: Vec<&str>) -> (Vec<String>, Vec<usize
     (result, positions_to_keep)
 }
 
-// fn delete_empty_columns(raw_input_seqs: Vec<&str>, verbose: bool) -> (Vec<String>, Vec<u32>) {
-//     let mut result = Vec::<String>::new();
-//     let sequences = raw_input_seqs.iter()
-//         .skip(1)
-//         .step_by(2)
-//         .map(|seq| seq.as_bytes())
-//         .collect();
-//     let length: usize = sequences[0].len();
-//     let mut positions_to_keep = HashSet::<usize>::new();
-//     for i in 0..length{
-//         for sequence in sequences {
-//             if sequence[i] != b'-' {
-//                 positions_to_keep.insert(i);
-//                 break;
-//             }
-//         }
-//     }
-//     let sequences = sequences.iter()
-//         .
-//     for (header, sequence) in raw_input_seqs.iter().step_by(2).zip(sequences.iter()) {
-//         result.push(header.to_string());
-//         result.push()
-//     }
-//     for i in 0..length {
-//         for sequence in raw_input_seqs:
-//
-//     }
-//     unimplemented!()
-// }
+
+fn _check_index(sequences: &Vec<&[u8]>, i:usize, target: u8) -> bool {
+    for seq in sequences.iter() {
+        if seq[i] != target {
+            return false;
+        }
+    }
+    true
+}
+
+fn _find_replaceble(sequences: Vec<&[u8]>, target: u8) -> HashSet<usize> {
+    let mut output = HashSet::new();
+    for i in 0..sequences[0].len() {
+        if _check_index(&sequences, i, target) {
+            output.insert(i);
+        }
+    }
+    output
+}
+
+fn find_question_marks(sequences: Vec<&[u8]>, start: usize, stop: usize) -> HashSet<usize> {
+    fn check_index(index: usize, sequences: &Vec<&[u8]>) -> bool {
+        for seq in sequences {
+            if seq[index] != b'-' {
+                return false;
+            }
+        }
+        true
+    }
+
+    let mut output = HashSet::new();
+    for i in start..stop {
+        if check_index(i, &sequences) {
+            output.insert(i);
+        }
+    }
+    output
+}
+
+fn replace_small_gaps(mut consensus_array: Vec<u8>, limit: usize) -> Vec<u8> {
+    let mut last_seen = Option::None;
+    for i in 0..consensus_array.len() {
+        let bp = consensus_array[i];
+        if bp == 63 {
+            match last_seen {
+                None => last_seen = Some(i),
+                _ => {}
+            }
+        } else {
+            match last_seen {
+                Some(index) => {
+                    if i - index < limit {
+                        for letter in index..i {
+                            consensus_array[letter] = 45;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            last_seen = None;
+        }
+    }
+    return consensus_array
+}
+
+#[pyfunction]
+fn convert_consensus(sequences: Vec<&str>, consensus: &str) -> String {
+    let replacement = b'?';
+    let seqs: Vec<&[u8]> = sequences.iter()
+        .map(|seq|seq.as_bytes())
+        .collect();
+    let con_list = consensus.as_bytes();
+    let (start, stop) = find_indices(con_list, b'X');
+    let mut con_list = con_list.to_vec();
+    let to_replace = find_question_marks(seqs, start, stop);
+    for index in to_replace {
+        con_list[index] = replacement;
+    }
+    con_list = replace_small_gaps(con_list, 8_usize);
+    String::from_utf8(con_list).unwrap()
+}
+
 // A Python module implemented in Rust.
 #[pymodule]
 fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
     m.add_function(wrap_pyfunction!(constrained_distance, m)?)?;
+    m.add_function(wrap_pyfunction!(convert_consensus, m)?)?;
     m.add_function(wrap_pyfunction!(dumb_consensus, m)?)?;
     m.add_function(wrap_pyfunction!(dumb_consensus_with_excise, m)?)?;
     m.add_function(wrap_pyfunction!(dumb_consensus_dupe, m)?)?;

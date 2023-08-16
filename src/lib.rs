@@ -2,9 +2,7 @@ mod flexcull;
 mod hit;
 mod identity;
 mod overlap;
-// extern crate bio;
 
-// extern crate pyo3;
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;
 use hit::Hit;
@@ -539,7 +537,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference, m)?)?;
-    m.add_function(wrap_pyfunction!(filter_nt, m)?)?;
+    m.add_function(wrap_pyfunction!(identity::filter_nt, m)?)?;
     m.add_function(wrap_pyfunction!(score_splits, m)?)?;
     m.add_function(wrap_pyfunction!(simd_hamming, m)?)?;
     m.add_function(wrap_pyfunction!(delete_empty_columns, m)?)?;

@@ -7,11 +7,40 @@ use bio::alignment::distance::simd::hamming;
 use flexcull::*;
 use hit::Hit;
 use hit::ReferenceHit;
-use identity::*;
 use itertools::enumerate;
 use overlap::get_overlap;
 use pyo3::prelude::*;
 use std::collections::HashSet;
+
+#[pyfunction]
+fn asm_index_split(sequence: String) -> Vec<(usize, usize)> {
+    let mut start = 0_usize;
+    let mut in_data = false;
+    let mut gap_count = 0_usize;
+    let mut output = Vec::new();
+
+    for (i, bp) in enumerate(sequence.as_bytes()) {
+        if *bp == b'-' {
+            gap_count += 1;
+            if gap_count >= 20 {
+                if in_data {
+                    output.push((start, i - gap_count + 1))
+                }
+                in_data = false
+            }
+        } else {
+            gap_count = 0;
+            if !in_data {
+                in_data = true;
+                start = i
+            }
+        }
+    }
+    if in_data {
+        output.push((start, sequence.len()))
+    }
+    output
+}
 
 #[pyfunction]
 fn bio_revcomp(sequence: String) -> String {
@@ -526,6 +555,7 @@ fn convert_consensus(sequences: Vec<&str>, consensus: &str) -> String {
 // A Python module implemented in Rust.
 #[pymodule]
 fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(asm_index_split, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
     m.add_function(wrap_pyfunction!(constrained_distance, m)?)?;

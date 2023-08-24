@@ -24,3 +24,17 @@ pub fn get_overlap(
         false => Ok(None),
     }
 }
+
+#[pyfunction]
+pub fn get_overlap_percent(
+    start1: i32,
+    end1: i32,
+    start2: i32,
+    end2: i32
+) ->  f32 {
+    let distance = min(&end1, &end2) - max(&start1, &start2);
+    match distance < 0 {
+        false => distance as f32 / min(&end1 - &start1, &end2 - &start2) as f32,
+        true => 0.0
+    }
+}

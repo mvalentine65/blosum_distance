@@ -2,13 +2,13 @@ mod flexcull;
 mod hit;
 mod identity;
 mod overlap;
-
+mod writer;
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;
 use hit::Hit;
 use hit::ReferenceHit;
 use itertools::enumerate;
-use overlap::get_overlap;
+use overlap::{get_overlap, get_overlap_percent};
 use pyo3::prelude::*;
 use std::collections::HashSet;
 
@@ -575,7 +575,9 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(join_with_exclusions, m)?)?;
     m.add_function(wrap_pyfunction!(join_triplets_with_exclusions, m)?)?;
     m.add_function(wrap_pyfunction!(get_overlap, m)?)?;
-
+    m.add_function(wrap_pyfunction!(get_overlap_percent, m)?)?;
+    m.add_function(wrap_pyfunction!(writer::writeFastaCompressed, m)?)?;
+    m.add_function(wrap_pyfunction!(writer::writeFastaUncompressed, m)?)?;
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;
     Ok(())

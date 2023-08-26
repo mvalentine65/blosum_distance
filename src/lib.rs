@@ -73,6 +73,12 @@ fn simd_hamming(one: &str, two: &str) -> u64 {
     return hamming(one.as_ref(), two.as_ref());
 }
 
+
+#[pyfunction]
+fn is_same_kmer(one: &str, two: &str) -> bool {
+    hamming(one.as_ref(), two.as_ref()) == 0
+}
+
 #[pyfunction]
 fn score_splits(ref_slice: &str, splits: Vec<(&str, u64)>) -> u64 {
     let mut min_distance: u64 = ref_slice.len() as u64;
@@ -575,6 +581,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(join_with_exclusions, m)?)?;
     m.add_function(wrap_pyfunction!(join_triplets_with_exclusions, m)?)?;
     m.add_function(wrap_pyfunction!(get_overlap, m)?)?;
+    m.add_function(wrap_pyfunction!(is_same_kmer, m)?)?;
     m.add_function(wrap_pyfunction!(get_overlap_percent, m)?)?;
     m.add_function(wrap_pyfunction!(writer::writeFastaCompressed, m)?)?;
     m.add_function(wrap_pyfunction!(writer::writeFastaUncompressed, m)?)?;

@@ -1,9 +1,66 @@
 use std::collections::{HashMap, HashSet};
 use std::{fs, process};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use fastx::FastX;
+use fastx::FastX::FastXFormat;
+use fastx::FastX::FastXFormat::FASTA;
 use tempfile::NamedTempFile;
 use pyo3::prelude::*;
+use serde_json::Value::Array;
+
+fn count_sequences(path: &str) -> usize {
+    let mut count = 0_usize;
+    let mut file = File::open(path).unwrap();
+    let mut reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        if let Ok(line) = line {
+            if line.starts_with('>') {
+                count += 1
+            }
+        }
+    }
+    count
+}
+
+fn writeFastaUncompressed<T: AsRef<str>>(path: &String, records: &Vec<(T, T)>) {
+    // let mut target_path = path.to_string();
+    // if !target_path.ends_with(".fa"){
+    //     target_path = target_path + ".fa";
+    // }
+    let mut file = File::create(path).unwrap();
+    for (header, sequence) in records {
+        // line = format!(">{}\n;{}\n", header.as_ref(), sequence.as_ref());
+        // buf = line.as_bytes();
+        // file.write_all(buf).unwrap();
+        file.write(format!(">{}\n", header.as_ref()).as_bytes()).unwrap();
+        file.write(format!("{}\n", sequence.as_ref()).as_bytes()).unwrap();
+    }
+    file.flush().unwrap();
+
+}
+
+fn default_clust_prep(dict: &mut HashMap<String, HashSet<String>>, key: &str) {
+   if !dict.contains_key(key) {
+       let new = HashSet::new();
+       dict.insert(key.to_string(), new);
+   }
+}
+
+fn parse_fasta(path: &String) -> Vec<(String, String)> {
+    let mut records = Vec::<(String, String)>::new();
+    let mut reader = FastX::reader_from_path(Path::new(path)).unwrap();
+    let mut fastx_record = FastX::from_reader(&mut reader).unwrap();
+    while let Ok(_some @ 1..=usize::MAX) = fastx_record.read(&mut reader) {
+        records.push((fastx_record.id().to_string(), String::from_utf8(fastx_record.seq()).unwrap()));
+    }
+    records
+
+
+}
+
 fn has_multiple_sequences(path: &Path) -> bool {
     let file = fs::File::open(&path).expect(&format!("Failed to open file {}", path.to_str().unwrap()));
     let reader = BufReader::new(file);
@@ -80,8 +137,12 @@ pub fn generate_clusters(data: HashMap<String, String>, kmer_length: usize, kmer
 
             for i in (0..gene_headers.len()).rev() {
                 let master_header = &gene_headers[i];
-                let master = kmers.get(master_header).unwrap_or(&empty_set);
-
+                default_clust_prep(&mut kmers, master_header);
+                // let master = match kmers.get(master_header) {
+                //     Some(set) => set,
+                //     None => continue,
+                // };
+                let master = kmers.get(master_header).unwrap();
                 if !master.is_empty() {
                     for j in 0..i {
                         let candidate_header = &gene_headers[j];
@@ -89,8 +150,8 @@ pub fn generate_clusters(data: HashMap<String, String>, kmer_length: usize, kmer
                         if processed_headers.contains(candidate_header) {
                             continue;
                         }
-
-                        let candidate = kmers.get(candidate_header).unwrap_or(&empty_set);
+                        default_clust_prep(&mut kmers, candidate_header);
+                        let candidate = kmers.get(candidate_header).unwrap();
                         let mut matched = false;
 
                         let mut headers_to_check: Vec<&str> = vec![master_header];
@@ -160,7 +221,7 @@ pub fn seperate_into_clusters(
 
         let temp_path = temp_in.path().to_str().unwrap();
         let mut sigclust = process::Command::new("siglclust/Sigclust")
-            .args(["-k", "8", "-c", &clusters_to_create.to_string(), temp_path])
+               .args(["-k", "8", "-c", &clusters_to_create.to_string(), temp_path])
             .output()
             .expect("Cannot get output from sigclust run")
             .stdout;
@@ -181,4 +242,101 @@ pub fn seperate_into_clusters(
         };
     };
     clusters
+}
+
+#[pyfunction]
+pub fn make_aligned_ingredients(clusters: Vec<Vec<String>>, data: HashMap<String, String>, gene: String, aligned_files_tmp: String
+, raw_files_tmp: String, this_intermediates: String) -> Vec<(String, usize, usize)> {
+    let mut aligned_ingredients:Vec<(String, usize, usize)> = Vec::new();
+    for (cluster_i, cluster) in clusters.iter().enumerate() {
+        let cluster_seqs: Vec<(&str, &str)> = cluster.iter()
+            .map(|header| (header.as_str(), data.get(header).unwrap().as_str()))
+            .collect();
+
+        let cluster_length = cluster.len();
+
+        // printv(
+        //     f"Aligning cluster {cluster_i}. Elapsed time: {keeper.differential():.2f}",
+        //     args.verbose,
+        //     3,
+        // )  # Debug
+
+        let this_clus_align = format!("aligned_cluster_{}", cluster_i);
+        let mut aligned_cluster = PathBuf::from(&aligned_files_tmp);
+        aligned_cluster = aligned_cluster.join(&this_clus_align);
+        let mut raw_cluster = PathBuf::from(&raw_files_tmp);
+        raw_cluster = raw_cluster.join(format!("{}_cluster{}", gene, cluster_i));
+        if cluster_length == 1 {
+            writeFastaUncompressed(&aligned_cluster.to_string_lossy().to_string(), &cluster_seqs);
+            aligned_ingredients.push((aligned_cluster.to_string_lossy().to_string(), 1, cluster_i));
+            continue;
+            // if debug:
+            //     writeFasta(
+            //         path.join(
+            //     this_intermediates,
+            //     this_clus_align,
+            // ),
+            // cluster_seqs,
+            // )
+        }
+        // if cluster_seqs.len() > 1...
+        writeFastaUncompressed(&raw_cluster.to_string_lossy().to_string(), &cluster_seqs);
+        // make_file(&aligned_cluster);
+        // let mut out_file = File::create(&aligned_cluster).unwrap();
+        // let mut intermediate_path = PathBuf::from(&this_intermediates);
+        // intermediate_path = intermediate_path.join(this_clus_align);
+        // writeFastaUncompressed(&intermediate_path.to_string_lossy().to_string(), cluster_seqs);
+        // command = "clustalo -i {in_file} -o {out_file} --threads=1 --full"
+
+        let _status = process::Command::new("clustalo")
+            .args(&["-i", &raw_cluster.to_string_lossy().to_string(),
+                "-o", &aligned_cluster.to_string_lossy().to_string(),
+                "--threads=1", "--full", "--force"])
+            .output()
+            .expect("Failed to execute clustalo");
+        // let aligned_sequences = parse_fasta(&aligned_cluster.to_string_lossy().to_string());
+        let count = count_sequences(&aligned_cluster.to_string_lossy().to_string());
+        // if debug:
+        //     printv(command, args.verbose, 3)
+        // writeFasta(
+        //     path.join(
+        //         this_intermediates,
+        //         this_clus_align,
+        //     ),
+        //     aligned_sequences,
+        // )
+
+        aligned_ingredients.push((aligned_cluster.to_string_lossy().to_string(), count, cluster_i));
+    }
+    aligned_ingredients
+}
+
+#[pyfunction]
+pub fn run_intermediate(cluster_file: String, seq_count: usize, cluster_i: usize,  tmp_align: String,
+                     parent_tempdir: String, this_intermediates: String, debug: bool) {
+    let outfile = Path::new(&parent_tempdir);
+    let outfile = outfile.join(format!("part_{}.fa", cluster_i)).to_string_lossy().to_string();
+    let args;
+    if seq_count >= 1 {
+        args = ["--p1", &tmp_align, "--p2", &cluster_file, "-o", &outfile, "--threads=1", "--full", "--is-profile", "--force"];
+    } else {
+        args = ["--p1", &tmp_align, "--p2", &cluster_file, "-o", &outfile, "--threads=1", "--full", "", "--force"]
+    }
+
+
+    let _status = std::process::Command::new("clustalo")
+        .args(args)
+        .status()
+        .expect("Failed to execute clustalo");
+    // if debug:
+    //     printv(
+    //         f"clustalo --p1 {tmp_aln.name} --p2 {file} -o {out_file} --threads=1 --full {is_profile} --force",
+    // args.verbose,
+    // 3,
+    // )
+    if debug {
+        let debug_path = Path::new(&this_intermediates);
+        let debug_path = debug_path.join(format!("reference_subalignment_{}.fa", cluster_i));
+        writeFastaUncompressed(&debug_path.to_string_lossy().to_string(), &parse_fasta(&outfile));
+    }
 }

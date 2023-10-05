@@ -8,7 +8,7 @@ use fastx::FastX::FastXFormat;
 use fastx::FastX::FastXFormat::FASTA;
 use tempfile::NamedTempFile;
 use pyo3::prelude::*;
-use serde_json::Value::Array;
+
 
 fn count_sequences(path: &str) -> usize {
     let mut count = 0_usize;
@@ -24,8 +24,12 @@ fn count_sequences(path: &str) -> usize {
     }
     count
 }
-
-fn writeFastaUncompressed<T: AsRef<str>>(path: &String, records: &Vec<(T, T)>) {
+fn writeFastaFileUncompressed<T: AsRef<str>>(file: &mut File, records: &Vec<(T, T)>) {
+    for (header, sequence) in records {
+        write!(file, ">{}\n{}\n", header.as_ref(), sequence.as_ref()).unwrap()
+    }
+}
+fn writeFastaPathUncompressed<T: AsRef<str>>(path: &String, records: &Vec<(T, T)>) {
     // let mut target_path = path.to_string();
     // if !target_path.ends_with(".fa"){
     //     target_path = target_path + ".fa";
@@ -255,32 +259,18 @@ pub fn make_aligned_ingredients(clusters: Vec<Vec<String>>, data: HashMap<String
 
         let cluster_length = cluster.len();
 
-        // printv(
-        //     f"Aligning cluster {cluster_i}. Elapsed time: {keeper.differential():.2f}",
-        //     args.verbose,
-        //     3,
-        // )  # Debug
-
         let this_clus_align = format!("aligned_cluster_{}", cluster_i);
         let mut aligned_cluster = PathBuf::from(&aligned_files_tmp);
         aligned_cluster = aligned_cluster.join(&this_clus_align);
         let mut raw_cluster = PathBuf::from(&raw_files_tmp);
         raw_cluster = raw_cluster.join(format!("{}_cluster{}", gene, cluster_i));
         if cluster_length == 1 {
-            writeFastaUncompressed(&aligned_cluster.to_string_lossy().to_string(), &cluster_seqs);
+            writeFastaPathUncompressed(&aligned_cluster.to_string_lossy().to_string(), &cluster_seqs);
             aligned_ingredients.push((aligned_cluster.to_string_lossy().to_string(), 1, cluster_i));
             continue;
-            // if debug:
-            //     writeFasta(
-            //         path.join(
-            //     this_intermediates,
-            //     this_clus_align,
-            // ),
-            // cluster_seqs,
-            // )
         }
         // if cluster_seqs.len() > 1...
-        writeFastaUncompressed(&raw_cluster.to_string_lossy().to_string(), &cluster_seqs);
+        writeFastaPathUncompressed(&raw_cluster.to_string_lossy().to_string(), &cluster_seqs);
         // make_file(&aligned_cluster);
         // let mut out_file = File::create(&aligned_cluster).unwrap();
         // let mut intermediate_path = PathBuf::from(&this_intermediates);
@@ -324,10 +314,12 @@ pub fn run_intermediate(cluster_file: String, seq_count: usize, cluster_i: usize
     }
 
 
-    let _status = std::process::Command::new("clustalo")
+    let output = std::process::Command::new("clustalo")
         .args(args)
-        .status()
-        .expect("Failed to execute clustalo");
+        .output()
+        .expect("Failed to execute clustalo")
+        .stdout;
+
     // if debug:
     //     printv(
     //         f"clustalo --p1 {tmp_aln.name} --p2 {file} -o {out_file} --threads=1 --full {is_profile} --force",
@@ -337,6 +329,114 @@ pub fn run_intermediate(cluster_file: String, seq_count: usize, cluster_i: usize
     if debug {
         let debug_path = Path::new(&this_intermediates);
         let debug_path = debug_path.join(format!("reference_subalignment_{}.fa", cluster_i));
-        writeFastaUncompressed(&debug_path.to_string_lossy().to_string(), &parse_fasta(&outfile));
+        writeFastaPathUncompressed(&debug_path.to_string_lossy().to_string(), &parse_fasta(&outfile));
     }
+}
+
+
+struct RecordHolder {
+    header: Vec<u8>,
+    sequence: Vec<u8>,
+    // in_header: bool
+}
+
+impl RecordHolder {
+    fn to_tuple(&self) -> (String, String) {
+        (String::from_utf8_lossy(&self.header).to_string(), String::from_utf8_lossy(&self.sequence).to_string())
+    }
+}
+
+
+// pub fn parse_stdout(stdout: Vec<u8>) -> Vec<String> {
+//     let mut output = Vec::new();
+//     // let mut current:RecordHolder = RecordHolder{
+//     //     header: Vec::new(),
+//     //     sequence: Vec::new(),
+//     // };
+//     let mut current = &Vec::new();
+//     let mut in_header = true;
+//     for byte in stdout {
+//         if byte == b'>' {
+//             output.push(Vec::new());
+//             current = output.last().unwrap();
+//             in_header = true;
+//             }
+//             // output.push(&current);
+//         } else if byte == b'\n' && in_header == true {
+//                 output.push(Vec::new());
+//                 in_header = false;
+//                 current = output.last().unwrap()
+//         } else {
+//             current.push(byte);
+//         }
+//
+//     output.into_iter()
+//         .map(|record| {
+//             String::from_utf8(record).unwrap()
+//         })
+//         .collect()
+// }
+#[pyfunction]
+pub fn process_clusters(clusters: Vec<Vec<String>>, data: HashMap<String, String>, this_intermediates: String
+, parent_tempdir: String, tmp_align: String) -> Vec<(String, String)> {
+    // let p2_path = Path::new(p2);
+
+    // if !p2_path.exists() {
+    //     println!("Cluster file '{}' does not exist. Skipping...", p2);
+    //     return;
+    // // }
+    // if !has_multiple_sequences(p2_path) {
+    //     return;
+    // }
+    let mut final_sequences = Vec::new();
+    for (cluster_i, cluster) in clusters.iter().enumerate() {
+        let cluster_seqs: Vec<(&String, &String)> = cluster.iter()
+            .map(|header| (header, data.get(header).unwrap()))
+            .collect();
+        if cluster_seqs.len() == 1 {
+            let (header, sequence) = cluster_seqs[0];
+            final_sequences.push((header.to_owned(), sequence.to_owned()));
+            continue;
+        }
+        let mut unaligned_in = PathBuf::from(&this_intermediates);
+        unaligned_in = unaligned_in.join(format!("unaligned_{}", cluster_i));
+        let mut in_file = NamedTempFile::new_in(&this_intermediates).unwrap();
+        for (header, seq) in cluster_seqs {
+            write!(&mut in_file, ">{}\n{}\n", header, seq).unwrap()
+        }
+        let in_path = in_file.path().to_str().expect("cannot get path to temp infile");
+        // let p2_number = p2.trim_start_matches("unaligned_cluster_");
+        let intermediate_file = NamedTempFile::new_in(&this_intermediates).expect("cannot create temp file");
+        // (format!("cluster_{}.fasta", p2_number));
+        let temp_path = intermediate_file.path().to_str().expect("cannot get path to temp file");
+        let _status = std::process::Command::new("clustalo")
+            .args(&["-i", in_path, "-o", temp_path, "--threads=1", "--force", "--full"])
+            .status()
+            .expect("Failed to execute clustalo");
+
+        // if !status.success() {
+        //     eprintln!("Failed to process unaligned cluster file '{}'", p2);
+        // }
+        // println!("first is fine {}",cluster_i);
+        let mut out_file = PathBuf::from(&parent_tempdir);
+        let out_tail = format!("part_{}.fa", cluster_i);
+        out_file = out_file.join(out_tail);
+        let out_path = out_file.as_path().to_str().unwrap();
+        let args;
+        let seq_count = count_sequences(temp_path);
+        if seq_count >= 1 {
+            args = ["--p1", &tmp_align, "--p2", temp_path, "-o", out_path, "--threads=1", "--full", "--is-profile", "--force"];
+        } else {
+            args = ["--p1", &tmp_align, "--p2", temp_path, "-o", out_path, "--threads=1", "--full", "", "--force"]
+        }
+        let _status = std::process::Command::new("clustalo")
+            .args(&["--p1", &tmp_align, "--p2", temp_path, "-o", &out_path, "--threads=1", "--full", "--is-profile", "--force"])
+            .status()
+            .expect("Failed to execute clustalo");
+
+        // if !status.success() {
+        //     eprintln!("Failed to process aligned cluster file '{}'", p2);
+        // }
+    }
+    final_sequences
 }

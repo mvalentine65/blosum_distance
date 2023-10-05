@@ -588,6 +588,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(align::seperate_into_clusters, m)?)?;
     m.add_function(wrap_pyfunction!(align::make_aligned_ingredients, m)?)?;
     m.add_function(wrap_pyfunction!(align::run_intermediate, m)?)?;
+    m.add_function(wrap_pyfunction!(align::process_clusters, m)?)?;
 
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;

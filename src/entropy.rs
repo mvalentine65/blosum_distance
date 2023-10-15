@@ -5,10 +5,12 @@ use pyo3::pyfunction;
 // Returns two tuple[str, str],
 // one for sequences above the entropy threshold, and one for sequences below the threshold
 #[pyfunction]
-pub fn entropy_filter(records: Vec<(String, String)>, entropy_threshold: f64) -> (Vec<(String, String)>, Vec<(String, String)>) {
+pub fn entropy_filter(records: Vec<String>, entropy_threshold: f64) -> Vec<(String, String)> {
     let mut greater = Vec::with_capacity(records.len());
-    let mut lesser = Vec::with_capacity(records.len());
-    for (header, seq) in records.into_iter() {
+    for string in records.into_iter() {
+        let fields = string.split("\n").collect::<Vec<&str>>();
+        let header = fields[0].to_string();
+        let seq = fields[1].to_string();
         // Calculate the frequency distribution of nucleotides in the sequence
         let a_count = seq.bytes().filter(|&c| c == b'A').count() as u32;
         let c_count = seq.bytes().filter(|&c| c == b'C').count() as u32;
@@ -23,11 +25,9 @@ pub fn entropy_filter(records: Vec<(String, String)>, entropy_threshold: f64) ->
         // Filter sequences with low entropy and write the remaining ones to the output FASTA file
         if ent >= entropy_threshold {
             greater.push((header, seq))
-        } else {
-            lesser.push((header, seq))
         }
     }
-    (greater, lesser)
+    greater
 }
 
 

@@ -2,9 +2,11 @@ mod flexcull;
 mod hit;
 mod identity;
 mod overlap;
-mod writer;
+// mod writer;
 mod align;
+mod utils;
 mod entropy;
+mod sigclust;
 
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;
@@ -592,7 +594,9 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(align::process_clusters, m)?)?;
     m.add_function(wrap_pyfunction!(entropy::entropy_filter, m)?)?;
     m.add_function(wrap_pyfunction!(entropy::entropy, m)?)?;
-
+    m.add_function(wrap_pyfunction!(sigclust::sigclust, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::write_fasta_compressed, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::write_fasta_uncompressed, m)?)?;
 
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;

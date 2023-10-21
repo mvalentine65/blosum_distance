@@ -3,12 +3,12 @@ use std::{fs, process};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use fastx::FastX;
-use fastx::FastX::FastXFormat;
-use fastx::FastX::FastXFormat::FASTA;
 use tempfile::NamedTempFile;
 use pyo3::prelude::*;
-
+// use utils::write_fasta_compressed;
+// use utils::write_fasta_uncompressed;
+use utils::parse_fasta;
+use crate::utils;
 
 fn count_sequences(path: &str) -> usize {
     let mut count = 0_usize;
@@ -24,11 +24,7 @@ fn count_sequences(path: &str) -> usize {
     }
     count
 }
-fn writeFastaFileUncompressed<T: AsRef<str>>(file: &mut File, records: &Vec<(T, T)>) {
-    for (header, sequence) in records {
-        write!(file, ">{}\n{}\n", header.as_ref(), sequence.as_ref()).unwrap()
-    }
-}
+
 fn writeFastaPathUncompressed<T: AsRef<str>>(path: &String, records: &Vec<(T, T)>) {
     // let mut target_path = path.to_string();
     // if !target_path.ends_with(".fa"){
@@ -53,17 +49,6 @@ fn default_clust_prep(dict: &mut HashMap<String, HashSet<String>>, key: &str) {
    }
 }
 
-fn parse_fasta(path: &String) -> Vec<(String, String)> {
-    let mut records = Vec::<(String, String)>::new();
-    let mut reader = FastX::reader_from_path(Path::new(path)).unwrap();
-    let mut fastx_record = FastX::from_reader(&mut reader).unwrap();
-    while let Ok(_some @ 1..=usize::MAX) = fastx_record.read(&mut reader) {
-        records.push((fastx_record.id().to_string(), String::from_utf8(fastx_record.seq()).unwrap()));
-    }
-    records
-
-
-}
 
 fn has_multiple_sequences(path: &Path) -> bool {
     let file = fs::File::open(&path).expect(&format!("Failed to open file {}", path.to_str().unwrap()));

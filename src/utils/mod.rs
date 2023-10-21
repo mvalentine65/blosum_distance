@@ -44,7 +44,7 @@ pub fn write_fasta_uncompressed(path: String, records: Vec<(String, String)>) {
     file.flush().unwrap();
 }
 
-fn parse_fasta(path: &str) -> Vec<(String, String)> {
+pub fn parse_fasta(path: &str) -> Vec<(String, String)> {
     let mut records = Vec::<(String, String)>::new();
     let mut reader = FastX::reader_from_path(Path::new(path)).unwrap();
     let mut fastx_record = FastX::from_reader(&mut reader).unwrap();

@@ -12,7 +12,7 @@ const DENSITY: f32 = 1_f32 / 21_f32;
 const KMEANS_ITERATIONS: usize = 4;
 
 #[pyfunction]
-pub fn sigclust(records: Vec<(String, String)>, k: usize, c: usize) -> Vec<Vec<(String, String)>> {
+pub fn sigclust(records: Vec<(String, String)>, k: usize, c: usize) -> Vec<Vec<String>> {
     let sigs = convert_fasta_to_signatures(&records, k);
     let clusters = cluster_signatures(&sigs, c);
     prepare_fasta_output(&records, &clusters, c)
@@ -183,19 +183,13 @@ fn cluster_signatures(sigs: &Vec<u64>, cluster_count: usize) -> Vec<usize> {
         mean_sigs = create_cluster_sigs(&clusters_list, sigs, cluster_count);
     }
 
-    let mut non_empty_clusters = 0_usize;
-    for cluster_list in clusters_list.iter() {
-        if !clusters_list.is_empty() {
-            non_empty_clusters += 1
-        }
-    }
     clusters
 }
 
-fn prepare_fasta_output(records: &Vec<(String, String)>, clusters: &Vec<usize>, cluster_count: usize) -> Vec<Vec<(String, String)>> {
+fn prepare_fasta_output(records: &Vec<(String, String)>, clusters: &Vec<usize>, cluster_count: usize) -> Vec<Vec<String>> {
     let mut output = vec![Vec::new();cluster_count];
     for i in 0..clusters.len() {
-        output[clusters[i]].push(records[i].clone());
+        output[clusters[i]].push(records[i].0.clone());
     }
     output
 }

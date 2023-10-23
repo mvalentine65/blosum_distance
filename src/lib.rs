@@ -4,9 +4,9 @@ mod identity;
 mod overlap;
 // mod writer;
 mod align;
-mod utils;
 mod entropy;
 mod sigclust;
+mod utils;
 
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;
@@ -77,7 +77,6 @@ fn has_data(sequence: &str, gap: char) -> bool {
 fn simd_hamming(one: &str, two: &str) -> u64 {
     return hamming(one.as_ref(), two.as_ref());
 }
-
 
 #[pyfunction]
 fn is_same_kmer(one: &str, two: &str) -> bool {
@@ -588,10 +587,12 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_overlap, m)?)?;
     m.add_function(wrap_pyfunction!(is_same_kmer, m)?)?;
     m.add_function(wrap_pyfunction!(get_overlap_percent, m)?)?;
-    m.add_function(wrap_pyfunction!(align::seperate_into_clusters, m)?)?;
+    // m.add_function(wrap_pyfunction!(align::seperate_into_clusters, m)?)?;
     m.add_function(wrap_pyfunction!(align::make_aligned_ingredients, m)?)?;
     m.add_function(wrap_pyfunction!(align::run_intermediate, m)?)?;
     m.add_function(wrap_pyfunction!(align::process_clusters, m)?)?;
+    m.add_function(wrap_pyfunction!(align::align_remove_empty_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(align::align_remove_dashes, m)?)?;
     m.add_function(wrap_pyfunction!(entropy::entropy_filter, m)?)?;
     m.add_function(wrap_pyfunction!(entropy::entropy, m)?)?;
     m.add_function(wrap_pyfunction!(sigclust::sigclust, m)?)?;

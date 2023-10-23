@@ -1,11 +1,11 @@
-use std::collections::HashSet;
 use pyo3::prelude::*;
+use std::collections::HashSet;
 
 #[pyfunction]
 pub fn join_by_tripled_index(string: &str, positions_to_keep: Vec<usize>) -> String {
     let mut result = Vec::with_capacity(string.len());
     for i in positions_to_keep.iter() {
-        result.push(&string[i*3..i*3+3]);
+        result.push(&string[i * 3..i * 3 + 3]);
     }
     result.join("")
 }
@@ -24,12 +24,16 @@ pub fn join_with_exclusions(string: &str, column_cull: HashSet<usize>) -> String
 }
 
 #[pyfunction]
-pub fn join_triplets_with_exclusions(string: &str, exclusion1: HashSet<usize>, exclusion2: HashSet<usize>) -> String {
+pub fn join_triplets_with_exclusions(
+    string: &str,
+    exclusion1: HashSet<usize>,
+    exclusion2: HashSet<usize>,
+) -> String {
     let mut result = Vec::with_capacity(string.len());
     for i in (0..string.len()).step_by(3) {
-        match exclusion1.contains(&i) || exclusion2.contains(&i){
+        match exclusion1.contains(&i) || exclusion2.contains(&i) {
             true => result.push("---"),
-            false => result.push(&string[i..i+3]),
+            false => result.push(&string[i..i + 3]),
         }
     }
     result.join("")

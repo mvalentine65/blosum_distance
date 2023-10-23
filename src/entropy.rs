@@ -1,6 +1,5 @@
 use pyo3::pyfunction;
 
-
 // Accepts fastas as the standard tuple[str, str] and an entropy threshold.
 // Returns two tuple[str, str],
 // one for sequences above the entropy threshold, and one for sequences below the threshold
@@ -16,7 +15,12 @@ pub fn entropy_filter(records: Vec<String>, entropy_threshold: f64) -> Vec<(Stri
         let c_count = seq.bytes().filter(|&c| c == b'C').count() as u32;
         let g_count = seq.bytes().filter(|&c| c == b'G').count() as u32;
         let t_count = seq.bytes().filter(|&c| c == b'T').count() as u32;
-        let counts = [a_count as f64, c_count as f64, g_count as f64, t_count as f64];
+        let counts = [
+            a_count as f64,
+            c_count as f64,
+            g_count as f64,
+            t_count as f64,
+        ];
 
         // Calculate the entropy of the sequence
         let freqs = counts.map(|count| count as f64 / seq.len() as f64);
@@ -29,7 +33,6 @@ pub fn entropy_filter(records: Vec<String>, entropy_threshold: f64) -> Vec<(Stri
     }
     greater
 }
-
 
 // Helper function to calculate entropy of a frequency distribution
 fn _entropy(freqs: &[f64]) -> f64 {

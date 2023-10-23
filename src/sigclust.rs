@@ -1,8 +1,8 @@
-use std::collections::HashSet;
 use pyo3::pyfunction;
 use rand::distributions::Uniform;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use std::collections::HashSet;
 
 //f"sigclust/SigClust -k 8 -c {clusters_to_create} {this_tmp.name} > {this_out.name}",
 
@@ -12,7 +12,7 @@ const DENSITY: f32 = 1_f32 / 21_f32;
 const KMEANS_ITERATIONS: usize = 4;
 
 #[pyfunction]
-pub fn sigclust(records: Vec<(String, String)>, k: usize, c: usize) -> Vec<Vec<String>> {
+pub fn sigclust(records: Vec<(String, String)>, k: usize, c: usize) -> Vec<Vec<(String, String)>> {
     let sigs = convert_fasta_to_signatures(&records, k);
     let clusters = cluster_signatures(&sigs, c);
     prepare_fasta_output(&records, &clusters, c)
@@ -30,7 +30,7 @@ fn generate_signature(output: &mut [u64], sequence: &str, kmer_length: usize) {
         -64_i32 * SIGNATURE_SIZE as i32,
         64_i32 * SIGNATURE_SIZE as i32,
     );
-    let mut unflattened_signature = vec![0_i32;SIGNATURE_SIZE * 64];
+    let mut unflattened_signature = vec![0_i32; SIGNATURE_SIZE * 64];
     let mut seed = [0; 32];
     let set_bits = (DENSITY * SIGNATURE_SIZE as f32 * 64.0) as i32;
     for i in 0..(seq_vec.len() - kmer_length + 1) {
@@ -50,7 +50,7 @@ fn generate_signature(output: &mut [u64], sequence: &str, kmer_length: usize) {
     }
     for i in 0..SIGNATURE_SIZE * 64 {
         if unflattened_signature[i] > 0 {
-            output[i / 64] |= 1 << (i % 64);
+            output[i / 64] |= 1_u64 << (i % 64);
         }
     }
 }
@@ -75,9 +75,11 @@ fn create_cluster_lists(clusters: &Vec<usize>, cluster_count: usize) -> Vec<Vec<
     cluster_lists
 }
 
-
-
-fn create_cluster_sigs(cluster_lists: &Vec<Vec<usize>>, sigs: &Vec<u64>, cluster_count: usize) -> Vec<u64> {
+fn create_cluster_sigs(
+    cluster_lists: &Vec<Vec<usize>>,
+    sigs: &Vec<u64>,
+    cluster_count: usize,
+) -> Vec<u64> {
     let mut cluster_sigs = vec![0_u64; SIGNATURE_SIZE * cluster_count];
     let mut unflattened_signature;
 
@@ -85,7 +87,8 @@ fn create_cluster_sigs(cluster_lists: &Vec<Vec<usize>>, sigs: &Vec<u64>, cluster
         unflattened_signature = vec![0_i32; SIGNATURE_WIDTH];
 
         for signature in &cluster_lists[cluster_i] {
-            let signature_data = &sigs[SIGNATURE_SIZE * signature..SIGNATURE_SIZE * signature + SIGNATURE_SIZE];
+            let signature_data =
+                &sigs[SIGNATURE_SIZE * signature..SIGNATURE_SIZE * signature + SIGNATURE_SIZE];
             for sig_i in 0..SIGNATURE_WIDTH {
                 let signature_mask = 1_u64 << (sig_i % 64);
                 if (signature_mask & signature_data[sig_i / 64]) != 0 {
@@ -98,21 +101,23 @@ fn create_cluster_sigs(cluster_lists: &Vec<Vec<usize>>, sigs: &Vec<u64>, cluster
         let mut flattened_signature = &mut cluster_sigs[cluster_i * SIGNATURE_SIZE..];
         for i in 0..SIGNATURE_WIDTH {
             if unflattened_signature[i] > 0 {
-                flattened_signature[i / 64] = 1 << (i % 64);
+                flattened_signature[i / 64] |= 1 << (i % 64);
             }
         }
     }
     cluster_sigs
 }
 
-
-fn recluster_signatures(clusters: &mut Vec<usize>, mean_sigs: &Vec<u64>, sigs: &Vec<u64>, cluster_count: usize) {
-
+fn recluster_signatures(
+    clusters: &mut Vec<usize>,
+    mean_sigs: &Vec<u64>,
+    sigs: &Vec<u64>,
+    cluster_count: usize,
+) {
     for sig_i in 0..clusters.len() {
-
         let source_signature = &sigs[sig_i * SIGNATURE_SIZE..];
         let mut min_hd_cluster = 0_usize;
-        let mut min_hd= usize::MAX;
+        let mut min_hd = usize::MAX;
         for cluster_i in 0..cluster_count {
             let cluster_signature = &mean_sigs[cluster_i * SIGNATURE_SIZE..];
             let mut hd: usize = 0;
@@ -129,25 +134,22 @@ fn recluster_signatures(clusters: &mut Vec<usize>, mean_sigs: &Vec<u64>, sigs: &
 }
 
 fn create_random_sigs(rng: &mut SmallRng, sigs: &Vec<u64>, cluster_count: usize) -> Vec<u64> {
-    let mut cluster_sigs = vec![0_u64;SIGNATURE_SIZE * cluster_count];
+    let mut cluster_sigs = vec![0_u64; SIGNATURE_SIZE * cluster_count];
     let signature_count = sigs.len() / SIGNATURE_SIZE;
-    let uniform_int_distribution = Uniform::new(
-        0_usize,
-        signature_count
-    );
+    let uniform_int_distribution = Uniform::new(0_usize, signature_count);
     let mut finished = false;
 
-    let mut unique_sigs = HashSet::new();  //179
+    let mut unique_sigs = HashSet::new(); //179
     for _sig in 0..signature_count {
         let sig = rng.sample(uniform_int_distribution);
         // let mut sig_data = vec![0_u64;SIGNATURE_SIZE];
 
         // Copy binary data from `sigs` into `sig_data`.
         // let sig_data = &sigs[sig * SIGNATURE_SIZE..sig*SIGNATURE_SIZE+SIGNATURE_SIZE];
-            // sig_data[start..end].copy_from_slice(&sigs[sig * SIGNATURE_SIZE].to_ne_bytes());
+        // sig_data[start..end].copy_from_slice(&sigs[sig * SIGNATURE_SIZE].to_ne_bytes());
 
-
-        unique_sigs.insert(sigs[sig * SIGNATURE_SIZE..sig*SIGNATURE_SIZE+SIGNATURE_SIZE].to_vec());
+        unique_sigs
+            .insert(sigs[sig * SIGNATURE_SIZE..sig * SIGNATURE_SIZE + SIGNATURE_SIZE].to_vec());
 
         if unique_sigs.len() >= cluster_count {
             finished = true;
@@ -160,21 +162,25 @@ fn create_random_sigs(rng: &mut SmallRng, sigs: &Vec<u64>, cluster_count: usize)
 
     let mut i = 0_usize;
     for sig in unique_sigs.iter() {
-        cluster_sigs[i*SIGNATURE_SIZE..i*SIGNATURE_SIZE+SIGNATURE_SIZE].copy_from_slice(sig.as_slice());
+        cluster_sigs[i * SIGNATURE_SIZE..i * SIGNATURE_SIZE + SIGNATURE_SIZE]
+            .copy_from_slice(sig.as_slice());
         i += 1;
     }
 
     if i != unique_sigs.len() {
-        eprintln!("Mismatch {} sigs added and {} unique sigs", i, unique_sigs.len());
+        eprintln!(
+            "Mismatch {} sigs added and {} unique sigs",
+            i,
+            unique_sigs.len()
+        );
         panic!();
     }
     cluster_sigs
 }
 
-
 fn cluster_signatures(sigs: &Vec<u64>, cluster_count: usize) -> Vec<usize> {
-    let mut rng = SmallRng::from_entropy();
-    let mut clusters = vec![0_usize;sigs.len()/SIGNATURE_SIZE];
+    let mut rng = SmallRng::seed_from_u64(19780503);
+    let mut clusters = vec![0_usize; sigs.len() / SIGNATURE_SIZE];
     let mut clusters_list = Vec::new();
     let mut mean_sigs = create_random_sigs(&mut rng, sigs, cluster_count);
     for _kmeans_iteration in 0..KMEANS_ITERATIONS {
@@ -186,10 +192,14 @@ fn cluster_signatures(sigs: &Vec<u64>, cluster_count: usize) -> Vec<usize> {
     clusters
 }
 
-fn prepare_fasta_output(records: &Vec<(String, String)>, clusters: &Vec<usize>, cluster_count: usize) -> Vec<Vec<String>> {
-    let mut output = vec![Vec::new();cluster_count];
+fn prepare_fasta_output(
+    records: &Vec<(String, String)>,
+    clusters: &Vec<usize>,
+    cluster_count: usize,
+) -> Vec<Vec<(String, String)>> {
+    let mut output = vec![Vec::new(); cluster_count];
     for i in 0..clusters.len() {
-        output[clusters[i]].push(records[i].0.clone());
+        output[clusters[i]].push(records[i].clone());
     }
     output
 }

@@ -596,6 +596,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(entropy::entropy_filter, m)?)?;
     m.add_function(wrap_pyfunction!(entropy::entropy, m)?)?;
     m.add_function(wrap_pyfunction!(sigclust::sigclust, m)?)?;
+    m.add_function(wrap_pyfunction!(sigclust::sigclust_with_sequence, m)?)?;
     m.add_function(wrap_pyfunction!(utils::write_fasta_compressed, m)?)?;
     m.add_function(wrap_pyfunction!(utils::write_fasta_uncompressed, m)?)?;
 

@@ -14,10 +14,17 @@ const DENSITY: f32 = 1_f32 / 21_f32;
 const KMEANS_ITERATIONS: usize = 4;
 
 #[pyfunction]
-pub fn sigclust(records: Vec<(String, String)>, k: usize, c: usize) -> Vec<Vec<(String, String)>> {
+pub fn sigclust(records: Vec<(String, String)>, k: usize, c: usize) -> Vec<Vec<String>> {
     let sigs = convert_fasta_to_signatures(&records, k);
     let clusters = cluster_signatures(&sigs, c);
-    prepare_fasta_output(&records, &clusters, c)
+    prepare_header_output(&records, &clusters, c)
+}
+
+#[pyfunction]
+pub fn sigclust_with_sequence(records: Vec<(String, String)>, k: usize, c: usize) -> Vec<Vec<(String, String)>> {
+    let sigs = convert_fasta_to_signatures(&records, k);
+    let clusters = cluster_signatures(&sigs, c);
+    prepare_tuple_output(&records, &clusters, c)
 }
 
 fn generate_signature(output: &mut [u64], sequence: &str, kmer_length: usize) {
@@ -194,7 +201,19 @@ fn cluster_signatures(sigs: &Vec<u64>, cluster_count: usize) -> Vec<usize> {
     clusters
 }
 
-fn prepare_fasta_output(
+fn prepare_header_output(
+    records: &Vec<(String, String)>,
+    clusters: &Vec<usize>,
+    cluster_count: usize,
+) -> Vec<Vec<String>> {
+    let mut output = vec![Vec::new(); cluster_count];
+    for i in 0..clusters.len() {
+        output[clusters[i]].push(records[i].0.clone());
+    }
+    output
+}
+
+fn prepare_tuple_output(
     records: &Vec<(String, String)>,
     clusters: &Vec<usize>,
     cluster_count: usize,

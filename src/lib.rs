@@ -7,6 +7,7 @@ mod align;
 mod entropy;
 mod sigclust;
 mod utils;
+mod translate;
 
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;
@@ -599,6 +600,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sigclust::sigclust_with_sequence, m)?)?;
     m.add_function(wrap_pyfunction!(utils::write_fasta_compressed, m)?)?;
     m.add_function(wrap_pyfunction!(utils::write_fasta_uncompressed, m)?)?;
+    m.add_function(wrap_pyfunction!(translate::translate, m)?)?;
 
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;

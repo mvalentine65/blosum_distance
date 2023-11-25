@@ -36,9 +36,9 @@ const ASCII_TO_INDEX: [usize;128] = [
         ['V', 'V', 'V', 'V'], // GTA, GTC, GTG, GTT
     ],
     [
-        ['-', 'Y', '-', 'Y'], // TAA, TAC, TAG, TAT
+        ['*', 'Y', '*', 'Y'], // TAA, TAC, TAG, TAT
         ['S', 'S', 'S', 'S'], // TCA, TCC, TCG, TCT
-        ['-', 'C', 'W', 'C'], // TGA, TGC, TGG, TGT
+        ['*', 'C', 'W', 'C'], // TGA, TGC, TGG, TGT
         ['L', 'F', 'L', 'F'], // TTA, TTC, TTG, TTT
     ],
 ];

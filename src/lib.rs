@@ -69,6 +69,28 @@ fn find_index_pair(sequence: &str, gap: &str) -> (usize, usize) {
     find_indices(sequence.as_bytes(), gap_char)
 }
 
+
+fn find_character_indices(sequence: &[u8], character: u8) -> Option<(usize, usize)> {
+    match  (sequence.iter().position(|c: &u8| *c == character), sequence.iter().rposition(|c: &u8| *c == character))
+    {
+        (Some(first), Some(last)) => Some((first, last + 1)),
+        _ => None
+    }
+}
+// Searches the given sequence for the first and last occurrence of the given character.
+// Returns an Option[tuple[int, int]].
+// If found, returns tuple with the indices. Start is inclusive, stop is exclusive. [start, stop)
+// If the character is not found, returns None.
+// Requires ascii input for both arguments. Character must be a single ascii character. (length of 1)
+// Search is case sensitive.
+#[pyfunction]
+fn find_first_last_character(sequence: &str, character: &str) -> Option<(usize, usize)> {
+    if character.len() != 1 {
+        panic!("Search character must be a single ascii character.");
+    }
+    find_character_indices(sequence.as_bytes(), character.as_bytes()[0])
+}
+
 #[pyfunction]
 fn has_data(sequence: &str, gap: char) -> bool {
     sequence.as_bytes().iter().any(|x| *x != gap as u8)
@@ -576,6 +598,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dumb_consensus_dupe, m)?)?;
     m.add_function(wrap_pyfunction!(excise_consensus_tail, m)?)?;
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
+    m.add_function(wrap_pyfunction!(find_first_last_character, m)?)?;
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference, m)?)?;
     m.add_function(wrap_pyfunction!(identity::filter_nt, m)?)?;
@@ -588,7 +611,6 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_overlap, m)?)?;
     m.add_function(wrap_pyfunction!(is_same_kmer, m)?)?;
     m.add_function(wrap_pyfunction!(get_overlap_percent, m)?)?;
-    // m.add_function(wrap_pyfunction!(align::seperate_into_clusters, m)?)?;
     m.add_function(wrap_pyfunction!(align::make_aligned_ingredients, m)?)?;
     m.add_function(wrap_pyfunction!(align::run_intermediate, m)?)?;
     m.add_function(wrap_pyfunction!(align::process_clusters, m)?)?;

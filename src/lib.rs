@@ -43,7 +43,7 @@ fn asm_index_split(sequence: String) -> Vec<(usize, usize)> {
         }
     }
     if in_data {
-        output.push((start, sequence.len()))
+        output.push((start, sequence.len() - gap_count))
     }
     output
 }

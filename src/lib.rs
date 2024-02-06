@@ -138,7 +138,7 @@ fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
 }
 
 #[pyfunction]
-fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
+fn dumb_consensus(sequences: Vec<&str>, threshold: f64, min_depth: u32) -> String {
     let first = &sequences[0];
     let mut total_at_position = vec![0_u32; first.len()];
     let mut counts_at_position = vec![[0_u32; 27]; first.len()];
@@ -172,7 +172,7 @@ fn dumb_consensus(sequences: Vec<&str>, threshold: f64) -> String {
     }
     let mut output = Vec::<u8>::with_capacity(total_at_position.len());
     for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
-        if total == 0 {
+        if total < min_depth {
             output.push(b'X');
             continue;
         } // if no characters at position, continue
@@ -279,6 +279,7 @@ fn detect_bad_regions(consensus: &String, limit: f32) -> Vec<(usize, usize)> {
 fn dumb_consensus_with_excise(
     sequences: Vec<&str>,
     consensus_threshold: f64,
+    min_depth: u32,
     excise_threshold: f64,
 ) -> (String, usize, String) {
     let first = &sequences[0];
@@ -316,7 +317,7 @@ fn dumb_consensus_with_excise(
     // let mut ratios = Vec::<u8>::with_capacity(total_at_position.len());
     // let mut ratio = Vec::<u8>::with_capacity(to)
     for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
-        if total == 0 {
+        if total < min_depth {
             output.push(b'X');
             continue;
         } // if no characters at position, continue
@@ -346,7 +347,7 @@ fn dumb_consensus_with_excise(
 }
 
 #[pyfunction]
-fn dumb_consensus_dupe(sequences: Vec<(&str, u32)>, threshold: f64) -> String {
+fn dumb_consensus_dupe(sequences: Vec<(&str, u32)>, threshold: f64, min_depth: u32) -> String {
     let (first, _) = &sequences[0];
     let mut total_at_position = vec![0_u32; first.len()];
     let mut counts_at_position = vec![[0_u32; 27]; first.len()];
@@ -380,7 +381,7 @@ fn dumb_consensus_dupe(sequences: Vec<(&str, u32)>, threshold: f64) -> String {
     }
     let mut output = Vec::<u8>::with_capacity(total_at_position.len());
     for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
-        if total == 0 {
+        if total < min_depth {
             output.push(b'X');
             continue;
         } // if no characters at position, continue
@@ -472,6 +473,81 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
     let maximum_score = std::cmp::max(max_first, max_second);
     1.0_f64 - (score as f64 / maximum_score as f64)
 }
+
+
+#[pyfunction]
+pub fn debug_blosum62_candidate_to_reference(candidate: &str, reference: &str) -> (f64, i32, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
+
+    let mut cand_locations = Vec::with_capacity(candidate.len());
+    let mut cand_sums = Vec::with_capacity(candidate.len());
+
+    let mut ref_locations = Vec::with_capacity(reference.len());
+    let mut ref_sums = Vec::with_capacity(reference.len());
+
+    let mut score_locations = Vec::with_capacity(candidate.len());
+    let mut score_sums = Vec::with_capacity(candidate.len());
+
+    let cand_bytes: &[u8] = candidate.as_bytes();
+    let ref_bytes: &[u8] = reference.as_bytes();
+
+    let mut this_score = 0;
+    let mut this_max_first = 0;
+    let mut this_max_second = 0;
+    let mut score = 0;
+    let mut max_first = 0;
+    let mut max_second = 0;
+    let length = cand_bytes.len();
+    let allowed: HashSet<u8> = HashSet::from([
+        65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
+        66, 79, 85, 42,
+    ]);
+    for i in 0..length {
+        let mut char1 = cand_bytes[i];
+        let char2 = ref_bytes[i];
+        if cand_bytes[i] == 45 {
+            char1 = b'*';
+        }
+        if ref_bytes[i] == 45 {
+            cand_locations.push(0);
+            cand_sums.push(max_first);
+
+            ref_locations.push(0);
+            ref_sums.push(max_second);
+
+            score_locations.push(0);
+            score_sums.push(score);
+            continue;
+        }
+        if !(allowed.contains(&char1)) {
+            panic!("first[i]  {} not in allowed\n{}", char1 as char, candidate);
+        }
+        if !(allowed.contains(&char2)) {
+            panic!("second[i] {} not in allowed\n{}", char2 as char, reference);
+        }
+        this_score = bio::scores::blosum62(char1, char2);
+        this_max_first = bio::scores::blosum62(char1, char1);
+        this_max_second = bio::scores::blosum62(char2, char2);
+
+
+        score += this_score;
+        max_first += this_max_first;
+        max_second += this_max_second;
+
+        cand_locations.push(this_max_first);
+        cand_sums.push(max_first);
+
+        ref_locations.push(this_max_second);
+        ref_sums.push(max_second);
+
+        score_locations.push(this_score);
+        score_sums.push(score);
+    }
+    let maximum_score = std::cmp::max(max_first, max_second);
+    let end_result = 1.0_f64 - (score as f64 / maximum_score as f64);
+
+    (end_result, maximum_score, cand_locations, cand_sums, ref_locations, ref_sums, score_locations, score_sums)
+}
+
 
 #[pyfunction]
 fn delete_empty_columns(raw_fed_sequences: Vec<&str>) -> (Vec<String>, Vec<usize>) {
@@ -601,6 +677,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(find_first_last_character, m)?)?;
     m.add_function(wrap_pyfunction!(has_data, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference, m)?)?;
+    m.add_function(wrap_pyfunction!(debug_blosum62_candidate_to_reference, m)?)?;
     m.add_function(wrap_pyfunction!(identity::filter_nt, m)?)?;
     m.add_function(wrap_pyfunction!(score_splits, m)?)?;
     m.add_function(wrap_pyfunction!(simd_hamming, m)?)?;

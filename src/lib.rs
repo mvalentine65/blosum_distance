@@ -663,7 +663,7 @@ fn convert_consensus(sequences: Vec<&str>, consensus: &str) -> String {
 
 // A Python module implemented in Rust.
 #[pymodule]
-fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
+fn sapphyre_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(asm_index_split, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;

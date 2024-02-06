@@ -1,11 +1,11 @@
 [package]
-name = "blosum_distance"
+name = "sapphyre_tools"
 version = "0.7.0"
 edition = "2021"
 include = ["/src"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "blosum_distance"
+name = "sapphyre_tools"
 crate-type = ["cdylib"]
 
 [dependencies]

@@ -323,29 +323,33 @@ fn detect_regions(sequence: &str) -> Vec<(usize, usize)> {
     regions
 }
 
-fn overlap_and_distance(con: &[u8], can: &[u8]) -> (usize, usize) {
+fn overlap_and_distance(con: &[u8], can: &[u8]) -> (usize, usize, usize) {
     let mut overlap = 0;
     let mut distance = 0;
+    let mut total_length = 0;
     for (con_char,can_char) in con.iter().zip(can.iter()) {
         if !(*con_char == b'X' || *can_char == b'X') { overlap += 1;}
-        if *con_char != *can_char {distance += 1;}
+        if *con_char != b'X' && *con_char != *can_char {distance += 1;}
+        total_length += 1;
     }
-    (overlap, distance)
+    (overlap, distance, total_length)
 }
 #[pyfunction]
-pub fn consensus_distance(consensus: String, candidate: String, min_length: usize, min_overlap: usize) -> usize {
+pub fn consensus_distance(consensus: String, candidate: String, min_length: usize, min_overlap: usize) -> (usize,usize) {
     let can = &_mask_small_regions(&candidate, min_length);
     let regions = detect_regions(&candidate);
     let can = can.as_bytes();
     let con = consensus.as_bytes();
+    let mut total_length = 0;
     let mut total_distance = 0;
     for (begin, end) in regions.iter() {
-        let (overlap, distance) = overlap_and_distance(&con[*begin..*end], &can[*begin..*end]);
-        if overlap > min_overlap {
+        let (overlap, distance, length) = overlap_and_distance(&con[*begin..*end], &can[*begin..*end]);
+        if overlap >= min_overlap {
             total_distance += distance;
+            total_length += length;
         }
     }
-    total_distance
+    (total_distance, total_length)
 }
 // #[pyfunction]
 // fn dumb_consensus_with_excise(

@@ -94,16 +94,13 @@ fn _dumb_consensus2(sequences: Vec<&str>, threshold: f64, min_depth: u32) -> Str
         if end > max {
             max = end;
         }
-        // let seq = &seq[..];
         for index in start..end {
             if index == seq.len() {
                 continue;
             }
-            // total_at_position[index] += 1;
+            total_at_position[index] += 1;
             if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
-                // if seq[index]-ASCII_OFFSET == 233 {println!("{}",seq[index]);}
                 counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += 1;
-                total_at_position[index] += 1;
             } else {
                 counts_at_position[index][26] += 1;
             }
@@ -161,7 +158,6 @@ fn _dumb_consensus_dupe1(sequences: Vec<(&str, u32)>, threshold: f64) -> String 
             }
             total_at_position[index] += count;
             if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
-                // if seq[index]-ASCII_OFFSET == 233 {println!("{}",seq[index]);}
                 counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += count;
             } else {
                 counts_at_position[index][26] += count;
@@ -215,10 +211,9 @@ fn _dumb_consensus_dupe2(sequences: Vec<(&str, u32)>, threshold: f64, min_depth:
             if index == seq.len() {
                 continue;
             }
+            total_at_position[index] += count;
             if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
-                // if seq[index]-ASCII_OFFSET == 233 {println!("{}",seq[index]);}
                 counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += count;
-                total_at_position[index] += count;
             } else {
                 counts_at_position[index][26] += count;
             }

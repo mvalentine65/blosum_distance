@@ -10,7 +10,7 @@ mod utils;
 mod translate;
 mod consensus;
 mod interval_tree;
-// mod prepare;
+mod prepare;
 
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;
@@ -713,7 +713,7 @@ fn sapphyre_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;
     m.add_class::<interval_tree::OverlapTree>()?;
-    
+    m.add_class::<prepare::GxHasher>()?;    
     Ok(())
 }
 

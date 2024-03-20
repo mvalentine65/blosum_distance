@@ -9,6 +9,8 @@ mod sigclust;
 mod utils;
 mod translate;
 mod consensus;
+mod interval_tree;
+// mod prepare;
 
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;
@@ -706,9 +708,12 @@ fn sapphyre_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(utils::write_fasta_compressed, m)?)?;
     m.add_function(wrap_pyfunction!(utils::write_fasta_uncompressed, m)?)?;
     m.add_function(wrap_pyfunction!(translate::translate, m)?)?;
+    m.add_function(wrap_pyfunction!(interval_tree::del_cols, m)?)?;
 
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;
+    m.add_class::<interval_tree::OverlapTree>()?;
+    
     Ok(())
 }
 

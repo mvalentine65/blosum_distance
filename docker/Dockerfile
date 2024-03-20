@@ -13,6 +13,9 @@ RUN curl --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 # add cargo and python interpreters to PATH
 ENV PATH /opt/python/cp38-cp38/bin:/opt/python/cp39-cp39/bin:/opt/python/cp310-cp310/bin:/opt/python/cp311-cp311/bin:/root/.cargo/bin:$PATH
 
+# add aes rustflag for GxHash
+ENV RUSTFLAGS="-C target-feature=+aes"
+
 # install maturin in each supported version of python
 RUN python3.8 -m pip install maturin && \
   python3.9 -m pip install maturin && \

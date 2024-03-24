@@ -713,7 +713,9 @@ fn sapphyre_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;
     m.add_class::<interval_tree::OverlapTree>()?;
-    m.add_class::<prepare::GxHasher>()?;    
+    m.add_class::<prepare::PyGxSet>()?;
+    m.add_class::<prepare::PyGxDict>()?;
+    m.add_class::<prepare::PyGxCounter>()?;
     Ok(())
 }
 

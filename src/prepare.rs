@@ -13,9 +13,9 @@ use std::collections::{HashSet};
 //use bio::io::fasta::{Record, Records};
 // use fastx::R
 // use utils::FastaParser;
-fn has_lowercase(sequence: &String) -> bool {
-    sequence.as_bytes().any(|c| (c >= b'a') && (c <= b'z'))
-}
+// fn has_lowercase(sequence: &String) -> bool {
+//     sequence.as_bytes().any(|c| (c >= b'a') && (c <= b'z'))
+// }
 
 #[pyclass]
 pub struct PyGxSet {

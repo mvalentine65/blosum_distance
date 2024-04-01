@@ -215,7 +215,7 @@ fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
 #[pyfunction]
 fn len_without_gaps(x: String) -> usize {
     return x.as_bytes().iter()
-        .filter(|&c| c != b'-')
+        .filter(|&&c| c != b'-')
         .count()
 }
 

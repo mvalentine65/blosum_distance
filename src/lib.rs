@@ -212,6 +212,12 @@ fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
 //     }
 // }
 
+#[pyfunction]
+fn len_without_gaps(x: String) -> usize {
+    return x.as_bytes().iter()
+        .filter(|&c| c != b'-')
+        .count()
+}
 
 fn _excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
     let step = 16_usize;
@@ -675,6 +681,7 @@ fn sapphyre_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
     m.add_function(wrap_pyfunction!(constrained_distance, m)?)?;
     m.add_function(wrap_pyfunction!(convert_consensus, m)?)?;
+    m.add_function(wrap_pyfunction!(len_without_gaps, m)?)?;
     m.add_function(wrap_pyfunction!(consensus::dumb_consensus, m)?)?;
     // m.add_function(wrap_pyfunction!(dumb_consensus_with_excise, m)?)?;
     m.add_function(wrap_pyfunction!(consensus::dumb_consensus_dupe, m)?)?;

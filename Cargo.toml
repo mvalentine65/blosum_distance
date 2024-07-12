@@ -25,7 +25,6 @@ crc = "3.0.1"
 deflate = {version="1.0.0", features =["gzip", "gzip-header"]}
 gzip = { version="0.1.2" }
 meminterval = "0.4.1"
-gxhash = "3.1.1"
 
 
 [profile.dev]

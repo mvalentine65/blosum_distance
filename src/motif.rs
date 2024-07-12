@@ -1,7 +1,7 @@
 use bio::pattern_matching::pssm::{Motif, ProtMotif};
 use pyo3::prelude::*;
 #[pyclass]
-struct ScoredPosition {
+pub struct ScoredPosition {
     #[pyo3(get, set)]
     pub location: usize,
     #[pyo3(get, set)]
@@ -24,7 +24,7 @@ impl ScoredPosition {
 
 
 #[pyclass]
-struct ProteinMotif {
+pub struct ProteinMotif {
     pub matrix: ProtMotif,
 }
 
@@ -32,7 +32,7 @@ struct ProteinMotif {
 impl ProteinMotif {
     #[new]
     pub fn __init__(sequences: Vec<String>) -> ProteinMotif {
-        let seqs: [Vec<u8>] = &sequences.iter().map(|&s| s.as_bytes().to_vec()).collect();
+        let seqs: Vec<Vec<u8>> = sequences.iter().map(|s| s.as_bytes().to_vec()).collect();
         ProteinMotif {
             matrix: ProtMotif::from_seqs(&seqs, None).unwrap()
         }
@@ -54,39 +54,39 @@ impl ProteinMotif {
         self.matrix.degenerate_consensus()
     }
     
-    pub fn lookup(&self, mono: u8) -> Option<usize> {
-        match self.matrix.lookup(mono) {
-            Ok(m) => m,
-            Err(_) => None,
-        }
-    }
-    
+    // pub fn lookup(&self, mono: u8) -> Option<usize> {
+    //     match self.matrix.lookup(mono) {
+    //         Ok(m) => Some(m),
+    //         Err(_) => None,
+    //     }
+    // }
+    // 
     pub fn len(&self) -> usize {
         self.matrix.len()
     }
     
-    pub fn rev_lk(&self, index: usize) -> u8 {
-        self.matrix.rev_lk(index)
-    }
+    // pub fn rev_lk(&self, index: usize) -> u8 {
+    //     self.matrix.rev_lk(index)
+    // }
     
     pub fn is_empty(&self) -> bool {
         self.matrix.is_empty()
     }
     
     pub fn raw_scores(&self, query_sequence: String) -> Option<(usize, f32, Vec<f32>)> {
-        match self.matrix.raw_score(query_sequence.iter()) {
-            Ok(tuple) => tuple,
+        match self.matrix.raw_score(query_sequence.as_bytes()) {
+            Ok(tuple) => Some(tuple),
             Err(_) => None,
         }
     }
     
     pub fn score(&self, query_sequence: String) -> Option<ScoredPosition> {
-        match self.matrix.score(query_sequence.iter()) {
-            Ok(scored) => ScoredPosition{
+        match self.matrix.score(query_sequence.as_bytes()) {
+            Ok(scored) => Some(ScoredPosition{
                                         location: scored.loc,
                                         sum: scored.sum,
                                         scores: scored.scores,
-                                        },
+                                        }),
             Err(_) => None,
         }
     }
@@ -95,11 +95,4 @@ impl ProteinMotif {
         self.matrix.info_content()
     }
     
-    pub fn __eq__(&self, other: ProteinMotif) -> bool {
-        self.matrix.eq(&other.matrix)
-    }
-    
-    pub fn __ne__(&self, other: ProteinMotif) -> bool {
-        self.matrix.ne(&other.matrix)
-    }
 }

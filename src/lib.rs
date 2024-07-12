@@ -11,6 +11,7 @@ mod translate;
 mod consensus;
 mod interval_tree;
 mod prepare;
+mod motif;
 
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;

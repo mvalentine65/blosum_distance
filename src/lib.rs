@@ -1,15 +1,15 @@
+mod align;
+mod consensus;
+mod entropy;
 mod flexcull;
 mod hit;
 mod identity;
-mod overlap;
-mod align;
-mod entropy;
-mod sigclust;
-mod utils;
-mod translate;
-mod consensus;
 mod interval_tree;
 mod motif;
+mod overlap;
+mod sigclust;
+mod translate;
+mod utils;
 
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;
@@ -71,12 +71,13 @@ fn find_index_pair(sequence: &str, gap: &str) -> (usize, usize) {
     find_indices(sequence.as_bytes(), gap_char)
 }
 
-
 fn find_character_indices(sequence: &[u8], character: u8) -> Option<(usize, usize)> {
-    match  (sequence.iter().position(|c: &u8| *c == character), sequence.iter().rposition(|c: &u8| *c == character))
-    {
+    match (
+        sequence.iter().position(|c: &u8| *c == character),
+        sequence.iter().rposition(|c: &u8| *c == character),
+    ) {
         (Some(first), Some(last)) => Some((first, last + 1)),
-        _ => None
+        _ => None,
     }
 }
 // Searches the given sequence for the first and last occurrence of the given character.
@@ -141,9 +142,7 @@ fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
 
 #[pyfunction]
 fn len_without_gaps(x: String) -> usize {
-    return x.as_bytes().iter()
-        .filter(|&&c| c != b'-')
-        .count()
+    return x.as_bytes().iter().filter(|&&c| c != b'-').count();
 }
 
 fn _excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
@@ -180,42 +179,9 @@ fn excise_consensus_tail(consensus: String, limit: f64) -> (String, usize) {
     _excise_consensus_tail(&consensus, limit)
 }
 
-fn detect_bad_regions(consensus: &String, limit: f32) -> Vec<(usize, usize)> {
-    let mut previous_ratio = 0_f32;
-    let mut current_ratio = 0_f32;
-
-    let mut num_x = 0_usize;
-    let mut last_x;
-    let mut beginning: Option<usize> = None;
-    let mut total = 0_usize;
-
-    let mut output: Vec<(usize, usize)> = Vec::new();
-    let bytes = consensus.as_bytes();
-    let (start, end) = find_indices(bytes, b'X');
-
-    for i in start..end {
-        previous_ratio = current_ratio;
-        if bytes[i] == b'X' {
-            num_x += 1;
-            last_x = i;
-            match beginning {
-                // if begging is None, this is the start of a region
-                None => beginning = Some(i),
-                _ => (),
-            }
-        }
-        total += 1;
-        current_ratio = num_x as f32 / total as f32;
-        // if this condition triggers, we have just exited a region
-        // reset values and look for last X character as the end of the region
-        if current_ratio < limit && previous_ratio >= limit {}
-    }
-    output
-}
-
-
 #[pyfunction]
 fn blosum62_distance(one: String, two: String) -> f64 {
+    // only used for ref to ref
     let first: &[u8] = one.as_bytes();
     let second: &[u8] = two.as_bytes();
     let mut score = 0;
@@ -241,6 +207,7 @@ fn blosum62_distance(one: String, two: String) -> f64 {
         if !(allowed.contains(&char2)) {
             panic!("second[i] {} not in allowed\n{}", char2 as char, two);
         }
+        // score += bio::scores::blosum62(char1, char2);
         score += bio::scores::blosum62(char1, char2);
         max_first += bio::scores::blosum62(char1, char1);
         max_second += bio::scores::blosum62(char2, char2);
@@ -257,17 +224,18 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
     let mut max_first = 0;
     let mut max_second = 0;
     let length = cand_bytes.len();
+    assert!(length == ref_bytes.len());
     let allowed: HashSet<u8> = HashSet::from([
         65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
         66, 79, 85, 42,
     ]);
     for i in 0..length {
         let mut char1 = cand_bytes[i];
-        let char2 = ref_bytes[i];
+        let mut char2 = ref_bytes[i];
         if cand_bytes[i] == 45 {
             char1 = b'*';
         }
-        if ref_bytes[i] == 45 {
+        if ref_bytes[i] == 45 || ref_bytes[i] == b'*' {
             continue;
         }
         if !(allowed.contains(&char1)) {
@@ -276,18 +244,35 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
         if !(allowed.contains(&char2)) {
             panic!("second[i] {} not in allowed\n{}", char2 as char, reference);
         }
-        score += bio::scores::blosum62(char1, char2);
-        max_first += bio::scores::blosum62(char1, char1);
-        max_second += bio::scores::blosum62(char2, char2);
+
+        if char1 == b'*' || char1 == b'-' {
+            score += -11;
+            max_first += -11;
+            max_second += bio::scores::blosum62(char2, char2);
+        } else {
+            score += bio::scores::blosum62(char1, char2);
+            max_first += bio::scores::blosum62(char1, char1);
+            max_second += bio::scores::blosum62(char2, char2);
+        }
     }
     let maximum_score = std::cmp::max(max_first, max_second);
     1.0_f64 - (score as f64 / maximum_score as f64)
 }
 
-
 #[pyfunction]
-pub fn debug_blosum62_candidate_to_reference(candidate: &str, reference: &str) -> (f64, i32, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
-
+pub fn debug_blosum62_candidate_to_reference(
+    candidate: &str,
+    reference: &str,
+) -> (
+    f64,
+    i32,
+    Vec<i32>,
+    Vec<i32>,
+    Vec<i32>,
+    Vec<i32>,
+    Vec<i32>,
+    Vec<i32>,
+) {
     let mut cand_locations = Vec::with_capacity(candidate.len());
     let mut cand_sums = Vec::with_capacity(candidate.len());
 
@@ -334,10 +319,15 @@ pub fn debug_blosum62_candidate_to_reference(candidate: &str, reference: &str) -
         if !(allowed.contains(&char2)) {
             panic!("second[i] {} not in allowed\n{}", char2 as char, reference);
         }
-        this_score = bio::scores::blosum62(char1, char2);
-        this_max_first = bio::scores::blosum62(char1, char1);
-        this_max_second = bio::scores::blosum62(char2, char2);
-
+        if char1 == b'*' || char1 == b'-' {
+            this_score = -11;
+            this_max_first = -11;
+            this_max_second += bio::scores::blosum62(char2, char2);
+        } else {
+            this_score += bio::scores::blosum62(char1, char2);
+            this_max_first += bio::scores::blosum62(char1, char1);
+            this_max_second += bio::scores::blosum62(char2, char2);
+        }
 
         score += this_score;
         max_first += this_max_first;
@@ -355,9 +345,17 @@ pub fn debug_blosum62_candidate_to_reference(candidate: &str, reference: &str) -
     let maximum_score = std::cmp::max(max_first, max_second);
     let end_result = 1.0_f64 - (score as f64 / maximum_score as f64);
 
-    (end_result, maximum_score, cand_locations, cand_sums, ref_locations, ref_sums, score_locations, score_sums)
+    (
+        end_result,
+        maximum_score,
+        cand_locations,
+        cand_sums,
+        ref_locations,
+        ref_sums,
+        score_locations,
+        score_sums,
+    )
 }
-
 
 #[pyfunction]
 fn delete_empty_columns(raw_fed_sequences: Vec<&str>) -> (Vec<String>, Vec<usize>) {
@@ -471,7 +469,6 @@ fn convert_consensus(sequences: Vec<&str>, consensus: &str) -> String {
     String::from_utf8(con_list).unwrap()
 }
 
-
 // A Python module implemented in Rust.
 #[pymodule]
 fn sapphyre_tools(_py: Python, m: &PyModule) -> PyResult<()> {
@@ -482,7 +479,6 @@ fn sapphyre_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(convert_consensus, m)?)?;
     m.add_function(wrap_pyfunction!(len_without_gaps, m)?)?;
     m.add_function(wrap_pyfunction!(consensus::dumb_consensus, m)?)?;
-    // m.add_function(wrap_pyfunction!(dumb_consensus_with_excise, m)?)?;
     m.add_function(wrap_pyfunction!(consensus::dumb_consensus_dupe, m)?)?;
     m.add_function(wrap_pyfunction!(consensus::filter_regions, m)?)?;
     m.add_function(wrap_pyfunction!(consensus::consensus_distance, m)?)?;
@@ -521,10 +517,9 @@ fn sapphyre_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<interval_tree::OverlapTree>()?;
     m.add_class::<motif::ScoredPosition>()?;
     m.add_class::<motif::ProteinMotif>()?;
-    
+
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

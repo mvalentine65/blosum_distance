@@ -110,12 +110,12 @@ fn is_same_kmer(one: &str, two: &str) -> bool {
 }
 
 #[pyfunction]
-fn score_splits(ref_slice: &str, splits: Vec<(&str, u64)>) -> u64 {
+fn score_splits(ref_slice: &str, splits: Vec<(String, u64)>) -> u64 {
     let mut min_distance: u64 = ref_slice.len() as u64;
     let mut winning_index: u64 = 0;
     let mut current: u64 = ref_slice.len() as u64;
     for (seq, index) in splits {
-        current = simd_hamming(ref_slice, seq);
+        current = simd_hamming(ref_slice, seq.as_ref());
         if current < min_distance {
             min_distance = current;
             winning_index = index;
@@ -172,7 +172,7 @@ fn _excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
         percent_invalid = num_invalid as f64 / denominator as f64;
     }
     (consensus[0..end].to_string(), end)
-}
+}   
 
 #[pyfunction]
 fn excise_consensus_tail(consensus: String, limit: f64) -> (String, usize) {
@@ -187,7 +187,7 @@ fn blosum62_distance(one: String, two: String) -> f64 {
     let mut score = 0;
     let mut max_first = 0;
     let mut max_second = 0;
-    let length = first.len();
+    let length = first.len();   
     let allowed: HashSet<u8> = HashSet::from([
         65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
         66, 79, 85, 42,
@@ -358,12 +358,12 @@ pub fn debug_blosum62_candidate_to_reference(
 }
 
 #[pyfunction]
-fn delete_empty_columns(raw_fed_sequences: Vec<&str>) -> (Vec<String>, Vec<usize>) {
+fn delete_empty_columns(raw_fed_sequences: Vec<String>) -> (Vec<String>, Vec<usize>) {
     let mut result = Vec::<String>::with_capacity(raw_fed_sequences.len());
-    let mut headers = Vec::<&str>::with_capacity(raw_fed_sequences.len() / 2 + 1);
+    let mut headers = Vec::<&String>::with_capacity(raw_fed_sequences.len() / 2 + 1);
     let mut sequences = Vec::<&[u8]>::with_capacity(raw_fed_sequences.len() / 2 + 1);
     for i in (1..raw_fed_sequences.len()).step_by(2) {
-        headers.push(raw_fed_sequences[i - 1]);
+        headers.push(&raw_fed_sequences[i - 1]);
         sequences.push(raw_fed_sequences[i].as_bytes())
     }
     if sequences.is_empty() {
@@ -455,7 +455,7 @@ fn replace_small_gaps(mut consensus_array: Vec<u8>, limit: usize) -> Vec<u8> {
 }
 
 #[pyfunction]
-fn convert_consensus(sequences: Vec<&str>, consensus: &str) -> String {
+fn convert_consensus(sequences: Vec<String>, consensus: &str) -> String {
     let replacement = b'?';
     let seqs: Vec<&[u8]> = sequences.iter().map(|seq| seq.as_bytes()).collect();
     let con_list = consensus.as_bytes();

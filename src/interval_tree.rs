@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use meminterval::{Interval, IntervalTree};
-use std::ops::Bound::*;
 use pyo3::prelude::*;
 
 #[pyclass]

@@ -19,4 +19,4 @@ pip install sapphyre-tools
 Actively maintained and used in research pipelines. Packaging and documentation improvements are in progress.
 
 ## License
-MIT
+Apache-2.0

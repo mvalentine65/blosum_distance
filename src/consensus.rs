@@ -3,20 +3,20 @@ use pyo3::pyfunction;
 use crate::find_indices;
 
 #[pyfunction]
-pub fn dumb_consensus(sequences: Vec<&str>, threshold: f64, min_depth: u32) -> String {
+pub fn dumb_consensus(sequences: Vec<String>, threshold: f64, min_depth: u32) -> String {
     match min_depth {
     0 => _dumb_consensus1(sequences,threshold),
     _ => _dumb_consensus2(sequences, threshold, min_depth),
     }
 }
 #[pyfunction]
-pub fn dumb_consensus_dupe(sequences: Vec<(&str, u32)>, threshold: f64, min_depth: u32) -> String {
+pub fn dumb_consensus_dupe(sequences: Vec<(String, u32)>, threshold: f64, min_depth: u32) -> String {
     match min_depth {
         0 => _dumb_consensus_dupe1(sequences, threshold),
         _ => _dumb_consensus_dupe2(sequences, threshold, min_depth),
     }
 }
-fn _dumb_consensus1(sequences: Vec<&str>, threshold: f64) -> String {
+fn _dumb_consensus1(sequences: Vec<String>, threshold: f64) -> String {
     let first = &sequences[0];
     let mut total_at_position = vec![0_u32; first.len()];
     let mut counts_at_position = vec![[0_u32; 27]; first.len()];
@@ -76,7 +76,7 @@ fn _dumb_consensus1(sequences: Vec<&str>, threshold: f64) -> String {
     String::from_utf8(output).unwrap()
 }
 
-fn _dumb_consensus2(sequences: Vec<&str>, threshold: f64, min_depth: u32) -> String {
+fn _dumb_consensus2(sequences: Vec<String>, threshold: f64, min_depth: u32) -> String {
     let first = &sequences[0];
     let mut total_at_position = vec![0_u32; first.len()];
     let mut counts_at_position = vec![[0_u32; 27]; first.len()];
@@ -133,7 +133,7 @@ fn _dumb_consensus2(sequences: Vec<&str>, threshold: f64, min_depth: u32) -> Str
     String::from_utf8(output).unwrap()
 }
 
-fn _dumb_consensus_dupe1(sequences: Vec<(&str, u32)>, threshold: f64) -> String {
+fn _dumb_consensus_dupe1(sequences: Vec<(String, u32)>, threshold: f64) -> String {
     let (first, _) = &sequences[0];
     let mut total_at_position = vec![0_u32; first.len()];
     let mut counts_at_position = vec![[0_u32; 27]; first.len()];
@@ -188,7 +188,7 @@ fn _dumb_consensus_dupe1(sequences: Vec<(&str, u32)>, threshold: f64) -> String 
     }
     String::from_utf8(output).unwrap()
 }
-fn _dumb_consensus_dupe2(sequences: Vec<(&str, u32)>, threshold: f64, min_depth: u32) -> String {
+fn _dumb_consensus_dupe2(sequences: Vec<(String, u32)>, threshold: f64, min_depth: u32) -> String {
     let (first, _) = &sequences[0];
     let mut total_at_position = vec![0_u32; first.len()];
     let mut counts_at_position = vec![[0_u32; 27]; first.len()];

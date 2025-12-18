@@ -264,7 +264,7 @@ pub fn fast_dedupe(
         items.sort_unstable_by(|a, b| b.1.cmp(a.1));
 
         for (i, (seq, &cnt)) in items.into_iter().enumerate() {
-            writeln!(out, ">NODE_{}|{}", i + 1, cnt)?;
+            writeln!(out, ">{}|{}", i + 1, cnt)?;
             out.write_all(seq)?;
             writeln!(out)?;
         }
@@ -275,7 +275,7 @@ pub fn fast_dedupe(
                 continue;
             }
             idx += 1;
-            writeln!(out, ">NODE_{}|{}", idx, cnt)?;
+            writeln!(out, ">{}|{}", idx, cnt)?;
             out.write_all(seq)?;
             writeln!(out)?;
         }

@@ -10,7 +10,9 @@ mod overlap;
 mod sigclust;
 mod translate;
 mod utils;
+mod dedupe;
 
+use dedupe::fast_dedupe as rust_fast_dedupe;
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;
 use hit::Hit;
@@ -19,6 +21,8 @@ use itertools::enumerate;
 use overlap::{get_overlap, get_overlap_percent};
 use pyo3::prelude::*;
 use std::collections::HashSet;
+use std::path::PathBuf;
+use pyo3::exceptions::PyRuntimeError;
 
 #[pyfunction]
 fn asm_index_split(sequence: String) -> Vec<(usize, usize)> {
@@ -469,10 +473,38 @@ fn convert_consensus(sequences: Vec<String>, consensus: &str) -> String {
     String::from_utf8(con_list).unwrap()
 }
 
+
+#[pyfunction]
+fn fast_dedupe(
+    r1: &str,
+    r2: &str,
+    out: &str,
+    threads: usize,
+    batch_pairs: usize,
+    sort_by_size: bool,
+    min_size: usize,
+) -> PyResult<()> {
+    let r1 = PathBuf::from(r1);
+    let r2 = PathBuf::from(r2);
+    let out = PathBuf::from(out);
+
+    rust_fast_dedupe(
+        r1,
+        r2,
+        out,
+        threads,
+        batch_pairs,
+        sort_by_size,
+        min_size,
+    ).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(())
+}
 // A Python module implemented in Rust.
 #[pymodule]
 
 fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(fast_dedupe, m)?)?;
     m.add_function(wrap_pyfunction!(asm_index_split, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;

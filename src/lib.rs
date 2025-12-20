@@ -473,16 +473,51 @@ fn convert_consensus(sequences: Vec<String>, consensus: &str) -> String {
     String::from_utf8(con_list).unwrap()
 }
 
+#[pyfunction]
+pub fn preprocess_n_chunks(
+    // Accepting String here fixes the "Can't extract str to Vec" error
+    data: Vec<(String, String)>, 
+    min_length: usize,
+) -> PyResult<Vec<(String, String)>> {
+    // Pre-allocate for performance
+    let mut results = Vec::with_capacity(data.len());
+
+    for (header, seq) in data {
+        // Fast fail for length
+        if seq.len() < min_length {
+            continue;
+        }
+
+        // Optimization: No 'N' found
+        // seq.as_bytes() allows us to use SIMD scanning on the string data
+        if !seq.as_bytes().contains(&b'N') && !seq.as_bytes().contains(&b'n') {
+            // Move the strings into the results (No new allocation for the data)
+            results.push((header, seq));
+        } else {
+            // Dirty path: Split by 'N' or 'n'
+            // We use .as_bytes().split() because it's faster than string splitting
+            for chunk_bytes in seq.as_bytes().split(|&b| b == b'N' || b == b'n') {
+                if chunk_bytes.len() >= min_length {
+                    // Convert the valid slice back to an owned String
+                    let chunk_str = String::from_utf8_lossy(chunk_bytes).into_owned();
+                    // We must clone the header for each sub-chunk
+                    results.push((header.clone(), chunk_str));
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
 
 #[pyfunction]
 fn fast_dedupe(
     r1: &str,
     r2: &str,
     out: &str,
-    threads: usize,
-    batch_pairs: usize,
     sort_by_size: bool,
-    min_size: usize,
+    min_size: u64,
 ) -> PyResult<()> {
     let r1 = PathBuf::from(r1);
     let r2 = PathBuf::from(r2);
@@ -492,8 +527,6 @@ fn fast_dedupe(
         r1,
         r2,
         out,
-        threads,
-        batch_pairs,
         sort_by_size,
         min_size,
     ).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -504,6 +537,7 @@ fn fast_dedupe(
 #[pymodule]
 
 fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(preprocess_n_chunks, m)?)?;
     m.add_function(wrap_pyfunction!(fast_dedupe, m)?)?;
     m.add_function(wrap_pyfunction!(asm_index_split, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;

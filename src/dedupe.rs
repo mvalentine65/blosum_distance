@@ -178,7 +178,7 @@ pub fn fast_dedupe(
     }
 
     for (i, b) in items.into_iter().enumerate() {
-        writeln!(out, ">NODE_{}|{}", i + 1, b.count)?;
+        writeln!(out, ">{}|{}", i + 1, b.count)?;
         out.write_all(table.arena_get(b.off, b.len))?;
         writeln!(out)?;
     }

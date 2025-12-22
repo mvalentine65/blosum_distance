@@ -137,8 +137,7 @@ fn open_reader(path: &PathBuf) -> Result<Box<dyn Read + Send>> {
 
 
 pub fn fast_dedupe(
-    r1: PathBuf,
-    r2: PathBuf,
+    input_paths: Vec<PathBuf>, // Changed from r1, r2 to a Vec
     out: PathBuf,
     sort_by_size: bool,
     min_size: u64,
@@ -146,23 +145,31 @@ pub fn fast_dedupe(
     // Single-threaded table initialization
     let mut table = DedupTable::with_capacity(2_000_000);
     
-    let mut r1r = Reader::new(open_reader(&r1)?);
-    let mut r2r = Reader::new(open_reader(&r2)?);
+    // Reuse a buffer for canonicalization to avoid massive allocation overhead
+    let mut scratch = Vec::with_capacity(300);
 
-    let mut it1 = r1r.records();
-    let mut it2 = r2r.records();
+    // PHASE 1: DEDUPLICATION
+    for path in input_paths {
+        let mut reader = Reader::new(open_reader(&path)?);
+        let mut records = reader.records();
 
-    // PHASE 1: DEDUPLICATION (Single-threaded loop as in main_bestrs)
-    while let (Some(ra), Some(rb)) = (it1.next(), it2.next()) {
-        let ra = ra.context("Error reading R1 record")?;
-        let rb = rb.context("Error reading R2 record")?;
-
-        table.add(&get_canonical(ra.seq()));
-        table.add(&get_canonical(rb.seq()));
+        while let Some(record) = records.next() {
+            let rec = record.context("Error reading FASTQ record")?;
+            let seq = rec.seq();
+            
+            // In-place canonicalization logic to save memory/time
+            if forward_is_canonical(seq) {
+                table.add(seq);
+            } else {
+                scratch.clear();
+                scratch.extend(seq.iter().rev().map(|&b| complement(b)));
+                table.add(&scratch);
+            }
+        }
     }
 
     // PHASE 2: WRITING
-    let mut out: Box<dyn Write> = if out.as_os_str() == "-" {
+    let mut writer: Box<dyn Write> = if out.as_os_str() == "-" {
         Box::new(BufWriter::with_capacity(8 << 20, io::stdout().lock()))
     } else {
         let f = File::create(&out).with_context(|| format!("Failed to create {}", out.display()))?;
@@ -178,11 +185,11 @@ pub fn fast_dedupe(
     }
 
     for (i, b) in items.into_iter().enumerate() {
-        writeln!(out, ">{}|{}", i + 1, b.count)?;
-        out.write_all(table.arena_get(b.off, b.len))?;
-        writeln!(out)?;
+        writeln!(writer, ">{}|{}", i + 1, b.count)?;
+        writer.write_all(table.arena_get(b.off, b.len))?;
+        writeln!(writer)?;
     }
     
-    out.flush()?;
+    writer.flush()?;
     Ok(())
 }

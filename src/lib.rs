@@ -510,23 +510,25 @@ pub fn preprocess_n_chunks(
     Ok(results)
 }
 
-
 #[pyfunction]
 fn fast_dedupe(
-    r1: &str,
-    r2: &str,
+    inputs: Vec<String>,      // Accept a list of strings from Python
     out: &str,
     sort_by_size: bool,
     min_size: u64,
 ) -> PyResult<()> {
-    let r1 = PathBuf::from(r1);
-    let r2 = PathBuf::from(r2);
-    let out = PathBuf::from(out);
+    // Convert all input strings into PathBufs
+    let input_paths: Vec<PathBuf> = inputs
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        
+    let out_path = PathBuf::from(out);
 
+    // Call the updated Rust function
     rust_fast_dedupe(
-        r1,
-        r2,
-        out,
+        input_paths,
+        out_path,
         sort_by_size,
         min_size,
     ).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;

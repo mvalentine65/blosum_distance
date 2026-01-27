@@ -10,7 +10,9 @@ mod overlap;
 mod sigclust;
 mod translate;
 mod utils;
+mod dedupe;
 
+use dedupe::fast_dedupe as rust_fast_dedupe;
 use bio::alignment::distance::simd::hamming;
 use flexcull::*;
 use hit::Hit;
@@ -19,6 +21,8 @@ use itertools::enumerate;
 use overlap::{get_overlap, get_overlap_percent};
 use pyo3::prelude::*;
 use std::collections::HashSet;
+use std::path::PathBuf;
+use pyo3::exceptions::PyRuntimeError;
 
 #[pyfunction]
 fn asm_index_split(sequence: String) -> Vec<(usize, usize)> {
@@ -469,10 +473,74 @@ fn convert_consensus(sequences: Vec<String>, consensus: &str) -> String {
     String::from_utf8(con_list).unwrap()
 }
 
+#[pyfunction]
+pub fn preprocess_n_chunks(
+    // Accepting String here fixes the "Can't extract str to Vec" error
+    data: Vec<(String, String)>, 
+    min_length: usize,
+) -> PyResult<Vec<(String, String)>> {
+    // Pre-allocate for performance
+    let mut results = Vec::with_capacity(data.len());
+
+    for (header, seq) in data {
+        // Fast fail for length
+        if seq.len() < min_length {
+            continue;
+        }
+
+        // Optimization: No 'N' found
+        // seq.as_bytes() allows us to use SIMD scanning on the string data
+        if !seq.as_bytes().contains(&b'N') && !seq.as_bytes().contains(&b'n') {
+            // Move the strings into the results (No new allocation for the data)
+            results.push((header, seq));
+        } else {
+            // Dirty path: Split by 'N' or 'n'
+            // We use .as_bytes().split() because it's faster than string splitting
+            for chunk_bytes in seq.as_bytes().split(|&b| b == b'N' || b == b'n') {
+                if chunk_bytes.len() >= min_length {
+                    // Convert the valid slice back to an owned String
+                    let chunk_str = String::from_utf8_lossy(chunk_bytes).into_owned();
+                    // We must clone the header for each sub-chunk
+                    results.push((header.clone(), chunk_str));
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+#[pyfunction]
+fn fast_dedupe(
+    inputs: Vec<String>,      // Accept a list of strings from Python
+    out: &str,
+    sort_by_size: bool,
+    min_size: u64,
+) -> PyResult<()> {
+    // Convert all input strings into PathBufs
+    let input_paths: Vec<PathBuf> = inputs
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        
+    let out_path = PathBuf::from(out);
+
+    // Call the updated Rust function
+    rust_fast_dedupe(
+        input_paths,
+        out_path,
+        sort_by_size,
+        min_size,
+    ).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(())
+}
 // A Python module implemented in Rust.
 #[pymodule]
 
 fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(preprocess_n_chunks, m)?)?;
+    m.add_function(wrap_pyfunction!(fast_dedupe, m)?)?;
     m.add_function(wrap_pyfunction!(asm_index_split, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;

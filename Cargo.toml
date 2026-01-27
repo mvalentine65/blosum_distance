@@ -1,6 +1,6 @@
 [package]
 name = "sapphyre_tools"
-version = "0.9.1"
+version = "0.9.3"
 edition = "2021"
 include = ["/src"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -24,6 +24,13 @@ crc = "3.0.1"
 deflate = {version="1.0.0", features =["gzip", "gzip-header"]}
 gzip = { version="0.1.2" }
 meminterval = "0.4.1"
+anyhow = "1"
+crossbeam-channel = "0.5"
+hashbrown = "0.14"
+ahash = "0.8"
+seq_io = "0.3"
+rayon = "1.10"
+flate2 = "1"
 
 
 [profile.dev]

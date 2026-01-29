@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
-use seq_io::fastq::{Reader, Record};
+use seq_io::fastq::{Reader as FastqReader, Record as FastqRecord};
+use seq_io::fasta::{Reader as FastaReader, Record as FastaRecord};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::error::Error;
 use flate2::read::MultiGzDecoder;
 
@@ -135,6 +136,34 @@ fn open_reader(path: &PathBuf) -> Result<Box<dyn Read + Send>> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum InputFormat {
+    Fasta,
+    Fastq,
+}
+
+fn data_extension(path: &PathBuf) -> Option<&str> {
+    let ext = path.extension().and_then(|e| e.to_str());
+    if ext.map(|e| e.eq_ignore_ascii_case("gz")).unwrap_or(false) {
+        path.file_stem()
+            .and_then(|s| Path::new(s).extension())
+            .and_then(|e| e.to_str())
+    } else {
+        ext
+    }
+}
+
+fn detect_format(path: &PathBuf) -> Result<InputFormat> {
+    let ext = data_extension(path)
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "fq" | "fastq" => Ok(InputFormat::Fastq),
+        "fa" | "fasta" | "fna" | "fas" | "fsa_nt" => Ok(InputFormat::Fasta),
+        _ => bail!("Unsupported input extension for {} (expected FASTQ: .fq/.fastq or FASTA: .fa/.fasta/.fna/.fas/.fsa_nt)", path.display()),
+    }
+}
+
 
 pub fn fast_dedupe(
     input_paths: Vec<PathBuf>, // Changed from r1, r2 to a Vec
@@ -150,20 +179,41 @@ pub fn fast_dedupe(
 
     // PHASE 1: DEDUPLICATION
     for path in input_paths {
-        let mut reader = Reader::new(open_reader(&path)?);
-        let mut records = reader.records();
+        match detect_format(&path)? {
+            InputFormat::Fastq => {
+                let mut reader = FastqReader::new(open_reader(&path)?);
+                let mut records = reader.records();
 
-        while let Some(record) = records.next() {
-            let rec = record.context("Error reading FASTQ record")?;
-            let seq = rec.seq();
-            
-            // In-place canonicalization logic to save memory/time
-            if forward_is_canonical(seq) {
-                table.add(seq);
-            } else {
-                scratch.clear();
-                scratch.extend(seq.iter().rev().map(|&b| complement(b)));
-                table.add(&scratch);
+                while let Some(record) = records.next() {
+                    let rec = record.context("Error reading FASTQ record")?;
+                    let seq = rec.seq();
+
+                    // In-place canonicalization logic to save memory/time
+                    if forward_is_canonical(seq) {
+                        table.add(seq);
+                    } else {
+                        scratch.clear();
+                        scratch.extend(seq.iter().rev().map(|&b| complement(b)));
+                        table.add(&scratch);
+                    }
+                }
+            }
+            InputFormat::Fasta => {
+                let mut reader = FastaReader::new(open_reader(&path)?);
+                let mut records = reader.records();
+
+                while let Some(record) = records.next() {
+                    let rec = record.context("Error reading FASTA record")?;
+                    let seq = rec.seq();
+
+                    if forward_is_canonical(seq) {
+                        table.add(seq);
+                    } else {
+                        scratch.clear();
+                        scratch.extend(seq.iter().rev().map(|&b| complement(b)));
+                        table.add(&scratch);
+                    }
+                }
             }
         }
     }

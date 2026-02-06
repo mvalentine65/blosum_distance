@@ -15,6 +15,7 @@ struct Bucket {
     off: usize, 
     len: usize,
     count: u64,
+    id: usize,
     used: bool,
 }
 
@@ -23,6 +24,8 @@ struct DedupTable {
     mask: usize,
     arena: Vec<u8>,
     used: usize,
+    next_id: usize,
+    order: Vec<usize>,
 }
 
 impl DedupTable {
@@ -34,6 +37,8 @@ impl DedupTable {
             mask: cap - 1,
             arena: Vec::with_capacity(512 * 1024 * 1024),
             used: 0,
+            next_id: 0,
+            order: Vec::with_capacity(expected_uniques),
         }
     }
 
@@ -76,7 +81,10 @@ impl DedupTable {
             if !self.buckets[i].used {
                 let off = self.arena.len();
                 self.arena.extend_from_slice(seq);
-                self.buckets[i] = Bucket { hash: h, off, len, count: 1, used: true };
+                let id = self.next_id;
+                self.next_id += 1;
+                self.order.push(id);
+                self.buckets[i] = Bucket { hash: h, off, len, count: 1, id, used: true };
                 self.used += 1;
                 return;
             }
@@ -166,11 +174,20 @@ fn detect_format(path: &PathBuf) -> Result<InputFormat> {
 
 
 pub fn fast_dedupe(
-    input_paths: Vec<PathBuf>, // Changed from r1, r2 to a Vec
+    mut input_paths: Vec<PathBuf>, // Changed from r1, r2 to a Vec
     out: PathBuf,
     sort_by_size: bool,
     min_size: u64,
 ) -> Result<(), Box<dyn Error>> {
+    // Stabilize input order by file name so IDs are deterministic across runs.
+    input_paths.sort_by(|a, b| {
+        let a_name = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let b_name = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        a_name
+            .cmp(b_name)
+            .then_with(|| a.as_os_str().cmp(b.as_os_str()))
+    });
+
     // Single-threaded table initialization
     let mut table = DedupTable::with_capacity(2_000_000);
     
@@ -226,18 +243,24 @@ pub fn fast_dedupe(
         Box::new(BufWriter::with_capacity(8 << 20, f))
     };
 
-    let mut items: Vec<Bucket> = table.buckets.iter().copied()
-        .filter(|b| b.used && b.count >= min_size)
-        .collect();
-
-    if sort_by_size {
-        items.sort_unstable_by(|a, b| b.count.cmp(&a.count));
+    let mut by_id: Vec<Option<Bucket>> = vec![None; table.next_id];
+    for b in table.buckets.iter().copied().filter(|b| b.used) {
+        by_id[b.id] = Some(b);
     }
 
-    for (i, b) in items.into_iter().enumerate() {
-        writeln!(writer, ">{}|{}", i + 1, b.count)?;
-        writer.write_all(table.arena_get(b.off, b.len))?;
-        writeln!(writer)?;
+    if sort_by_size {
+        // Intentionally preserve input order to avoid nondeterministic ties.
+    }
+
+    for id in table.order.iter().copied() {
+        if let Some(b) = by_id[id] {
+            if b.count < min_size {
+                continue;
+            }
+            writeln!(writer, ">{}|{}", id + 1, b.count)?;
+            writer.write_all(table.arena_get(b.off, b.len))?;
+            writeln!(writer)?;
+        }
     }
     
     writer.flush()?;

@@ -28,3 +28,7 @@ keywords = [
     "Python wrapper",
     "high-performance",
 ]
+
+[tool.maturin]
+python-source = "python"
+module-name = "sapphyre_tools.sapphyre_tools"

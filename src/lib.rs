@@ -1,6 +1,8 @@
 mod align;
 mod consensus;
+mod dedupe;
 mod entropy;
+mod exon_dp;
 mod flexcull;
 mod hit;
 mod identity;
@@ -10,19 +12,18 @@ mod overlap;
 mod sigclust;
 mod translate;
 mod utils;
-mod dedupe;
 
-use dedupe::fast_dedupe as rust_fast_dedupe;
 use bio::alignment::distance::simd::hamming;
+use dedupe::fast_dedupe as rust_fast_dedupe;
 use flexcull::*;
 use hit::Hit;
 use hit::ReferenceHit;
 use itertools::enumerate;
 use overlap::{get_overlap, get_overlap_percent};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use pyo3::exceptions::PyRuntimeError;
 
 #[pyfunction]
 fn asm_index_split(sequence: String) -> Vec<(usize, usize)> {
@@ -176,7 +177,7 @@ fn _excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
         percent_invalid = num_invalid as f64 / denominator as f64;
     }
     (consensus[0..end].to_string(), end)
-}   
+}
 
 #[pyfunction]
 fn excise_consensus_tail(consensus: String, limit: f64) -> (String, usize) {
@@ -191,7 +192,7 @@ fn blosum62_distance(one: String, two: String) -> f64 {
     let mut score = 0;
     let mut max_first = 0;
     let mut max_second = 0;
-    let length = first.len();   
+    let length = first.len();
     let allowed: HashSet<u8> = HashSet::from([
         65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
         66, 79, 85, 42,
@@ -476,7 +477,7 @@ fn convert_consensus(sequences: Vec<String>, consensus: &str) -> String {
 #[pyfunction]
 pub fn preprocess_n_chunks(
     // Accepting String here fixes the "Can't extract str to Vec" error
-    data: Vec<(String, String)>, 
+    data: Vec<(String, String)>,
     min_length: usize,
 ) -> PyResult<Vec<(String, String)>> {
     // Pre-allocate for performance
@@ -512,26 +513,19 @@ pub fn preprocess_n_chunks(
 
 #[pyfunction]
 fn fast_dedupe(
-    inputs: Vec<String>,      // Accept a list of strings from Python
+    inputs: Vec<String>, // Accept a list of strings from Python
     out: &str,
     sort_by_size: bool,
     min_size: u64,
 ) -> PyResult<()> {
     // Convert all input strings into PathBufs
-    let input_paths: Vec<PathBuf> = inputs
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-        
+    let input_paths: Vec<PathBuf> = inputs.into_iter().map(PathBuf::from).collect();
+
     let out_path = PathBuf::from(out);
 
     // Call the updated Rust function
-    rust_fast_dedupe(
-        input_paths,
-        out_path,
-        sort_by_size,
-        min_size,
-    ).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    rust_fast_dedupe(input_paths, out_path, sort_by_size, min_size)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     Ok(())
 }
@@ -561,6 +555,7 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(score_splits, m)?)?;
     m.add_function(wrap_pyfunction!(simd_hamming, m)?)?;
     m.add_function(wrap_pyfunction!(delete_empty_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(exon_dp::exon_dp, m)?)?;
     m.add_function(wrap_pyfunction!(join_by_tripled_index, m)?)?;
     m.add_function(wrap_pyfunction!(join_with_exclusions, m)?)?;
     m.add_function(wrap_pyfunction!(join_triplets_with_exclusions, m)?)?;

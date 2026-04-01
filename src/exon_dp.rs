@@ -1,8 +1,10 @@
+use flate2::read::GzDecoder;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rocksdb::{Options, DB};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 const INTRON_OPEN_PENALTY: f64 = -12.0;
@@ -1307,9 +1309,22 @@ fn read_clusters(path: &str) -> HashMap<String, HashMap<String, (Vec<String>, St
 
 fn read_aa_fasta(path: &str) -> Vec<(String, String)> {
     let mut entries = Vec::new();
-    let data = match fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(_) => return entries,
+    let data = if path.ends_with(".gz") {
+        let file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return entries,
+        };
+        let mut decoder = GzDecoder::new(file);
+        let mut s = String::new();
+        if decoder.read_to_string(&mut s).is_err() {
+            return entries;
+        }
+        s
+    } else {
+        match fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(_) => return entries,
+        }
     };
     let mut header = String::new();
     let mut seq = String::new();
@@ -1825,30 +1840,14 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
 
     let gff_path = find_gff_path(folder_path, &sub_dir);
     let gff_nodes = match &gff_path {
-        Some(path) => {
-            eprintln!("[exon_dp] Loaded GFF from: {}", path);
-            read_gff(path)
-        }
-        None => {
-            eprintln!(
-                "[exon_dp] WARNING: No *_coords.gff found for sub_dir='{}'. All GFF lookups will fail.",
-                sub_dir
-            );
-            HashMap::new()
-        }
+        Some(path) => read_gff(path),
+        None => HashMap::new(),
     };
-    eprintln!("[exon_dp] GFF entries: {}", gff_nodes.len());
 
     let cluster_csv = input_folder.join("resolve_clusters.csv");
     let gene_clusters = if cluster_csv.exists() {
-        let clusters = read_clusters(&cluster_csv.to_string_lossy());
-        eprintln!("[exon_dp] Loaded clusters for {} genes from {:?}", clusters.len(), cluster_csv);
-        clusters
+        read_clusters(&cluster_csv.to_string_lossy())
     } else {
-        eprintln!(
-            "[exon_dp] WARNING: resolve_clusters.csv not found at {:?}. No gaps will be examined.",
-            cluster_csv
-        );
         HashMap::new()
     };
 
@@ -1863,26 +1862,18 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
                 gene_files.push(name);
             }
         }
-    } else {
-        eprintln!(
-            "[exon_dp] WARNING: Could not read AA directory {:?}. No genes will be processed.",
-            aa_dir
-        );
     }
     gene_files.sort();
-    eprintln!("[exon_dp] Found {} AA gene files in {:?}", gene_files.len(), aa_dir);
 
     let score_thr = SCORE_FLOOR_FRAC_DEFAULT;
     let min_aa = MIN_EXON_AA_DEFAULT;
 
     let mut results_list: Vec<GeneResult> = Vec::new();
     let mut output_genes: Vec<String> = Vec::new();
-    let mut skipped_no_cluster = 0usize;
 
     for gene_file in &gene_files {
         let gene_key = gene_file.trim_end_matches(".gz");
         if !gene_clusters.contains_key(gene_key) {
-            skipped_no_cluster += 1;
             continue;
         }
 
@@ -1905,25 +1896,6 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
             min_aa,
         ));
     }
-
-    if skipped_no_cluster > 0 {
-        eprintln!(
-            "[exon_dp] {} / {} gene files had no matching cluster entry (skipped). \
-             First cluster keys: {:?}. First gene files: {:?}",
-            skipped_no_cluster,
-            gene_files.len(),
-            gene_clusters.keys().take(3).collect::<Vec<_>>(),
-            gene_files.iter().take(3).map(|f| f.trim_end_matches(".gz")).collect::<Vec<_>>(),
-        );
-    }
-    let total_gaps: usize = results_list.iter().map(|r| r.gaps).sum();
-    let total_hits: usize = results_list.iter().map(|r| r.hits).sum();
-    eprintln!(
-        "[exon_dp] Processed {} genes, {} gaps examined, {} exons recovered",
-        output_genes.len(),
-        total_gaps,
-        total_hits
-    );
 
     let output = PyDict::new(py);
 

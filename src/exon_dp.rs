@@ -1054,7 +1054,11 @@ fn filter_ref_consensus(
     rg: &HashSet<usize>,
     gs: usize,
     ge: usize,
+    coverage_thresh: f64,
 ) -> (HashMap<usize, Vec<u8>>, Vec<usize>) {
+    // Note: the Python call site passes data_cols_required=(None, None),
+    // meaning no edge trimming is performed.  We match that behaviour here
+    // by skipping edge trimming entirely.
     let usable = (ge - gs) - rg.len();
     if usable == 0 {
         return (HashMap::new(), Vec::new());
@@ -1076,7 +1080,7 @@ fn filter_ref_consensus(
         covs.push(if tot > 0 { ng as f64 / tot as f64 } else { 0.0 });
     }
     let best = covs.iter().cloned().fold(0.0f64, f64::max);
-    let target = REF_COVERAGE_THRESH * best;
+    let target = coverage_thresh * best;
     let ri: Vec<usize> = covs
         .iter()
         .enumerate()
@@ -1119,7 +1123,7 @@ fn prepare_gap_consensus(
         log.push("Not enough consecutive non-gap columns".into());
         return None;
     }
-    let (tc, _ri) = filter_ref_consensus(rcount, rc, &rg, gs, ge);
+    let (tc, _ri) = filter_ref_consensus(rcount, rc, &rg, gs, ge, REF_COVERAGE_THRESH);
     if tc.is_empty() {
         log.push("No usable consensus columns after filtering".into());
         return None;
@@ -1261,8 +1265,8 @@ fn read_gff(path: &str) -> HashMap<String, GffEntry> {
     nodes
 }
 
-fn read_clusters(path: &str) -> HashMap<String, HashMap<String, Vec<String>>> {
-    let mut gene_clusters: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+fn read_clusters(path: &str) -> HashMap<String, HashMap<String, (Vec<String>, String)>> {
+    let mut gene_clusters: HashMap<String, HashMap<String, (Vec<String>, String)>> = HashMap::new();
     let data = match fs::read_to_string(path) {
         Ok(data) => data,
         Err(_) => return gene_clusters,
@@ -1284,14 +1288,19 @@ fn read_clusters(path: &str) -> HashMap<String, HashMap<String, Vec<String>>> {
         let gene = fields[0].trim_end_matches(".gz").to_string();
         let cluster_key = fields[1].to_string();
         let nodes: Vec<String> = fields[6]
-            .split("; ")
+            .split(';')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        let isoform_type = if fields.len() > 8 {
+            fields[8].trim().to_string()
+        } else {
+            String::new()
+        };
         gene_clusters
             .entry(gene)
             .or_default()
-            .insert(cluster_key, nodes);
+            .insert(cluster_key, (nodes, isoform_type));
     }
     gene_clusters
 }
@@ -1344,7 +1353,7 @@ struct GeneResult {
 fn process_gene(
     aa_file: &str,
     entries: &[(String, String)],
-    clusters_map: &HashMap<String, HashMap<String, Vec<String>>>,
+    clusters_map: &HashMap<String, HashMap<String, (Vec<String>, String)>>,
     gff: &HashMap<String, GffEntry>,
     genome: &HashMap<String, Vec<u8>>,
     aa_idx: &[u8; 256],
@@ -1425,92 +1434,236 @@ fn process_gene(
         };
     }
 
-    for (ck, node_list) in clusters {
-        if node_list.len() < 2 {
+    // Build combined consensus (refs + candidates)
+    let mut combined: HashMap<usize, Vec<u8>> = HashMap::new();
+    for (&col, chars) in &rc {
+        combined.insert(col, chars.clone());
+    }
+    for (cs, ce, cseq) in &cseqs {
+        for i in *cs..*ce {
+            if i < cseq.len() {
+                let aa = cseq[i];
+                if aa != b'-' {
+                    combined.entry(i).or_default().push(aa);
+                }
+            }
+        }
+    }
+
+    flog.push(format!(
+        "=== {}: {} refs, {} candidates ===",
+        gene, rcount, cands.len()
+    ));
+
+    let mut hit_id = 0usize;
+
+    // Track recovered exon positions for MXE narrowing
+    let mut base_recovered_gff: HashMap<String, Vec<(String, usize, usize)>> = HashMap::new();
+
+    // Separate clusters into base and MXE, skip N-terminal
+    let mut base_clusters: Vec<(&String, &Vec<String>, &String)> = Vec::new();
+    let mut mxe_clusters: Vec<(&String, &Vec<String>, &String)> = Vec::new();
+    for (ck, (node_tokens, iso_type)) in clusters.iter() {
+        if iso_type == "N-terminal" {
             continue;
         }
-        flog.push(format!("Cluster {} ({} nodes)", ck, node_list.len()));
+        if iso_type == "MXE" {
+            mxe_clusters.push((ck, node_tokens, iso_type));
+        } else {
+            base_clusters.push((ck, node_tokens, iso_type));
+        }
+    }
+    base_clusters.sort_by_key(|(ck, _, _)| *ck);
+    mxe_clusters.sort_by_key(|(ck, _, _)| *ck);
 
-        for wi in 0..node_list.len() - 1 {
-            let nan = &node_list[wi];
-            let nbn = &node_list[wi + 1];
+    let all_clusters: Vec<_> = base_clusters
+        .iter()
+        .chain(mxe_clusters.iter())
+        .cloned()
+        .collect();
 
-            let na = match cands.iter().find(|c| {
-                let nf = c.nf.replace("NODE_", "");
-                nf == *nan
-                    || nf
-                        .split("&&")
-                        .any(|p| p == *nan || nan.split("&&").any(|q| q == p))
-            }) {
-                Some(candidate) => candidate,
-                None => continue,
+    for (ck, node_tokens, iso_type) in &all_clusters {
+        let cluster_node_fields: HashSet<String> = node_tokens
+            .iter()
+            .map(|t| format!("NODE_{}", t))
+            .collect();
+
+        // For MXE clusters, identify modular nodes
+        let modular_node_fields: HashSet<String> = if *iso_type == "MXE" {
+            if let Some(base_key) = ck.rsplit_once('_').map(|(k, _)| k.to_string()) {
+                if let Some((base_tokens, _)) = clusters.get(&base_key) {
+                    let base_fields: HashSet<String> = base_tokens
+                        .iter()
+                        .map(|t| format!("NODE_{}", t))
+                        .collect();
+                    cluster_node_fields
+                        .difference(&base_fields)
+                        .cloned()
+                        .collect()
+                } else {
+                    HashSet::new()
+                }
+            } else {
+                HashSet::new()
+            }
+        } else {
+            HashSet::new()
+        };
+
+        // Filter candidates by cluster membership
+        let mut aa_subset: Vec<usize> = cands
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| cluster_node_fields.contains(&c.nf))
+            .map(|(i, _)| i)
+            .collect();
+
+        if aa_subset.len() < 2 {
+            continue;
+        }
+
+        let is_negative = cands[aa_subset[0]].frame < 0;
+        if is_negative {
+            aa_subset.sort_by(|&a, &b| cands[b].start.cmp(&cands[a].start));
+        } else {
+            aa_subset.sort_by(|&a, &b| cands[a].start.cmp(&cands[b].start));
+        }
+
+        for wi in 1..aa_subset.len() {
+            let na_idx = aa_subset[wi - 1];
+            let nb_idx = aa_subset[wi];
+            let na = &cands[na_idx];
+            let nb = &cands[nb_idx];
+
+            let (left_end, right_start) = if is_negative {
+                (nb.end, na.start)
+            } else {
+                (na.end, nb.start)
             };
-            let nb = match cands.iter().find(|c| {
-                let nf = c.nf.replace("NODE_", "");
-                nf == *nbn
-                    || nf
-                        .split("&&")
-                        .any(|p| p == *nbn || nbn.split("&&").any(|q| q == p))
-            }) {
-                Some(candidate) => candidate,
-                None => continue,
-            };
 
-            let ga = match gff.get(nan) {
+            let gap_aa = if right_start > left_end {
+                right_start - left_end
+            } else {
+                0
+            };
+            let gap_nt = gap_aa * 3;
+
+            if gap_aa == 0
+                || gap_nt < _MINIMUM_GAP_BP
+                || gap_nt > _MAX_INTERNAL_GAP_BP
+            {
+                continue;
+            }
+
+            let gap_start = left_end;
+            let gap_end = right_start;
+
+            tgaps += 1;
+
+            let node_a_name = na.nf.replace("NODE_", "");
+            let node_b_name = nb.nf.replace("NODE_", "");
+
+            // MXE: skip gaps between two shared (non-modular) nodes
+            if *iso_type == "MXE" && !modular_node_fields.is_empty() {
+                let a_mod = modular_node_fields.contains(&na.nf);
+                let b_mod = modular_node_fields.contains(&nb.nf);
+                if !a_mod && !b_mod {
+                    continue;
+                }
+            }
+
+            let ga = match gff.get(&node_a_name) {
                 Some(gff_entry) => gff_entry,
                 None => continue,
             };
-            let gb = match gff.get(nbn) {
+            let gb = match gff.get(&node_b_name) {
                 Some(gff_entry) => gff_entry,
                 None => continue,
             };
 
-            if ga.scaffold != gb.scaffold || ga.strand != gb.strand {
+            if ga.scaffold != gb.scaffold {
                 continue;
             }
             let strand = &ga.strand;
+
+            let (region_start, region_end) = if ga.start < gb.start {
+                (ga.end + 1, if gb.start > 0 { gb.start - 1 } else { 0 })
+            } else {
+                (gb.end + 1, if ga.start > 0 { ga.start - 1 } else { 0 })
+            };
+
+            // MXE narrowing: use recovered exons from base cluster
+            let (mut rs, mut re) = (region_start, region_end);
+            if *iso_type == "MXE" {
+                if let Some(base_key) = ck.rsplit_once('_').map(|(k, _)| k.to_string()) {
+                    if let Some(recovered_list) = base_recovered_gff.get(&base_key) {
+                        let gap_recovered: Vec<_> = recovered_list
+                            .iter()
+                            .filter(|(rscaf, rrs, rre)| {
+                                *rscaf == ga.scaffold && *rrs >= rs && *rre <= re
+                            })
+                            .collect();
+                        if !gap_recovered.is_empty() {
+                            let a_mod = modular_node_fields.contains(&na.nf);
+                            let b_mod = modular_node_fields.contains(&nb.nf);
+                            if a_mod && !b_mod {
+                                let leftmost = gap_recovered
+                                    .iter()
+                                    .min_by_key(|(_, s, _)| s)
+                                    .unwrap();
+                                re = leftmost.1 - 1;
+                            } else if b_mod && !a_mod {
+                                let rightmost = gap_recovered
+                                    .iter()
+                                    .max_by_key(|(_, _, e)| e)
+                                    .unwrap();
+                                rs = rightmost.2 + 1;
+                            }
+                            if rs >= re {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
             let scaffold_seq = match genome.get(&ga.scaffold) {
                 Some(sequence) => sequence,
                 None => continue,
             };
 
-            let (rstart, rend) = if strand == "+" {
-                (ga.end.min(gb.start), gb.start.max(ga.end))
-            } else {
-                (gb.end.min(ga.start), ga.start.max(gb.end))
-            };
-
-            if rend <= rstart || rend - rstart < 15 {
-                continue;
-            }
-            if rend > scaffold_seq.len() {
+            if re < rs || rs == 0 || re > scaffold_seq.len() {
                 continue;
             }
 
-            tgaps += 1;
             flog.push(format!(
                 "  Gap {}-{}: {}:{}-{} ({})",
-                nan, nbn, ga.scaffold, rstart, rend, strand
+                node_a_name, node_b_name, ga.scaffold, rs, re, strand
             ));
 
             let sr: Vec<u8> = if strand == "+" {
-                scaffold_seq[rstart.saturating_sub(1)..rend.min(scaffold_seq.len())].to_vec()
+                scaffold_seq[rs - 1..re].to_vec()
             } else {
-                bio_revcomp(&scaffold_seq[rstart.saturating_sub(1)..rend.min(scaffold_seq.len())])
+                bio_revcomp(&scaffold_seq[rs - 1..re])
             };
 
             if sr.len() < 6 {
                 continue;
             }
 
-            let gap_start = na.end + 1;
-            let gap_end = nb.start;
             if gap_end <= gap_start || gap_end - gap_start < 3 {
                 continue;
             }
 
             let mut lout: Vec<String> = Vec::new();
-            let prep = prepare_gap_consensus(gap_start, gap_end, &rc, rcount, None, &mut lout);
+            let prep = prepare_gap_consensus(
+                gap_start,
+                gap_end,
+                &rc,
+                rcount,
+                Some(&combined),
+                &mut lout,
+            );
             let (tcon, rcols, rgaps, _ia) = match prep {
                 Some(prepared) => prepared,
                 None => {
@@ -1536,13 +1689,13 @@ fn process_gene(
                 thits += hits.len();
                 flog.push(format!("  >>> FOUND {} exon(s)", hits.len()));
                 let pa: Vec<&str> = na.header.split('|').collect();
-                for &(ps, pe, gs, ge, fr, sc, ref aa) in &hits {
-                    let hit_id = thits;
+                for &(ps, pe, g_s, g_e, fr, sc, ref aa) in &hits {
+                    hit_id += 1;
                     let (hss, hse) = if strand == "+" {
-                        (rstart + gs, rstart + ge - 1)
+                        (rs + g_s, rs + g_e - 1)
                     } else {
-                        let rl = rend - rstart + 1;
-                        (rstart + (rl - ge), rstart + (rl - gs) - 1)
+                        let rl = re - rs + 1;
+                        (rs + (rl - g_e), rs + (rl - g_s) - 1)
                     };
                     let nt = if strand == "+" {
                         scaffold_seq[hss - 1..hse].to_vec()
@@ -1568,7 +1721,7 @@ fn process_gene(
                     );
                     let attrs = format!(
                         "ID={};Name={};Parent={};Note=dp_recovered,frame={},pssm={}-{},score={:.1},aa_len={},between={}+{},cluster={};AA={}",
-                        dn, dn, gene_base, fv, ps, pe, sc, aa.len(), nan, nbn, ck, aa
+                        dn, dn, gene_base, fv, ps, pe, sc, aa.len(), node_a_name, node_b_name, ck, aa
                     );
                     gff_lines.push(format!(
                         "{}\tExonDP\texon\t{}\t{}\t{:.1}\t{}\t.\t{}",
@@ -1581,10 +1734,16 @@ fn process_gene(
                         nt_seq: String::from_utf8_lossy(&nt).into(),
                         region: format!("{}:{}-{}({})", ga.scaffold, hss, hse, strand),
                         score: sc,
-                        cluster_key: ck.clone(),
-                        node_a_name: nan.clone(),
-                        node_b_name: nbn.clone(),
+                        cluster_key: ck.to_string(),
+                        node_a_name: node_a_name.clone(),
+                        node_b_name: node_b_name.clone(),
                     });
+
+                    // Track for MXE narrowing
+                    base_recovered_gff
+                        .entry(ck.to_string())
+                        .or_default()
+                        .push((ga.scaffold.clone(), hss, hse));
                 }
             }
         }
@@ -1666,14 +1825,30 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
 
     let gff_path = find_gff_path(folder_path, &sub_dir);
     let gff_nodes = match &gff_path {
-        Some(path) => read_gff(path),
-        None => HashMap::new(),
+        Some(path) => {
+            eprintln!("[exon_dp] Loaded GFF from: {}", path);
+            read_gff(path)
+        }
+        None => {
+            eprintln!(
+                "[exon_dp] WARNING: No *_coords.gff found for sub_dir='{}'. All GFF lookups will fail.",
+                sub_dir
+            );
+            HashMap::new()
+        }
     };
+    eprintln!("[exon_dp] GFF entries: {}", gff_nodes.len());
 
     let cluster_csv = input_folder.join("resolve_clusters.csv");
     let gene_clusters = if cluster_csv.exists() {
-        read_clusters(&cluster_csv.to_string_lossy())
+        let clusters = read_clusters(&cluster_csv.to_string_lossy());
+        eprintln!("[exon_dp] Loaded clusters for {} genes from {:?}", clusters.len(), cluster_csv);
+        clusters
     } else {
+        eprintln!(
+            "[exon_dp] WARNING: resolve_clusters.csv not found at {:?}. No gaps will be examined.",
+            cluster_csv
+        );
         HashMap::new()
     };
 
@@ -1688,18 +1863,26 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
                 gene_files.push(name);
             }
         }
+    } else {
+        eprintln!(
+            "[exon_dp] WARNING: Could not read AA directory {:?}. No genes will be processed.",
+            aa_dir
+        );
     }
     gene_files.sort();
+    eprintln!("[exon_dp] Found {} AA gene files in {:?}", gene_files.len(), aa_dir);
 
     let score_thr = SCORE_FLOOR_FRAC_DEFAULT;
     let min_aa = MIN_EXON_AA_DEFAULT;
 
     let mut results_list: Vec<GeneResult> = Vec::new();
     let mut output_genes: Vec<String> = Vec::new();
+    let mut skipped_no_cluster = 0usize;
 
     for gene_file in &gene_files {
         let gene_key = gene_file.trim_end_matches(".gz");
         if !gene_clusters.contains_key(gene_key) {
+            skipped_no_cluster += 1;
             continue;
         }
 
@@ -1722,6 +1905,25 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
             min_aa,
         ));
     }
+
+    if skipped_no_cluster > 0 {
+        eprintln!(
+            "[exon_dp] {} / {} gene files had no matching cluster entry (skipped). \
+             First cluster keys: {:?}. First gene files: {:?}",
+            skipped_no_cluster,
+            gene_files.len(),
+            gene_clusters.keys().take(3).collect::<Vec<_>>(),
+            gene_files.iter().take(3).map(|f| f.trim_end_matches(".gz")).collect::<Vec<_>>(),
+        );
+    }
+    let total_gaps: usize = results_list.iter().map(|r| r.gaps).sum();
+    let total_hits: usize = results_list.iter().map(|r| r.hits).sum();
+    eprintln!(
+        "[exon_dp] Processed {} genes, {} gaps examined, {} exons recovered",
+        output_genes.len(),
+        total_gaps,
+        total_hits
+    );
 
     let output = PyDict::new(py);
 

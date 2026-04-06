@@ -1173,7 +1173,27 @@ struct GffEntry {
     strand: String,
 }
 
-fn load_genome_from_rocksdb(rocksdb_path: &str) -> HashMap<String, Vec<u8>> {
+fn collect_needed_scaffolds(
+    gene_clusters: &HashMap<String, HashMap<String, (Vec<String>, String)>>,
+    gff: &HashMap<String, GffEntry>,
+) -> HashSet<String> {
+    let mut needed = HashSet::new();
+    for (_gene, clusters) in gene_clusters {
+        for (_ck, (node_tokens, _iso_type)) in clusters {
+            for token in node_tokens {
+                if let Some(entry) = gff.get(token.as_str()) {
+                    needed.insert(entry.scaffold.clone());
+                }
+            }
+        }
+    }
+    needed
+}
+
+fn load_genome_from_rocksdb(
+    rocksdb_path: &str,
+    needed: &HashSet<String>,
+) -> HashMap<String, Vec<u8>> {
     let mut opts = Options::default();
     opts.set_error_if_exists(false);
     let db = match DB::open_for_read_only(&opts, rocksdb_path, false) {
@@ -1214,11 +1234,15 @@ fn load_genome_from_rocksdb(rocksdb_path: &str) -> HashMap<String, Vec<u8>> {
             let nl2 = match data[pos..].find('\n') {
                 Some(p) => pos + p,
                 None => {
-                    scaffolds.insert(name.to_string(), data[pos..].as_bytes().to_vec());
+                    if needed.contains(name) {
+                        scaffolds.insert(name.to_string(), data[pos..].as_bytes().to_vec());
+                    }
                     break;
                 }
             };
-            scaffolds.insert(name.to_string(), data[pos..nl2].as_bytes().to_vec());
+            if needed.contains(name) {
+                scaffolds.insert(name.to_string(), data[pos..nl2].as_bytes().to_vec());
+            }
             pos = nl2 + 1;
         }
     }
@@ -1820,15 +1844,6 @@ fn find_input_folder(folder: &Path, sub_dir: &str) -> Option<std::path::PathBuf>
 pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyObject> {
     let folder_path = Path::new(&folder);
 
-    let rocksdb_path = folder_path.join("rocksdb").join("sequences").join("nt");
-    let genome = load_genome_from_rocksdb(&rocksdb_path.to_string_lossy());
-    if genome.is_empty() {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "No parent sequences found in RocksDB at {:?}",
-            rocksdb_path
-        )));
-    }
-
     let input_folder = find_input_folder(folder_path, &sub_dir).ok_or_else(|| {
         pyo3::exceptions::PyFileNotFoundError::new_err(format!(
             "Input folder not found for sub_dir={}",
@@ -1850,6 +1865,27 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
     } else {
         HashMap::new()
     };
+
+    // Determine which scaffolds are actually needed before hitting RocksDB.
+    // If no cluster nodes map to any GFF entry we have nothing to process.
+    let needed_scaffolds = collect_needed_scaffolds(&gene_clusters, &gff_nodes);
+    if needed_scaffolds.is_empty() {
+        let output = PyDict::new(py);
+        output.set_item("results", PyList::empty(py))?;
+        output.set_item("gff_nodes", PyDict::new(py))?;
+        output.set_item("genes", PyList::empty(py))?;
+        output.set_item("genome_count", 0usize)?;
+        return Ok(output.into());
+    }
+
+    let rocksdb_path = folder_path.join("rocksdb").join("sequences").join("nt");
+    let genome = load_genome_from_rocksdb(&rocksdb_path.to_string_lossy(), &needed_scaffolds);
+    if genome.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "No parent sequences found in RocksDB at {:?}",
+            rocksdb_path
+        )));
+    }
 
     let aa_idx = build_aa_idx_table();
     let ct = build_codon_table(&aa_idx);

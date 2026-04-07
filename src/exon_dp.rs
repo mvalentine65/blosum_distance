@@ -846,23 +846,42 @@ fn refine_boundaries(exons: &[ExonTuple], genome: &[u8]) -> Vec<ExonTuple> {
             if sc.len() == 3 {
                 let saa = codon_to_aa(sc[0], sc[1], sc[2]);
                 if saa != b'*' && saa != 0 {
+                    // Re-translate each exon over its new (possibly non
+                    // codon-aligned) span, then snap the NT range back to
+                    // an exact codon-aligned subrange of length aa.len()*3.
+                    //
+                    // Why: bsh ∈ {-2,-1,1,2} shifts the splice boundary by
+                    // 1-2 nt, which is biologically valid (splice sites are
+                    // not constrained to codon boundaries) but leaves a
+                    // partial codon at one end of each exon. translate_seq
+                    // ignores those trailing nt, so the AA length stays the
+                    // same while the NT span gains 1-2 untranslated nt.
+                    // The "spanning codon" saa above accounts for them
+                    // logically but cannot be appended to either exon's NT
+                    // (the 3 nt straddle the intron and are not contiguous).
+                    // Trim them so downstream consumers (pn2codon, etc.)
+                    // see NT length == aa.len() * 3.
+                    let aa_left = translate_seq(&genome[gsa..ngea]);
+                    let nt_end_left = gsa + aa_left.len() * 3;
                     r[idx] = (
                         psa,
                         pea,
                         gsa,
-                        ngea,
+                        nt_end_left,
                         gsa % 3,
                         sca,
-                        translate_seq(&genome[gsa..ngea]),
+                        aa_left,
                     );
+                    let aa_right = translate_seq(&genome[ngsb..geb]);
+                    let nt_end_right = ngsb + aa_right.len() * 3;
                     r[idx + 1] = (
                         psb,
                         peb,
                         ngsb,
-                        geb,
+                        nt_end_right,
                         ngsb % 3,
                         scb,
-                        translate_seq(&genome[ngsb..geb]),
+                        aa_right,
                     );
                 }
             }

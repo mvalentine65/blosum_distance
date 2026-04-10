@@ -940,12 +940,22 @@ fn solve_gap_dp(
 
     let mut all_exons: Vec<ExonHit> = Vec::new();
 
+    // Track DP data from the best-scoring region for runner-up analysis
+    let mut best_region_score = NEG_INF;
+    let mut best_region_data: Option<(Vec<u8>, Vec<DpRow>, usize)> = None;
+
     for &(rs, re) in &regions {
         let sub = &genome[rs..re];
         let (score, bi, bj, rows) = dp_align(sub, &pssm, &cmx, ct);
         if score <= 0.0 || bi < 0 {
             continue;
         }
+
+        if score > best_region_score {
+            best_region_score = score;
+            best_region_data = Some((sub.to_vec(), rows.clone(), rs));
+        }
+
         let path = traceback(bi, bj, &rows);
         let exons = extract_exons(&path, sub, &pssm, aa_idx, min_aa);
         let exons = extend_to_splice(&exons, sub, &pssm, &cmx, aa_idx, 15);
@@ -963,15 +973,45 @@ fn solve_gap_dp(
         return Vec::new();
     }
 
-    all_exons.retain(|e| {
+    // Track status for each exon candidate
+    let mut exon_statuses: Vec<(ExonHit, String)> = Vec::new();
+
+    // Quality filter
+    let mut quality_passed: Vec<ExonHit> = Vec::new();
+    for e in all_exons {
         let em: f64 = cmx[e.pssm_start..e.pssm_end].iter().sum();
-        em > 0.0 && e.score / em >= score_thr
-    });
-    if all_exons.is_empty() {
+        if em > 0.0 && e.score / em >= score_thr {
+            quality_passed.push(e);
+        } else {
+            let frac = if em > 0.0 { e.score / em } else { 0.0 };
+            exon_statuses.push((e, format!("FAIL:quality({:.1}%<{:.0}%)", frac * 100.0, score_thr * 100.0)));
+        }
+    }
+
+    if quality_passed.is_empty() {
+        // Log all failed exons, aligned to gap region
+        let gap_len = splice.len();
+        for (i, (e, status)) in exon_statuses.iter().enumerate() {
+            let em: f64 = cmx[e.pssm_start..e.pssm_end].iter().sum();
+            let frac = if em > 0.0 { e.score / em } else { 0.0 };
+            log.push(format!(
+                ">exon{} {} pssm={}-{} ({} AA) frame={} score={:.1}/{:.1} ({:.1}%) genome_nt={}-{} aa={}",
+                i + 1, status, e.pssm_start, e.pssm_end,
+                e.pssm_end - e.pssm_start, e.frame, e.score, em, frac * 100.0,
+                e.genome_start, e.genome_end, e.aa_seq
+            ));
+            let nt_end = e.genome_end.min(gap_len);
+            let nt_slice = String::from_utf8_lossy(&splice[e.genome_start..nt_end]);
+            let leading = "-".repeat(e.genome_start);
+            let trailing = "-".repeat(gap_len.saturating_sub(nt_end));
+            log.push(format!("{}{}{}", leading, nt_slice, trailing));
+        }
         log.push("DP: all exons filtered".into());
         return Vec::new();
     }
 
+    // Dedup overlapping PSSM regions
+    let mut all_exons = quality_passed;
     if all_exons.len() > 1 {
         all_exons.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         let mut used: HashSet<usize> = HashSet::new();
@@ -979,6 +1019,7 @@ fn solve_gap_dp(
         for e in &all_exons {
             let ec: HashSet<usize> = (e.pssm_start..e.pssm_end).collect();
             if ec.intersection(&used).count() > 8 {
+                exon_statuses.push((e.clone(), "FAIL:dedup_overlap".into()));
                 continue;
             }
             used.extend(e.pssm_start..e.pssm_end);
@@ -1008,16 +1049,146 @@ fn solve_gap_dp(
         tem,
         sf * 100.0
     ));
-    if sf < score_thr {
+
+    // Mark surviving exons with their status
+    for e in &all_exons {
+        if sf >= score_thr {
+            exon_statuses.push((e.clone(), "PASS".into()));
+        } else {
+            exon_statuses.push((e.clone(), format!("FAIL:chain({:.1}%)", sf * 100.0)));
+        }
+    }
+
+    // Log all exon candidates with their status, aligned to gap region
+    let gap_len = splice.len();
+    exon_statuses.sort_by_key(|(e, _)| e.pssm_start);
+    for (i, (e, status)) in exon_statuses.iter().enumerate() {
+        let em: f64 = cmx[e.pssm_start..e.pssm_end].iter().sum();
+        let frac = if em > 0.0 { e.score / em } else { 0.0 };
         log.push(format!(
-            "DP: chain rejected -- {:.1}% < {:.0}%",
-            sf * 100.0,
+            ">exon{} {} pssm={}-{} ({} AA) frame={} score={:.1}/{:.1} ({:.1}%) genome_nt={}-{} aa={}",
+            i + 1, status, e.pssm_start, e.pssm_end,
+            e.pssm_end - e.pssm_start, e.frame, e.score, em, frac * 100.0,
+            e.genome_start, e.genome_end, e.aa_seq
+        ));
+        // Dash-padded NT aligned to the full gap region
+        let nt_end = e.genome_end.min(gap_len);
+        let nt_slice = String::from_utf8_lossy(&splice[e.genome_start..nt_end]);
+        let leading = "-".repeat(e.genome_start);
+        let trailing = "-".repeat(gap_len.saturating_sub(nt_end));
+        log.push(format!("{}{}{}", leading, nt_slice, trailing));
+    }
+
+    // Find and log runner-up candidates, then pick the winner by best score fraction
+    // Candidates: index 0 = main hit, 1..=N = runner-ups
+    struct Candidate {
+        score_frac: f64,
+        exons: Vec<ExonHit>, // global coords
+    }
+
+    let main_frac = sf;
+    let mut candidates: Vec<Candidate> = vec![Candidate {
+        score_frac: main_frac,
+        exons: all_exons.clone(),
+    }];
+
+    if let Some((ref sub_genome, ref rows, r_start)) = best_region_data {
+        let best_relative: Vec<ExonHit> = all_exons
+            .iter()
+            .map(|e| ExonHit {
+                genome_start: e.genome_start - r_start,
+                genome_end: e.genome_end - r_start,
+                ..e.clone()
+            })
+            .collect();
+        let runners = find_runner_ups(
+            rows, sub_genome, &pssm, &cmx, &best_relative, aa_idx, min_aa, score_thr, 2,
+        );
+        for (ri, (r_score, r_frac, r_exons)) in runners.iter().enumerate() {
+            log.push(format!(
+                "Runner-up #{}: total_score={:.1} ({:.1}% of max), {} exon(s)",
+                ri + 1, r_score, r_frac * 100.0, r_exons.len()
+            ));
+            // Convert runner-up exons to global coords and log them
+            let mut global_exons: Vec<ExonHit> = Vec::new();
+            for (ei, exon) in r_exons.iter().enumerate() {
+                let exon_max: f64 = cmx[exon.pssm_start..exon.pssm_end].iter().sum();
+                let efrac = if exon_max > 0.0 { exon.score / exon_max } else { 0.0 };
+                let g_start_global = exon.genome_start + r_start;
+                let g_end_global = exon.genome_end + r_start;
+                log.push(format!(
+                    ">exon{} pssm={}-{} ({} AA) frame={} score={:.1}/{:.1} ({:.1}%) genome_nt={}-{} aa={}",
+                    ei + 1, exon.pssm_start, exon.pssm_end,
+                    exon.pssm_end - exon.pssm_start, exon.frame, exon.score, exon_max, efrac * 100.0,
+                    g_start_global, g_end_global, exon.aa_seq
+                ));
+                let nt_end = g_end_global.min(gap_len);
+                let nt_slice = String::from_utf8_lossy(&splice[g_start_global..nt_end]);
+                let leading = "-".repeat(g_start_global);
+                let trailing = "-".repeat(gap_len.saturating_sub(nt_end));
+                log.push(format!("{}{}{}", leading, nt_slice, trailing));
+
+                global_exons.push(ExonHit {
+                    genome_start: g_start_global,
+                    genome_end: g_end_global,
+                    ..exon.clone()
+                });
+            }
+            candidates.push(Candidate {
+                score_frac: *r_frac,
+                exons: global_exons,
+            });
+        }
+        if runners.is_empty() {
+            log.push("Runner-up candidates: none found".into());
+        }
+    }
+
+    // Pick winner: highest score fraction among all candidates that pass threshold
+    let mut best_idx = 0usize;
+    let mut best_frac = candidates[0].score_frac;
+    for (ci, cand) in candidates.iter().enumerate().skip(1) {
+        if cand.score_frac > best_frac {
+            best_frac = cand.score_frac;
+            best_idx = ci;
+        }
+    }
+
+    let winner = &candidates[best_idx];
+
+    if winner.score_frac < score_thr {
+        log.push(format!(
+            "DP: chain rejected -- best candidate {:.1}% < {:.0}%",
+            winner.score_frac * 100.0,
             score_thr * 100.0
         ));
         return Vec::new();
     }
 
-    all_exons
+    // Log the winner
+    let winner_label = if best_idx == 0 {
+        "main".to_string()
+    } else {
+        format!("runner-up #{}", best_idx)
+    };
+    log.push(format!("Winner (from {}):", winner_label));
+    for (ei, exon) in winner.exons.iter().enumerate() {
+        let exon_max: f64 = cmx[exon.pssm_start..exon.pssm_end].iter().sum();
+        let efrac = if exon_max > 0.0 { exon.score / exon_max } else { 0.0 };
+        log.push(format!(
+            ">exon{} pssm={}-{} ({} AA) frame={} score={:.1}/{:.1} ({:.1}%) genome_nt={}-{}",
+            ei + 1, exon.pssm_start, exon.pssm_end,
+            exon.pssm_end - exon.pssm_start, exon.frame, exon.score, exon_max, efrac * 100.0,
+            exon.genome_start, exon.genome_end
+        ));
+        let nt_end = exon.genome_end.min(gap_len);
+        let nt_slice = String::from_utf8_lossy(&splice[exon.genome_start..nt_end]);
+        log.push(nt_slice.into_owned());
+        log.push(exon.aa_seq.clone());
+    }
+
+    winner
+        .exons
         .iter()
         .map(|e| {
             (
@@ -1031,6 +1202,83 @@ fn solve_gap_dp(
             )
         })
         .collect()
+}
+
+fn find_runner_ups(
+    rows: &[DpRow],
+    genome: &[u8],
+    pssm: &[[f64; NUM_AA]],
+    col_maxes: &[f64],
+    best_exons: &[ExonHit],
+    aa_idx: &[u8; 256],
+    min_aa: usize,
+    score_thr: f64,
+    n_runners: usize,
+) -> Vec<(f64, f64, Vec<ExonHit>)> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    // Collect genomic intervals already taken by the best chain
+    let taken: Vec<(usize, usize)> = best_exons
+        .iter()
+        .map(|e| (e.genome_start, e.genome_end))
+        .collect();
+
+    // Gather all scored endpoints sorted by descending score
+    let mut endpoints: Vec<(f64, usize, usize)> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        for (&j, &(sc, _, _)) in row {
+            endpoints.push((sc, i, j));
+        }
+    }
+    endpoints.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+    let mut runners: Vec<(f64, f64, Vec<ExonHit>)> = Vec::new();
+
+    for &(_, ei, ej) in &endpoints {
+        if runners.len() >= n_runners {
+            break;
+        }
+
+        let path = traceback(ei as isize, ej as isize, rows);
+        let exons = extract_exons(&path, genome, pssm, aa_idx, min_aa);
+        if exons.is_empty() {
+            continue;
+        }
+
+        // Check that this candidate is NOT a substring of any accepted chain
+        let mut all_intervals: Vec<(usize, usize)> = taken.clone();
+        for (_, _, rexons) in &runners {
+            for e in rexons {
+                all_intervals.push((e.genome_start, e.genome_end));
+            }
+        }
+
+        let is_substring = exons.iter().all(|exon| {
+            all_intervals
+                .iter()
+                .any(|&(ts, te)| exon.genome_start >= ts && exon.genome_end <= te)
+        });
+        if is_substring {
+            continue;
+        }
+
+        let total_score: f64 = exons.iter().map(|e| e.score).sum();
+        let total_max: f64 = exons
+            .iter()
+            .map(|e| col_maxes[e.pssm_start..e.pssm_end].iter().sum::<f64>())
+            .sum();
+        let score_frac = if total_max > 0.0 {
+            total_score / total_max
+        } else {
+            0.0
+        };
+
+        runners.push((total_score, score_frac, exons));
+    }
+
+    runners
 }
 
 fn count_ref_gaps(
@@ -1704,6 +1952,13 @@ fn process_gene(
             } else {
                 bio_revcomp(&scaffold_seq[rs - 1..re])
             };
+
+            // Log the entire NT gap region in FASTA format
+            flog.push(format!(
+                "  >gap_region {}:{}-{}({}) len={}",
+                ga.scaffold, rs, re, strand, sr.len()
+            ));
+            flog.push(format!("  {}", String::from_utf8_lossy(&sr)));
 
             if sr.len() < 6 {
                 continue;

@@ -1848,6 +1848,38 @@ fn process_gene(
             let gap_start = left_end;
             let gap_end = right_start;
 
+            // Ref-presence filter: gap columns must have enough
+            // consecutive reference-occupied positions to build a
+            // usable PSSM.  Gaps in insertion columns are padding.
+            {
+                let mut longest_consec = 0usize;
+                let mut cur_consec = 0usize;
+                for col in gap_start..gap_end {
+                    let has_ref = match rc.get(&col) {
+                        Some(chars) if !chars.is_empty() => {
+                            let gf = chars.iter().filter(|&&c| c == b'-').count() as f64
+                                / chars.len() as f64;
+                            gf < 0.67
+                        }
+                        _ => false,
+                    };
+                    if has_ref {
+                        cur_consec += 1;
+                    } else {
+                        if cur_consec > longest_consec {
+                            longest_consec = cur_consec;
+                        }
+                        cur_consec = 0;
+                    }
+                }
+                if cur_consec > longest_consec {
+                    longest_consec = cur_consec;
+                }
+                if longest_consec < MIN_CONSEC_CHAR {
+                    continue;
+                }
+            }
+
             tgaps += 1;
 
             let node_a_name = na.nf.replace("NODE_", "");

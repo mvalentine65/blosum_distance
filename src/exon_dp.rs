@@ -988,28 +988,6 @@ fn solve_gap_dp(
         }
     }
 
-    if quality_passed.is_empty() {
-        // Log all failed exons, aligned to gap region
-        let gap_len = splice.len();
-        for (i, (e, status)) in exon_statuses.iter().enumerate() {
-            let em: f64 = cmx[e.pssm_start..e.pssm_end].iter().sum();
-            let frac = if em > 0.0 { e.score / em } else { 0.0 };
-            log.push(format!(
-                ">exon{} {} pssm={}-{} ({} AA) frame={} score={:.1}/{:.1} ({:.1}%) genome_nt={}-{} aa={}",
-                i + 1, status, e.pssm_start, e.pssm_end,
-                e.pssm_end - e.pssm_start, e.frame, e.score, em, frac * 100.0,
-                e.genome_start, e.genome_end, e.aa_seq
-            ));
-            let nt_end = e.genome_end.min(gap_len);
-            let nt_slice = String::from_utf8_lossy(&splice[e.genome_start..nt_end]);
-            let leading = "-".repeat(e.genome_start);
-            let trailing = "-".repeat(gap_len.saturating_sub(nt_end));
-            log.push(format!("{}{}{}", leading, nt_slice, trailing));
-        }
-        log.push("DP: all exons filtered".into());
-        return Vec::new();
-    }
-
     // Dedup overlapping PSSM regions
     let mut all_exons = quality_passed;
     if all_exons.len() > 1 {
@@ -1039,16 +1017,21 @@ fn solve_gap_dp(
         tem += cmx[e.pssm_start..e.pssm_end].iter().sum::<f64>();
     }
     let sf = if tem > 0.0 { ts / tem } else { 0.0 };
-    log.push(format!(
-        "DP result: {} exon(s), {}/{} cols ({:.1}%), score {:.1}/{:.1} ({:.1}%)",
-        all_exons.len(),
-        cov.len(),
-        nc,
-        cov.len() as f64 / nc as f64 * 100.0,
-        ts,
-        tem,
-        sf * 100.0
-    ));
+
+    if all_exons.is_empty() {
+        log.push("DP: all main exons filtered by quality".into());
+    } else {
+        log.push(format!(
+            "DP result: {} exon(s), {}/{} cols ({:.1}%), score {:.1}/{:.1} ({:.1}%)",
+            all_exons.len(),
+            cov.len(),
+            nc,
+            cov.len() as f64 / nc as f64 * 100.0,
+            ts,
+            tem,
+            sf * 100.0
+        ));
+    }
 
     // Mark surviving exons with their status
     for e in &all_exons {
@@ -1086,7 +1069,8 @@ fn solve_gap_dp(
         exons: Vec<ExonHit>, // global coords
     }
 
-    let main_frac = sf;
+    // If main has no exons (all filtered), use NEG_INF so runner-ups can win
+    let main_frac = if all_exons.is_empty() { NEG_INF } else { sf };
     let mut candidates: Vec<Candidate> = vec![Candidate {
         score_frac: main_frac,
         exons: all_exons.clone(),

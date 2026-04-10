@@ -1772,13 +1772,90 @@ fn process_gene(
         .cloned()
         .collect();
 
+    // Build a map of known GFF intervals for each MXE cluster group.
+    // Key = base cluster key (e.g. "86"), Value = vec of (scaffold, start, end)
+    // for every node across all sibling isoforms (including the base).
+    // Used to narrow MXE gap search regions so the DP does not scan
+    // genomic intervals already occupied by known cassette variants
+    // from other isoforms.
+    let mxe_sibling_gff: HashMap<String, Vec<(String, usize, usize)>> = {
+        // Collect all MXE cluster keys grouped by base key
+        let mut groups: HashMap<String, Vec<&Vec<String>>> = HashMap::new();
+        for (ck, node_tokens, iso_type) in &all_clusters {
+            if *iso_type != "MXE" {
+                continue;
+            }
+            let base_key = ck
+                .rsplit_once('_')
+                .map(|(k, _)| k.to_string())
+                .unwrap_or_else(|| (*ck).clone());
+            groups.entry(base_key).or_default().push(node_tokens);
+        }
+        let mut result: HashMap<String, Vec<(String, usize, usize)>> = HashMap::new();
+        for (base_key, token_lists) in &groups {
+            let mut intervals = Vec::new();
+            for tokens in token_lists {
+                for token in *tokens {
+                    if let Some(entry) = gff.get(token.as_str()) {
+                        intervals.push((
+                            entry.scaffold.clone(),
+                            entry.start,
+                            entry.end,
+                        ));
+                    }
+                }
+            }
+            result.insert(base_key.clone(), intervals);
+        }
+        result
+    };
+
+    // For each MXE base cluster key, compute which of its nodes are
+    // modular (i.e. get swapped out in at least one isoform).
+    // A base node is modular if any isoform child does NOT contain it.
+    let mxe_base_modular: HashMap<String, HashSet<String>> = {
+        let mut result: HashMap<String, HashSet<String>> = HashMap::new();
+        // Group isoform node-sets by base key
+        let mut iso_sets: HashMap<String, Vec<HashSet<String>>> = HashMap::new();
+        let mut base_sets: HashMap<String, HashSet<String>> = HashMap::new();
+        for (ck, (node_tokens, iso_type)) in clusters.iter() {
+            if iso_type != "MXE" {
+                continue;
+            }
+            let fields: HashSet<String> = node_tokens
+                .iter()
+                .map(|t| format!("NODE_{}", t))
+                .collect();
+            if let Some(bk) = ck.rsplit_once('_').map(|(k, _)| k.to_string()) {
+                iso_sets.entry(bk).or_default().push(fields);
+            } else {
+                base_sets.insert(ck.clone(), fields);
+            }
+        }
+        for (bk, base_fields) in &base_sets {
+            if let Some(children) = iso_sets.get(bk) {
+                // A base node is modular if ANY child lacks it
+                let modular: HashSet<String> = base_fields
+                    .iter()
+                    .filter(|node| children.iter().any(|child| !child.contains(*node)))
+                    .cloned()
+                    .collect();
+                result.insert(bk.clone(), modular);
+            }
+        }
+        result
+    };
+
     for (ck, node_tokens, iso_type) in &all_clusters {
         let cluster_node_fields: HashSet<String> = node_tokens
             .iter()
             .map(|t| format!("NODE_{}", t))
             .collect();
 
-        // For MXE clusters, identify modular nodes
+        // For MXE clusters, identify modular nodes.
+        // Isoform clusters: nodes present in the isoform but not the base.
+        // Base clusters: nodes in the base that are replaced in at
+        //   least one isoform child.
         let modular_node_fields: HashSet<String> = if *iso_type == "MXE" {
             if let Some(base_key) = ck.rsplit_once('_').map(|(k, _)| k.to_string()) {
                 if let Some((base_tokens, _)) = clusters.get(&base_key) {
@@ -1794,7 +1871,11 @@ fn process_gene(
                     HashSet::new()
                 }
             } else {
-                HashSet::new()
+                // Base cluster: use precomputed modular set
+                mxe_base_modular
+                    .get(*ck)
+                    .cloned()
+                    .unwrap_or_default()
             }
         } else {
             HashSet::new()
@@ -1885,8 +1966,13 @@ fn process_gene(
             let node_a_name = na.nf.replace("NODE_", "");
             let node_b_name = nb.nf.replace("NODE_", "");
 
-            // MXE: skip gaps between two shared (non-modular) nodes
-            if *iso_type == "MXE" && !modular_node_fields.is_empty() {
+            // MXE isoforms: skip gaps between two shared (non-modular)
+            // nodes.  These gaps duplicate work done by the base
+            // cluster.  Only gaps touching a modular node may contain
+            // undiscovered cassette variants in the flanking intron.
+            // The base cluster itself must process shared-shared gaps
+            // because no other cluster will.
+            if *iso_type == "MXE" && ck.contains('_') && !modular_node_fields.is_empty() {
                 let a_mod = modular_node_fields.contains(&na.nf);
                 let b_mod = modular_node_fields.contains(&nb.nf);
                 if !a_mod && !b_mod {
@@ -1914,10 +2000,73 @@ fn process_gene(
                 (gb.end + 1, if ga.start > 0 { ga.start - 1 } else { 0 })
             };
 
-            // MXE narrowing: use recovered exons from base cluster
+            // MXE gap narrowing.  Two complementary mechanisms:
+            //
+            // (A) All MXE clusters: narrow around pre-existing GFF
+            //     nodes from sibling isoforms so the DP does not
+            //     scan over known cassette exons and produce
+            //     overlapping hits.
+            //
+            // (B) Isoform clusters only: further narrow around
+            //     DP-recovered exons from the base cluster (which
+            //     runs first) so each isoform searches only the
+            //     sub-region belonging to its own cassette module.
             let (mut rs, mut re) = (region_start, region_end);
             if *iso_type == "MXE" {
-                if let Some(base_key) = ck.rsplit_once('_').map(|(k, _)| k.to_string()) {
+                let base_key = ck
+                    .rsplit_once('_')
+                    .map(|(k, _)| k.to_string())
+                    .unwrap_or_else(|| (*ck).clone());
+
+                // (A) Narrow around sibling GFF nodes
+                if let Some(sibling_intervals) = mxe_sibling_gff.get(&base_key) {
+                    let foreign: Vec<(usize, usize)> = sibling_intervals
+                        .iter()
+                        .filter(|(sscaf, ss, se)| {
+                            *sscaf == ga.scaffold
+                                && *ss >= rs
+                                && *se <= re
+                                && !cluster_node_fields.iter().any(|nf| {
+                                    let bare = nf.strip_prefix("NODE_").unwrap_or(nf);
+                                    if let Some(entry) = gff.get(bare) {
+                                        entry.scaffold == *sscaf
+                                            && entry.start == *ss
+                                            && entry.end == *se
+                                    } else {
+                                        false
+                                    }
+                                })
+                        })
+                        .map(|(_, ss, se)| (*ss, *se))
+                        .collect();
+                    if !foreign.is_empty() {
+                        let a_mod = modular_node_fields.contains(&na.nf);
+                        let b_mod = modular_node_fields.contains(&nb.nf);
+                        let leftmost_foreign = foreign.iter().map(|(s, _)| *s).min().unwrap();
+                        let rightmost_foreign_end =
+                            foreign.iter().map(|(_, e)| *e).max().unwrap();
+                        let mod_is_left = if a_mod && !b_mod {
+                            ga.start < gb.start
+                        } else if b_mod && !a_mod {
+                            gb.start < ga.start
+                        } else {
+                            let left_size = leftmost_foreign.saturating_sub(rs);
+                            let right_size = re.saturating_sub(rightmost_foreign_end);
+                            left_size >= right_size
+                        };
+                        if mod_is_left {
+                            re = re.min(leftmost_foreign - 1);
+                        } else {
+                            rs = rs.max(rightmost_foreign_end + 1);
+                        }
+                        if rs >= re {
+                            continue;
+                        }
+                    }
+                }
+
+                // (B) Isoform clusters: further narrow around base DP hits
+                if ck.contains('_') {
                     if let Some(recovered_list) = base_recovered_gff.get(&base_key) {
                         let gap_recovered: Vec<_> = recovered_list
                             .iter()

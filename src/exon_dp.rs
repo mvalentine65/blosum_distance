@@ -11,7 +11,7 @@ const INTRON_OPEN_PENALTY: f64 = -12.0;
 const MIN_INTRON_NT: usize = 30;
 const MAX_INTRON_NT: usize = 200_000;
 const MIN_EXON_AA_DEFAULT: usize = 10;
-const SCORE_FLOOR_FRAC_DEFAULT: f64 = 0.35;
+const SCORE_FLOOR_FRAC_DEFAULT: f64 = 0.4;
 const SEED_THRESHOLD: usize = 50_000;
 const _MINIMUM_GAP_BP: usize = 15;
 const _MAX_INTERNAL_GAP_BP: usize = 15_000;
@@ -1054,12 +1054,9 @@ fn solve_gap_dp(
             e.pssm_end - e.pssm_start, e.frame, e.score, em, frac * 100.0,
             e.genome_start, e.genome_end, e.aa_seq
         ));
-        // Dash-padded NT aligned to the full gap region
         let nt_end = e.genome_end.min(gap_len);
         let nt_slice = String::from_utf8_lossy(&splice[e.genome_start..nt_end]);
-        let leading = "-".repeat(e.genome_start);
-        let trailing = "-".repeat(gap_len.saturating_sub(nt_end));
-        log.push(format!("{}{}{}", leading, nt_slice, trailing));
+        log.push(format!("nt={}", nt_slice));
     }
 
     // Find and log runner-up candidates, then pick the winner by best score fraction
@@ -1455,6 +1452,47 @@ fn load_genome_from_rocksdb(
         }
     };
 
+    // Try indexed lookups first (new format: scaffold_index key)
+    if let Ok(Some(idx_raw)) = db.get(b"scaffold_index") {
+        let idx_str = String::from_utf8_lossy(&idx_raw);
+        // Parse index: each line is "name\tbatch_index\tbyte_offset\tseq_length"
+        // Group needed scaffolds by batch so we only load each batch once.
+        let mut batch_requests: HashMap<String, Vec<(String, usize, usize)>> = HashMap::new();
+        for line in idx_str.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 4 {
+                continue;
+            }
+            let name = parts[0];
+            if !needed.contains(name) {
+                continue;
+            }
+            let batch_id = parts[1].to_string();
+            let offset: usize = parts[2].parse().unwrap_or(0);
+            let length: usize = parts[3].parse().unwrap_or(0);
+            batch_requests
+                .entry(batch_id)
+                .or_default()
+                .push((name.to_string(), offset, length));
+        }
+
+        let mut scaffolds = HashMap::with_capacity(needed.len());
+        for (batch_id, entries) in &batch_requests {
+            let key = format!("parentbatch:{}", batch_id);
+            let data = match db.get(key.as_bytes()) {
+                Ok(Some(v)) => v,
+                _ => continue,
+            };
+            for (name, offset, length) in entries {
+                let end = (*offset + *length).min(data.len());
+                let start = (*offset).min(end);
+                scaffolds.insert(name.clone(), data[start..end].to_vec());
+            }
+        }
+        return scaffolds;
+    }
+
+    // Fallback: legacy batched format (scan all batches)
     let recipe = match db.get(b"getall:parentbatches") {
         Ok(Some(v)) => String::from_utf8_lossy(&v).to_string(),
         _ => {
@@ -2293,6 +2331,7 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
     let aa_dir = input_folder.join("aa");
 
     let gff_path = find_gff_path(folder_path, &sub_dir);
+
     let gff_nodes = match &gff_path {
         Some(path) => read_gff(path),
         None => HashMap::new(),
@@ -2308,6 +2347,7 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
     // Determine which scaffolds are actually needed before hitting RocksDB.
     // If no cluster nodes map to any GFF entry we have nothing to process.
     let needed_scaffolds = collect_needed_scaffolds(&gene_clusters, &gff_nodes);
+
     if needed_scaffolds.is_empty() {
         let output = PyDict::new(py);
         output.set_item("results", PyList::empty(py))?;
@@ -2319,6 +2359,7 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
 
     let rocksdb_path = folder_path.join("rocksdb").join("sequences").join("nt");
     let genome = load_genome_from_rocksdb(&rocksdb_path.to_string_lossy(), &needed_scaffolds);
+
     if genome.is_empty() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "No parent sequences found in RocksDB at {:?}",
@@ -2354,11 +2395,13 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
 
         let fpath = aa_dir.join(gene_file);
         let entries = read_aa_fasta(&fpath.to_string_lossy());
+
         if entries.is_empty() {
             continue;
         }
 
         output_genes.push(gene_file.clone());
+
         results_list.push(process_gene(
             gene_key,
             &entries,

@@ -1414,6 +1414,1001 @@ fn parse_node_field(h: &str) -> &str {
     h.split('|').nth(3).unwrap_or("")
 }
 
+// ---------------------------------------------------------------------------
+// Motif scan: kmer-based flank extension
+// ---------------------------------------------------------------------------
+
+struct MotifNode {
+    header: String,
+    frame: i32,
+    sequence: String,
+    start: usize,
+    end: usize,
+}
+
+struct MotifHit {
+    header: String,
+    aa_seq: String,
+    nt_seq: String,
+}
+
+/// Build sorted exon interval lists per scaffold from GFF entries.
+fn build_scaffold_intervals(
+    gff: &HashMap<String, GffEntry>,
+) -> HashMap<String, Vec<(usize, usize, String)>> {
+    let mut intervals: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+    for (name, entry) in gff {
+        intervals
+            .entry(entry.scaffold.clone())
+            .or_default()
+            .push((entry.start, entry.end, name.clone()));
+    }
+    for v in intervals.values_mut() {
+        v.sort();
+    }
+    intervals
+}
+
+/// Find the end of the nearest exon LEFT of `position` on this scaffold.
+fn find_left_bound(
+    scaffold: &str,
+    position: usize,
+    intervals: &HashMap<String, Vec<(usize, usize, String)>>,
+) -> usize {
+    let mut best = 0usize;
+    if let Some(ivs) = intervals.get(scaffold) {
+        for &(_, e, _) in ivs {
+            if e < position {
+                best = best.max(e);
+            }
+        }
+    }
+    best
+}
+
+/// Find the start of the nearest exon RIGHT of `position` on this scaffold.
+fn find_right_bound(
+    scaffold: &str,
+    position: usize,
+    intervals: &HashMap<String, Vec<(usize, usize, String)>>,
+    scaffold_len: usize,
+) -> usize {
+    if let Some(ivs) = intervals.get(scaffold) {
+        for &(s, _, _) in ivs {
+            if s > position {
+                return s;
+            }
+        }
+    }
+    scaffold_len
+}
+
+/// Count reference gap columns in [gap_start..gap_end).
+fn motif_count_ref_gaps(
+    gap_start: usize,
+    gap_end: usize,
+    ref_consensus: &HashMap<usize, Vec<u8>>,
+    ref_gap_thresh: f64,
+) -> (HashSet<usize>, Vec<usize>, usize) {
+    let mut ref_gaps = HashSet::new();
+    let mut insert_at = Vec::new();
+    let mut longest_consecutive: usize = 0;
+    let mut consecutive_non_gap: usize = 0;
+    for (i, x) in (gap_start..gap_end).enumerate() {
+        let col = ref_consensus.get(&x);
+        let is_gap = if let Some(col) = col {
+            let gap_count = col.iter().filter(|&&c| c == b'-' || c == b' ').count();
+            (gap_count as f64 / col.len() as f64) >= ref_gap_thresh
+        } else {
+            true
+        };
+        if is_gap {
+            ref_gaps.insert(x);
+            insert_at.push(i);
+            longest_consecutive = longest_consecutive.max(consecutive_non_gap);
+            consecutive_non_gap = 0;
+        } else {
+            consecutive_non_gap += 1;
+        }
+    }
+    longest_consecutive = longest_consecutive.max(consecutive_non_gap);
+    (ref_gaps, insert_at, longest_consecutive)
+}
+
+/// Filter reference consensus columns, trimming low-coverage edges.
+fn motif_filter_ref_consensus(
+    ref_count: usize,
+    ref_consensus: &HashMap<usize, Vec<u8>>,
+    ref_gaps: &HashSet<usize>,
+    gap_start: usize,
+    gap_end: usize,
+    coverage_thresh: f64,
+    left_data_cols: Option<f64>,
+    right_data_cols: Option<f64>,
+) -> (HashMap<usize, Vec<u8>>, HashSet<usize>) {
+    let mut trimmed_cols = HashSet::new();
+
+    if let Some(thresh) = left_data_cols {
+        for x in gap_start..gap_end {
+            if let Some(col) = ref_consensus.get(&x) {
+                let gap_count = col.iter().filter(|&&c| c == b'-' || c == b' ').count();
+                let data_present = 1.0 - (gap_count as f64 / ref_count as f64);
+                if data_present < thresh {
+                    trimmed_cols.insert(x);
+                } else {
+                    break;
+                }
+            } else {
+                trimmed_cols.insert(x);
+            }
+        }
+    }
+
+    if let Some(thresh) = right_data_cols {
+        for x in (gap_start..gap_end).rev() {
+            if let Some(col) = ref_consensus.get(&x) {
+                let gap_count = col.iter().filter(|&&c| c == b'-' || c == b' ').count();
+                let data_present = 1.0 - (gap_count as f64 / ref_count as f64);
+                if data_present < thresh {
+                    trimmed_cols.insert(x);
+                } else {
+                    break;
+                }
+            } else {
+                trimmed_cols.insert(x);
+            }
+        }
+    }
+
+    let total_skipped = trimmed_cols.len() + ref_gaps.len();
+    if total_skipped >= gap_end - gap_start {
+        return (HashMap::new(), trimmed_cols);
+    }
+
+    // Build per-ref sequences to find coverage, then filter refs
+    let mut ref_coverages: Vec<f64> = Vec::with_capacity(ref_count);
+    for y in 0..ref_count {
+        let mut data = 0usize;
+        let mut total = 0usize;
+        for x in gap_start..gap_end {
+            if ref_gaps.contains(&x) || trimmed_cols.contains(&x) {
+                continue;
+            }
+            total += 1;
+            if let Some(col) = ref_consensus.get(&x) {
+                if y < col.len() && col[y] != b'-' && col[y] != b' ' {
+                    data += 1;
+                }
+            }
+        }
+        ref_coverages.push(if total > 0 { data as f64 / total as f64 } else { 0.0 });
+    }
+
+    let max_cov = ref_coverages.iter().cloned().fold(0.0f64, f64::max);
+    let target = coverage_thresh * max_cov;
+    let ref_indices: Vec<usize> = ref_coverages
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c >= target)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut this_consensus: HashMap<usize, Vec<u8>> = HashMap::new();
+    for x in gap_start..gap_end {
+        if ref_gaps.contains(&x) || trimmed_cols.contains(&x) {
+            continue;
+        }
+        if let Some(col) = ref_consensus.get(&x) {
+            let filtered: Vec<u8> = ref_indices
+                .iter()
+                .filter_map(|&y| {
+                    if y < col.len() && col[y] != b' ' && col[y] != b'-' {
+                        Some(col[y])
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            this_consensus.insert(x, filtered);
+        }
+    }
+
+    (this_consensus, trimmed_cols)
+}
+
+/// Translate nucleotide bytes to amino acid string (standard code).
+fn motif_translate(nt: &[u8]) -> Vec<u8> {
+    let mut aa = Vec::with_capacity(nt.len() / 3);
+    let mut i = 0;
+    while i + 2 < nt.len() {
+        let c = codon_to_aa(
+            nt[i].to_ascii_uppercase(),
+            nt[i + 1].to_ascii_uppercase(),
+            nt[i + 2].to_ascii_uppercase(),
+        );
+        aa.push(if c == 0 { b'X' } else { c });
+        i += 3;
+    }
+    aa
+}
+
+/// Trim sequence to multiple of 3.
+fn trim_to_codon(seq: &[u8]) -> &[u8] {
+    let r = seq.len() % 3;
+    if r > 0 { &seq[..seq.len() - r] } else { seq }
+}
+
+/// Insert gap dashes into an amino acid or nucleotide string at given positions.
+fn insert_gaps(input: &str, positions: &[usize], offset: usize, is_nt: bool) -> String {
+    if positions.is_empty() {
+        return input.to_string();
+    }
+    if is_nt {
+        let mut triplets: Vec<String> = input
+            .as_bytes()
+            .chunks(3)
+            .map(|c| String::from_utf8_lossy(c).to_string())
+            .collect();
+        for &pos in positions {
+            let idx = offset + pos;
+            if idx <= triplets.len() {
+                triplets.insert(idx, "---".to_string());
+            }
+        }
+        triplets.join("")
+    } else {
+        let mut chars: Vec<char> = input.chars().collect();
+        for &pos in positions {
+            let idx = offset + pos;
+            if idx <= chars.len() {
+                chars.insert(idx, '-');
+            }
+        }
+        chars.into_iter().collect()
+    }
+}
+
+/// Core kmer scanning across 3 reading frames.
+fn scan_kmer(
+    amount: usize,
+    log: &mut Vec<String>,
+    splice_region: &[u8],
+    skip_cols: &HashSet<usize>,
+    flex: usize,
+    consensus: &HashMap<usize, Vec<u8>>,
+    gap_start: usize,
+    gap_end: usize,
+    max_score: usize,
+    stop_penalty: usize,
+) -> (usize, Vec<(Vec<u8>, usize, usize, usize, usize)>, Vec<usize>) {
+    let ref_cols: Vec<usize> = (gap_start..gap_end)
+        .filter(|x| !skip_cols.contains(x))
+        .collect();
+    let kmer_size = (amount / 3).saturating_sub(skip_cols.len()).saturating_sub(flex);
+    if kmer_size == 0 || ref_cols.is_empty() {
+        return (0, Vec::new(), ref_cols);
+    }
+
+    // Collect all amino acids present in consensus
+    let mut all_aas: HashSet<u8> = HashSet::new();
+    for col_vals in consensus.values() {
+        for &a in col_vals {
+            all_aas.insert(a);
+        }
+    }
+
+    // Highest possible score
+    let mut highest_possible_score: usize = 0;
+    for &x in &ref_cols {
+        if let Some(col) = consensus.get(&x) {
+            let max_count = all_aas
+                .iter()
+                .map(|&a| col.iter().filter(|&&c| c == a).count())
+                .max()
+                .unwrap_or(0);
+            highest_possible_score += max_count.min(max_score);
+        }
+    }
+
+    let mut results: Vec<(Vec<u8>, usize, usize, usize, usize)> = Vec::new();
+
+    for frame in 0..3usize {
+        let trimmed_nt = trim_to_codon(&splice_region[frame..]);
+        let protein_seq = motif_translate(trimmed_nt);
+
+        if protein_seq.len() <= kmer_size {
+            continue;
+        }
+
+        for i in 0..protein_seq.len() - kmer_size {
+            let kmer = &protein_seq[i..i + kmer_size];
+            for offset in 0..=flex {
+                if offset + kmer_size > ref_cols.len() {
+                    continue;
+                }
+                let mut kmer_score: usize = 0;
+                for ki in 0..kmer_size {
+                    if let Some(col) = consensus.get(&ref_cols[ki + offset]) {
+                        kmer_score +=
+                            col.iter().filter(|&&c| c == kmer[ki]).count().min(max_score);
+                    }
+                }
+                let stops = kmer.iter().filter(|&&c| c == b'*').count();
+                kmer_score = kmer_score.saturating_sub(stop_penalty * stops);
+
+                let best_qstart = (i * 3) + frame;
+                let best_qend = best_qstart + (kmer_size * 3);
+                results.push((kmer.to_vec(), kmer_score, best_qstart, best_qend, frame));
+            }
+        }
+    }
+
+    log.push(format!(
+        "Translated splice ({} bp, {} ref cols, kmer_size={})",
+        splice_region.len(),
+        ref_cols.len(),
+        kmer_size
+    ));
+
+    (highest_possible_score, results, ref_cols)
+}
+
+/// Expand a kmer hit by up to `max_expand` AA in each direction.
+fn expand_hit(
+    kmer: &[u8],
+    score: usize,
+    qstart: usize,
+    qend: usize,
+    frame: usize,
+    seq: &[u8],
+    ref_cols: &[usize],
+    consensus: &HashMap<usize, Vec<u8>>,
+    max_score: usize,
+    stop_penalty: usize,
+    max_expand: usize,
+) -> (Vec<u8>, usize, usize, usize, usize, f64) {
+    let kmer_size = kmer.len();
+    let protein_i = (qstart - frame) / 3;
+    let trimmed_nt = trim_to_codon(&seq[frame..]);
+    let protein_seq = motif_translate(trimmed_nt);
+
+    // Find original offset
+    let raw_score = score + stop_penalty * kmer.iter().filter(|&&c| c == b'*').count();
+    let mut best_offset = 0;
+    for offset in 0..2.min(ref_cols.len().saturating_sub(kmer_size) + 1) {
+        if offset + kmer_size > ref_cols.len() {
+            continue;
+        }
+        let sc: usize = (0..kmer_size)
+            .map(|k| {
+                consensus
+                    .get(&ref_cols[offset + k])
+                    .map(|col| col.iter().filter(|&&c| c == kmer[k]).count().min(max_score))
+                    .unwrap_or(0)
+            })
+            .sum();
+        if sc == raw_score {
+            best_offset = offset;
+            break;
+        }
+    }
+
+    // All AAs in consensus
+    let mut all_aas: HashSet<u8> = HashSet::new();
+    for &col_idx in ref_cols {
+        if let Some(col) = consensus.get(&col_idx) {
+            for &a in col {
+                all_aas.insert(a);
+            }
+        }
+    }
+
+    // Per-column max
+    let col_max: HashMap<usize, usize> = ref_cols
+        .iter()
+        .map(|&col_idx| {
+            let mx = consensus
+                .get(&col_idx)
+                .map(|col| {
+                    all_aas
+                        .iter()
+                        .map(|&a| col.iter().filter(|&&c| c == a).count())
+                        .max()
+                        .unwrap_or(0)
+                        .min(max_score)
+                })
+                .unwrap_or(0);
+            (col_idx, mx)
+        })
+        .collect();
+
+    let orig_mx: usize = (0..kmer_size)
+        .map(|k| col_max.get(&ref_cols[best_offset + k]).copied().unwrap_or(0))
+        .sum();
+    let orig_ratio = if orig_mx > 0 { score as f64 / orig_mx as f64 } else { 0.0 };
+
+    let mut best_ratio = orig_ratio;
+    let mut best_result = (kmer.to_vec(), score, qstart, qend, frame);
+
+    for left in 0..=max_expand {
+        for right in 0..=max_expand {
+            if left == 0 && right == 0 {
+                continue;
+            }
+            if protein_i < left {
+                continue;
+            }
+            let ni = protein_i - left;
+            let ns = kmer_size + left + right;
+            if best_offset < left {
+                continue;
+            }
+            let no = best_offset - left;
+
+            if ni + ns > protein_seq.len() || no + ns > ref_cols.len() {
+                continue;
+            }
+
+            let expanded = &protein_seq[ni..ni + ns];
+            let mut sc: usize = 0;
+            let mut mx: usize = 0;
+            for k in 0..ns {
+                let col_idx = ref_cols[no + k];
+                sc += consensus
+                    .get(&col_idx)
+                    .map(|col| col.iter().filter(|&&c| c == expanded[k]).count().min(max_score))
+                    .unwrap_or(0);
+                mx += col_max.get(&col_idx).copied().unwrap_or(0);
+            }
+            let stops = expanded.iter().filter(|&&c| c == b'*').count();
+            sc = sc.saturating_sub(stop_penalty * stops);
+
+            let ratio = if mx > 0 { sc as f64 / mx as f64 } else { 0.0 };
+            if ratio > best_ratio {
+                best_ratio = ratio;
+                let new_qstart = ni * 3 + frame;
+                let new_qend = new_qstart + ns * 3;
+                best_result = (expanded.to_vec(), sc, new_qstart, new_qend, frame);
+            }
+        }
+    }
+
+    (
+        best_result.0,
+        best_result.1,
+        best_result.2,
+        best_result.3,
+        best_result.4,
+        best_ratio,
+    )
+}
+
+/// Scan the trailing (right) flank of the last node in a cluster.
+fn motif_scan_flank(
+    gap_start: usize,
+    gap_end: usize,
+    node: &MotifNode,
+    is_leading: bool,
+    id_check: &mut HashSet<String>,
+    id_count: &mut HashMap<usize, usize>,
+    log: &mut Vec<String>,
+    ref_consensus: &HashMap<usize, Vec<u8>>,
+    ref_count: usize,
+    gff: &HashMap<String, GffEntry>,
+    genome: &HashMap<String, Vec<u8>>,
+    scaffold_intervals: &HashMap<String, Vec<(usize, usize, String)>>,
+    last_node_seq_len: usize,
+    last_node_nt_seq_len: usize,
+    results: &mut Vec<MotifHit>,
+) {
+    let amount = (gap_end - gap_start) * 3;
+    let direction = if is_leading { "Left leading" } else { "Right trailing" };
+    log.push(format!(
+        "{} gap of {} with size {}",
+        direction, node.header, amount
+    ));
+
+    const MINIMUM_GAP_BP: usize = 15;
+    const MAX_GAP_BP: usize = 360;
+    const REF_GAP_THR: f64 = 0.7;
+    const LR_REF_COV: f64 = 0.8;
+    const MIN_CONSEC: usize = 5;
+    const MINIMUM_AA: usize = 5;
+    const REQ_END_DATA_COLS: f64 = 0.75;
+    const FLANK_BP: usize = 20000;
+    const MAX_SCORE: usize = 100;
+    const STOP_PENALTY: usize = 5;
+    const FLEX: usize = 1;
+
+    if amount < MINIMUM_GAP_BP || amount >= MAX_GAP_BP {
+        log.push("Gap too small or too large\n".to_string());
+        return;
+    }
+
+    let node_field = parse_node_field(&node.header).replace("NODE_", "");
+    let node_name = if node_field.contains("&&") {
+        if is_leading {
+            node_field.split("&&").next().unwrap_or(&node_field)
+        } else {
+            node_field.split("&&").last().unwrap_or(&node_field)
+        }
+        .split('_')
+        .next()
+        .unwrap_or(&node_field)
+    } else {
+        node_field.split('_').next().unwrap_or(&node_field)
+    };
+
+    let gff_entry = gff.get(&node_field).or_else(|| gff.get(node_name));
+    let gff_entry = match gff_entry {
+        Some(e) => e,
+        None => {
+            log.push(format!("No GFF entry for {}\n", node_field));
+            return;
+        }
+    };
+
+    let scaffold_seq = match genome.get(&gff_entry.scaffold) {
+        Some(s) => s,
+        None => {
+            log.push(format!("Scaffold {} not loaded\n", gff_entry.scaffold));
+            return;
+        }
+    };
+    let scaffold_len = scaffold_seq.len();
+
+    let (seq, rs, re) = if is_leading {
+        // Upstream of this exon
+        if gff_entry.strand == "+" {
+            let left = find_left_bound(&gff_entry.scaffold, gff_entry.start, scaffold_intervals);
+            let s = left.max(gff_entry.start.saturating_sub(1).saturating_sub(FLANK_BP));
+            let e = gff_entry.start.saturating_sub(1);
+            (scaffold_seq[s..e].to_vec(), s, e)
+        } else {
+            let right = find_right_bound(
+                &gff_entry.scaffold,
+                gff_entry.end,
+                scaffold_intervals,
+                scaffold_len,
+            );
+            let s = gff_entry.end;
+            let e = right.min(gff_entry.end + FLANK_BP);
+            (bio_revcomp(&scaffold_seq[s..e]), s, e)
+        }
+    } else {
+        // Downstream of this exon
+        if gff_entry.strand == "+" {
+            let right = find_right_bound(
+                &gff_entry.scaffold,
+                gff_entry.end,
+                scaffold_intervals,
+                scaffold_len,
+            );
+            let s = gff_entry.end;
+            let e = right.min(gff_entry.end + FLANK_BP);
+            (scaffold_seq[s..e].to_vec(), s, e)
+        } else {
+            let left = find_left_bound(&gff_entry.scaffold, gff_entry.start, scaffold_intervals);
+            let s = left.max(gff_entry.start.saturating_sub(1).saturating_sub(FLANK_BP));
+            let e = gff_entry.start.saturating_sub(1);
+            (bio_revcomp(&scaffold_seq[s..e]), s, e)
+        }
+    };
+
+    if seq.is_empty() {
+        log.push("Empty flank region\n".to_string());
+        return;
+    }
+
+    log.push(format!(
+        "  Node: {}:{}-{} ({}) Search: {}:{}-{} len={}",
+        gff_entry.scaffold,
+        gff_entry.start,
+        gff_entry.end,
+        gff_entry.strand,
+        gff_entry.scaffold,
+        rs + 1,
+        re,
+        seq.len()
+    ));
+
+    let (ref_gaps, insert_at, longest_consecutive) =
+        motif_count_ref_gaps(gap_start, gap_end, ref_consensus, REF_GAP_THR);
+    if longest_consecutive < MIN_CONSEC {
+        return;
+    }
+
+    let (left_dc, right_dc) = if is_leading {
+        (Some(REQ_END_DATA_COLS), None)
+    } else {
+        (None, Some(REQ_END_DATA_COLS))
+    };
+
+    let (this_consensus, edge_trim_cols) = motif_filter_ref_consensus(
+        ref_count,
+        ref_consensus,
+        &ref_gaps,
+        gap_start,
+        gap_end,
+        LR_REF_COV,
+        left_dc,
+        right_dc,
+    );
+    if this_consensus.is_empty() {
+        return;
+    }
+
+    let skip_cols: HashSet<usize> = edge_trim_cols.union(&ref_gaps).cloned().collect();
+
+    let (highest_possible_score, kmer_results, ref_cols) = scan_kmer(
+        amount,
+        log,
+        &seq,
+        &skip_cols,
+        FLEX,
+        &this_consensus,
+        gap_start,
+        gap_end,
+        MAX_SCORE,
+        STOP_PENALTY,
+    );
+
+    if kmer_results.is_empty() {
+        log.push("No suitable kmer found\n".to_string());
+        return;
+    }
+
+    let mut sorted_results = kmer_results;
+    sorted_results.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut accepted = 0usize;
+    let mut seen_positions: HashSet<(usize, usize)> = HashSet::new();
+
+    for (kmer, score, qstart, qend, frame) in &sorted_results {
+        if accepted >= 3 {
+            break;
+        }
+        if kmer.len() < MINIMUM_AA {
+            continue;
+        }
+
+        let pos_key = (*frame, qstart / 9);
+        if seen_positions.contains(&pos_key) {
+            continue;
+        }
+
+        let (exp_kmer, exp_score, exp_qstart, exp_qend, exp_frame, _exp_ratio) = expand_hit(
+            kmer, *score, *qstart, *qend, *frame, &seq, &ref_cols, &this_consensus, MAX_SCORE,
+            STOP_PENALTY, 10,
+        );
+
+        let exp_size = exp_kmer.len();
+        let exp_cols: &[usize] = if exp_size <= ref_cols.len() {
+            &ref_cols[..exp_size]
+        } else {
+            &ref_cols
+        };
+        let mut all_aas: HashSet<u8> = HashSet::new();
+        for col_vals in this_consensus.values() {
+            for &a in col_vals {
+                all_aas.insert(a);
+            }
+        }
+        let exp_max: usize = exp_cols
+            .iter()
+            .map(|&c| {
+                this_consensus
+                    .get(&c)
+                    .map(|col| {
+                        all_aas
+                            .iter()
+                            .map(|&a| col.iter().filter(|&&cc| cc == a).count())
+                            .max()
+                            .unwrap_or(0)
+                            .min(MAX_SCORE)
+                    })
+                    .unwrap_or(0)
+            })
+            .sum();
+
+        let threshold: f64 = if exp_size >= 10 { 0.5 } else { 0.85 };
+        let threshold_score = (exp_max as f64 * threshold).round() as usize;
+        if exp_max > 0 && exp_score < threshold_score {
+            if accepted == 0 {
+                log.push(format!(
+                    "Failed score threshold: {} ({:.0}%) < {:.0}%",
+                    exp_score,
+                    if exp_max > 0 {
+                        exp_score as f64 / exp_max as f64 * 100.0
+                    } else {
+                        0.0
+                    },
+                    threshold * 100.0
+                ));
+            }
+            continue;
+        }
+
+        seen_positions.insert(pos_key);
+
+        // Finalise: build header, aa sequence, nt sequence
+        let exp_kmer_str = String::from_utf8_lossy(&exp_kmer).to_string();
+
+        let node_id: usize = node_name.parse().unwrap_or(0);
+
+        let count = id_count.entry(node_id).or_insert(0);
+        let mut new_node = if *count == 0 {
+            node_id.to_string()
+        } else {
+            format!("{}_{}", node_id, count)
+        };
+        while id_check.contains(&new_node) {
+            *count += 1;
+            new_node = if *count == 0 {
+                node_id.to_string()
+            } else {
+                format!("{}_{}", node_id, count)
+            };
+        }
+        *count += 1;
+        id_check.insert(new_node.clone());
+
+        let mut best_frame_val = (exp_frame as i32) + 1;
+        if node.frame < 0 {
+            best_frame_val = -best_frame_val;
+        }
+
+        let mut header_fields: Vec<&str> = node.header.split('|').collect();
+        let node_field_owned = format!("NODE_{}", new_node);
+        let frame_str = best_frame_val.to_string();
+        let score_str = "1".to_string();
+        if header_fields.len() > 5 {
+            header_fields[3] = &node_field_owned;
+            header_fields[4] = &frame_str;
+            header_fields[5] = &score_str;
+        }
+        let new_header = header_fields.join("|");
+
+        let gapped_kmer = insert_gaps(&exp_kmer_str, &insert_at, 0, false);
+        let mut new_aa = "-".repeat(gap_start) + &gapped_kmer;
+        if new_aa.len() < last_node_seq_len {
+            new_aa.push_str(&"-".repeat(last_node_seq_len - new_aa.len()));
+        }
+
+        let nt_seq_raw = String::from_utf8_lossy(&seq[exp_qstart..exp_qend]).to_string();
+        let gapped_nt = insert_gaps(&nt_seq_raw, &insert_at, 0, true);
+        let mut new_nt = "-".repeat(gap_start * 3) + &gapped_nt;
+        if new_nt.len() < last_node_nt_seq_len {
+            new_nt.push_str(&"-".repeat(last_node_nt_seq_len - new_nt.len()));
+        }
+
+        log.push(format!(
+            "Best match: {} score={} max={} threshold={:.0}%",
+            exp_kmer_str, exp_score, highest_possible_score, threshold * 100.0
+        ));
+        log.push(format!("Inserted sequence: {}", new_header));
+        log.push(format!("nt={}\n", nt_seq_raw));
+
+        results.push(MotifHit {
+            header: new_header,
+            aa_seq: new_aa,
+            nt_seq: new_nt,
+        });
+        accepted += 1;
+    }
+
+    log.push(String::new());
+}
+
+/// Find the start and end of non-gap content in a sequence.
+fn motif_find_index_pair(seq: &str) -> (usize, usize) {
+    let bytes = seq.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'-' {
+            start = i;
+            break;
+        }
+    }
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] != b'-' {
+            end = i + 1;
+            break;
+        }
+    }
+    (start, end)
+}
+
+/// Run motif scan on a single gene.
+fn motif_scan_gene(
+    gene: &str,
+    aa_entries: &[(String, String)],
+    nt_dir: &Path,
+    clusters_map: &HashMap<String, HashMap<String, (Vec<String>, String)>>,
+    gff: &HashMap<String, GffEntry>,
+    genome: &HashMap<String, Vec<u8>>,
+    scaffold_intervals: &HashMap<String, Vec<(usize, usize, String)>>,
+) -> (Vec<String>, Vec<MotifHit>) {
+    let mut log: Vec<String> = Vec::new();
+    let mut all_hits: Vec<MotifHit> = Vec::new();
+
+    log.push(format!("=== Motif scan: {} ===", gene));
+
+    // Build ref consensus and node list from AA entries
+    let mut ref_consensus: HashMap<usize, Vec<u8>> = HashMap::new();
+    let mut ref_starts: Vec<usize> = Vec::new();
+    let mut ref_ends: Vec<usize> = Vec::new();
+    let mut ref_count: usize = 0;
+    let mut aa_nodes: Vec<MotifNode> = Vec::new();
+
+    for (header, seq) in aa_entries {
+        if header.ends_with('.') {
+            ref_count += 1;
+            let (start, end) = motif_find_index_pair(seq);
+            ref_starts.push(start);
+            ref_ends.push(end);
+            for (i, b) in seq.bytes().enumerate() {
+                let col = ref_consensus.entry(i).or_default();
+                if i >= start && i <= end {
+                    col.push(b);
+                } else {
+                    col.push(b'-');
+                }
+            }
+            continue;
+        }
+        let fields: Vec<&str> = header.split('|').collect();
+        let frame: i32 = fields.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let (start, end) = motif_find_index_pair(seq);
+        aa_nodes.push(MotifNode {
+            header: header.clone(),
+            frame,
+            sequence: seq.clone(),
+            start,
+            end,
+        });
+    }
+
+    if aa_nodes.is_empty() || ref_count == 0 || ref_starts.is_empty() {
+        return (log, all_hits);
+    }
+
+    // Load NT sequences
+    let nt_file = gene.replace(".aa.", ".nt.").replace("aa.fa", "nt.fa");
+    let nt_path = nt_dir.join(&nt_file);
+    let nt_entries = read_aa_fasta(&nt_path.to_string_lossy());
+    let nt_map: HashMap<&str, &str> = nt_entries
+        .iter()
+        .map(|(h, s)| (h.as_str(), s.as_str()))
+        .collect();
+
+    // Ref median start/end
+    let mut sorted_starts = ref_starts.clone();
+    sorted_starts.sort();
+    let ref_median_start = sorted_starts[sorted_starts.len() / 2];
+    let mut sorted_ends = ref_ends.clone();
+    sorted_ends.sort();
+    let ref_median_end = sorted_ends[sorted_ends.len() / 2];
+
+    // Build id tracking
+    let mut id_count: HashMap<usize, usize> = HashMap::new();
+    let mut id_check: HashSet<String> = HashSet::new();
+    for node in &aa_nodes {
+        let nf = parse_node_field(&node.header).replace("NODE_", "");
+        for part in nf.split("&&") {
+            id_check.insert(part.to_string());
+        }
+        for part in nf.split("&&") {
+            if let Ok(id) = part.split('_').next().unwrap_or("").parse::<usize>() {
+                *id_count.entry(id).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Get cluster sets for this gene
+    let clusters = match clusters_map.get(gene) {
+        Some(c) => c,
+        None => return (log, all_hits),
+    };
+
+    // Convert cluster map to sets of NODE_ prefixed tokens
+    let cluster_sets: Vec<HashSet<String>> = clusters
+        .values()
+        .map(|(nodes, _)| nodes.iter().map(|n| format!("NODE_{}", n)).collect())
+        .collect();
+
+    // Get reference sequence length for padding
+    let last_seq_len = aa_entries
+        .iter()
+        .filter(|(h, _)| !h.ends_with('.'))
+        .map(|(_, s)| s.len())
+        .max()
+        .unwrap_or(0);
+    let last_nt_seq_len = nt_map
+        .values()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(last_seq_len * 3);
+
+    for cluster_set in &cluster_sets {
+        let mut aa_subset: Vec<&MotifNode> = aa_nodes
+            .iter()
+            .filter(|n| {
+                let nf = n.header.split('|').nth(3).unwrap_or("");
+                cluster_set.contains(nf)
+            })
+            .collect();
+
+        if aa_subset.is_empty() {
+            continue;
+        }
+
+        if aa_subset[0].frame < 0 {
+            aa_subset.sort_by(|a, b| b.start.cmp(&a.start));
+        } else {
+            aa_subset.sort_by(|a, b| a.start.cmp(&b.start));
+        }
+
+        let (first_node, last_node) = if aa_subset[0].frame < 0 {
+            (
+                aa_subset[aa_subset.len() - 1],
+                aa_subset[0],
+            )
+        } else {
+            (aa_subset[0], aa_subset[aa_subset.len() - 1])
+        };
+
+        // Leading gap: from ref_median_start to first_node.start
+        if first_node.start > ref_median_start {
+            motif_scan_flank(
+                ref_median_start,
+                first_node.start,
+                first_node,
+                true,
+                &mut id_check,
+                &mut id_count,
+                &mut log,
+                &ref_consensus,
+                ref_count,
+                gff,
+                genome,
+                scaffold_intervals,
+                last_seq_len,
+                last_nt_seq_len,
+                &mut all_hits,
+            );
+        }
+
+        // Trailing gap: from last_node.end to ref_median_end
+        if ref_median_end > last_node.end {
+            motif_scan_flank(
+                last_node.end,
+                ref_median_end,
+                last_node,
+                false,
+                &mut id_check,
+                &mut id_count,
+                &mut log,
+                &ref_consensus,
+                ref_count,
+                gff,
+                genome,
+                scaffold_intervals,
+                last_seq_len,
+                last_nt_seq_len,
+                &mut all_hits,
+            );
+        }
+    }
+
+    (log, all_hits)
+}
+
+// ---------------------------------------------------------------------------
+// End motif scan
+// ---------------------------------------------------------------------------
+
 struct GffEntry {
     scaffold: String,
     start: usize,
@@ -2332,7 +3327,7 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
 
     let gff_path = find_gff_path(folder_path, &sub_dir);
 
-    let gff_nodes = match &gff_path {
+    let mut gff_nodes = match &gff_path {
         Some(path) => read_gff(path),
         None => HashMap::new(),
     };
@@ -2415,6 +3410,77 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // Motif scan: update GFF with recovered exons, then scan flanks
+    // -----------------------------------------------------------------------
+    // Register recovered DP nodes into gff_nodes so motif scan can see them
+    for result in &results_list {
+        for rec in &result.recovered {
+            let dp_name = parse_node_field(&rec.header).replace("NODE_", "");
+            // Parse region string: "scaffold:start-end(strand)"
+            if let Some(colon) = rec.region.find(':') {
+                if let Some(paren) = rec.region.find('(') {
+                    let scaffold = &rec.region[..colon];
+                    let coords = &rec.region[colon + 1..paren];
+                    let strand = &rec.region[paren + 1..paren + 2];
+                    let parts: Vec<&str> = coords.split('-').collect();
+                    if parts.len() == 2 {
+                        if let (Ok(s), Ok(e)) = (parts[0].parse(), parts[1].parse()) {
+                            gff_nodes.insert(
+                                dp_name,
+                                GffEntry {
+                                    scaffold: scaffold.to_string(),
+                                    start: s,
+                                    end: e,
+                                    strand: strand.to_string(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let scaffold_intervals = build_scaffold_intervals(&gff_nodes);
+    let nt_dir = input_folder.join("nt");
+
+    let mut motif_log_all: Vec<String> = Vec::new();
+    let mut motif_results: Vec<(String, Vec<MotifHit>)> = Vec::new();
+
+    for gene_file in &output_genes {
+        let gene_key = gene_file.trim_end_matches(".gz");
+        if !gene_clusters.contains_key(gene_key) {
+            continue;
+        }
+        // Re-read AA entries (needed for ref consensus)
+        let fpath = aa_dir.join(gene_file);
+        let entries = read_aa_fasta(&fpath.to_string_lossy());
+        if entries.is_empty() {
+            continue;
+        }
+
+        let (log, hits) = motif_scan_gene(
+            gene_key,
+            &entries,
+            &nt_dir,
+            &gene_clusters,
+            &gff_nodes,
+            &genome,
+            &scaffold_intervals,
+        );
+
+        if !log.is_empty() {
+            motif_log_all.extend(log);
+        }
+        if !hits.is_empty() {
+            motif_results.push((gene_key.to_string(), hits));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Build Python output
+    // -----------------------------------------------------------------------
     let output = PyDict::new(py);
 
     let py_results = PyList::empty(py);
@@ -2443,6 +3509,25 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
         py_results.append(rd)?;
     }
     output.set_item("results", py_results)?;
+
+    // Motif scan results
+    let py_motif = PyList::empty(py);
+    for (gene, hits) in &motif_results {
+        let gd = PyDict::new(py);
+        gd.set_item("gene", gene)?;
+        let py_hits = PyList::empty(py);
+        for hit in hits {
+            let hd = PyDict::new(py);
+            hd.set_item("header", &hit.header)?;
+            hd.set_item("aa_seq", &hit.aa_seq)?;
+            hd.set_item("nt_seq", &hit.nt_seq)?;
+            py_hits.append(hd)?;
+        }
+        gd.set_item("hits", py_hits)?;
+        py_motif.append(gd)?;
+    }
+    output.set_item("motif_results", py_motif)?;
+    output.set_item("motif_log", motif_log_all)?;
 
     let py_gff = PyDict::new(py);
     for (name, entry) in &gff_nodes {

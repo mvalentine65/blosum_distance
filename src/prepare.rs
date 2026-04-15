@@ -219,7 +219,7 @@ impl PyGxCounter {
 //             rename,
 //             min_seq_len,
 //             this_index: 0,
-//             // header_template: "NODE_{}".to_string(),
+//             // header_template: "{}".to_string(),
 //             append_index_template: "{}_{}".to_string(),
 //             sequence_template: ">{}\n{}\n".to_string(),
 //             duplicates: GxHashMap::<String, usize>::default(),
@@ -246,7 +246,7 @@ impl PyGxCounter {
 //         let n_sequences = self.n_trim(parent_seq);
 //         let header: String;
 //         match self.rename {
-//             true => header = format!("NODE_{}", self.this_index),
+//             true => header = format!("{}", self.this_index),
 //             false => header = header.split(" ").take(1).collect(),
 //         }
 //         for seq in n_sequences.into_iter() {

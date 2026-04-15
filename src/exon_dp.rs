@@ -357,7 +357,7 @@ fn flank_extract_orfs(
         direction, node.header, effective_gap, total_cols
     ));
 
-    let node_field = parse_node_field(&node.header).replace("NODE_", "");
+    let node_field = parse_node_field(&node.header).to_string();
     let node_name = if node_field.contains("&&") {
         if is_leading {
             node_field.split("&&").next().unwrap_or(&node_field)
@@ -596,7 +596,7 @@ fn flank_scan_gene(
         .map(|(key, (nodes, iso_type))| {
             (
                 key.as_str(),
-                nodes.iter().map(|n| format!("NODE_{}", n)).collect(),
+                nodes.iter().cloned().collect(),
                 iso_type.as_str(),
             )
         })
@@ -1161,10 +1161,7 @@ fn process_gene(
             if iso_type != "MXE" {
                 continue;
             }
-            let fields: HashSet<String> = node_tokens
-                .iter()
-                .map(|t| format!("NODE_{}", t))
-                .collect();
+            let fields: HashSet<String> = node_tokens.iter().cloned().collect();
             if let Some(bk) = ck.rsplit_once('_').map(|(k, _)| k.to_string()) {
                 iso_sets.entry(bk).or_default().push(fields);
             } else {
@@ -1186,10 +1183,7 @@ fn process_gene(
     };
 
     for (ck, node_tokens, iso_type) in &all_clusters {
-        let cluster_node_fields: HashSet<String> = node_tokens
-            .iter()
-            .map(|t| format!("NODE_{}", t))
-            .collect();
+        let cluster_node_fields: HashSet<String> = node_tokens.iter().cloned().collect();
 
         // For MXE clusters, identify modular nodes.
         // Isoform clusters: nodes present in the isoform but not the base.
@@ -1198,10 +1192,7 @@ fn process_gene(
         let modular_node_fields: HashSet<String> = if *iso_type == "MXE" {
             if let Some(base_key) = ck.rsplit_once('_').map(|(k, _)| k.to_string()) {
                 if let Some((base_tokens, _)) = clusters.get(&base_key) {
-                    let base_fields: HashSet<String> = base_tokens
-                        .iter()
-                        .map(|t| format!("NODE_{}", t))
-                        .collect();
+                    let base_fields: HashSet<String> = base_tokens.iter().cloned().collect();
                     cluster_node_fields
                         .difference(&base_fields)
                         .cloned()
@@ -1271,8 +1262,8 @@ fn process_gene(
 
             tgaps += 1;
 
-            let node_a_name = na.nf.replace("NODE_", "");
-            let node_b_name = nb.nf.replace("NODE_", "");
+            let node_a_name = na.nf.clone();
+            let node_b_name = nb.nf.clone();
 
             // MXE isoforms: skip gaps between two shared (non-modular)
             // nodes.  These gaps duplicate work done by the base
@@ -1335,8 +1326,7 @@ fn process_gene(
                                 && *ss >= rs
                                 && *se <= re
                                 && !cluster_node_fields.iter().any(|nf| {
-                                    let bare = nf.strip_prefix("NODE_").unwrap_or(nf);
-                                    if let Some(entry) = gff.get(bare) {
+                                    if let Some(entry) = gff.get(nf.as_str()) {
                                         entry.scaffold == *sscaf
                                             && entry.start == *ss
                                             && entry.end == *se
@@ -1609,7 +1599,7 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
     // Register recovered DP nodes into gff_nodes so flank scan can see them
     for result in &results_list {
         for rec in &result.recovered {
-            let dp_name = parse_node_field(&rec.header).replace("NODE_", "");
+            let dp_name = parse_node_field(&rec.header).to_string();
             // Parse region string: "scaffold:start-end(strand)"
             if let Some(colon) = rec.region.find(':') {
                 if let Some(paren) = rec.region.find('(') {

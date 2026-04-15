@@ -1,4 +1,6 @@
 mod align;
+mod aligner;
+mod column_cull;
 mod consensus;
 mod dedupe;
 mod entropy;
@@ -575,6 +577,9 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(utils::write_fasta_uncompressed, m)?)?;
     m.add_function(wrap_pyfunction!(translate::translate, m)?)?;
     m.add_function(wrap_pyfunction!(interval_tree::del_cols, m)?)?;
+    m.add_function(wrap_pyfunction!(aligner::hmm_align, m)?)?;
+    m.add_function(wrap_pyfunction!(column_cull::cull_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(column_cull::apply_gff_culls, m)?)?;
 
     m.add_class::<Hit>()?;
     m.add_class::<ReferenceHit>()?;

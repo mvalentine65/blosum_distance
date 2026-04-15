@@ -7,9 +7,15 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-const _MINIMUM_GAP_BP: usize = 15;
-const _MAX_INTERNAL_GAP_BP: usize = 15_000;
-const MIN_CONSEC_CHAR: usize = 5;
+/// Fraction of refs that must be gap/space for a column to be masked out.
+const REF_GAP_THR: f64 = 0.67;
+/// Minimum effective (masked) gap columns to trigger a scan.
+const MINIMUM_GAP_AA: usize = 10;
+/// Maximum effective (masked) gap columns; larger gaps are skipped.
+const MAX_GAP_AA: usize = 250;
+/// Genomic search region cap for flank scans (bp).
+const FLANK_BP: usize = 15000;
+
 
 fn codon_to_aa(c1: u8, c2: u8, c3: u8) -> u8 {
     match (c1, c2, c3) {
@@ -191,6 +197,24 @@ fn flank_count_ref_gaps(
     (ref_gaps, insert_at, longest_consecutive)
 }
 
+/// Check whether a gap qualifies for scanning. Returns
+/// `Some((effective_gap, scaled_min_aa))` if it does, `None` otherwise.
+fn qualify_gap(
+    gap_start: usize,
+    gap_end: usize,
+    ref_consensus: &HashMap<usize, Vec<u8>>,
+) -> Option<(usize, usize)> {
+    let (ref_gaps, _, _) =
+        flank_count_ref_gaps(gap_start, gap_end, ref_consensus, REF_GAP_THR);
+    let total_cols = gap_end - gap_start;
+    let effective_gap = total_cols - ref_gaps.len();
+    if effective_gap < MINIMUM_GAP_AA || effective_gap >= MAX_GAP_AA {
+        return None;
+    }
+    let scaled_min_aa = MINIMUM_GAP_AA.max(effective_gap / 2);
+    Some((effective_gap, scaled_min_aa))
+}
+
 /// Translate nucleotide bytes to amino acid string (standard code).
 fn flank_translate(nt: &[u8]) -> Vec<u8> {
     let mut aa = Vec::with_capacity(nt.len() / 3);
@@ -217,21 +241,14 @@ fn trim_to_codon(seq: &[u8]) -> &[u8] {
 /// Returns (aa_seq, nt_start, nt_end, frame) for each ORF >= min_aa residues.
 /// ORFs are delimited by stop codons or sequence boundaries.
 ///
-/// Leading flanks (require_start=true, is_leading=true):
+/// Leading flanks (require_start=true):
 ///   - Trim 5' to first M (ATG). No M = discard.
-///   - Trim 3' to last GT/GC donor found by scanning backwards from the
-///     stop boundary. Checks all 3 phases. No donor found = keep untrimmed.
-///
-/// Trailing flanks (require_start=false, is_leading=false):
-///   - Trim 5' to first AG acceptor found by scanning forwards from the
-///     start boundary. Checks all 3 phases. No acceptor found = keep untrimmed.
 ///
 /// Results are deduplicated by AA containment (shorter contained in longer removed).
 fn extract_flank_orfs(
     seq: &[u8],
     min_aa: usize,
     require_start: bool,
-    is_leading: bool,
 ) -> Vec<(Vec<u8>, usize, usize, usize)> {
     let mut raw: Vec<(Vec<u8>, usize, usize, usize)> = Vec::new();
     let seq_len = seq.len();
@@ -260,7 +277,7 @@ fn extract_flank_orfs(
 
         for (seg_start_aa, seg_end_aa) in segments {
             let mut aa_from = seg_start_aa;
-            let mut aa_to = seg_end_aa;
+            let aa_to = seg_end_aa;
 
             // --- Leading flank: trim 5' to first M ---
             if require_start {
@@ -269,83 +286,6 @@ fn extract_flank_orfs(
                     aa_from += m_pos;
                 } else {
                     continue;
-                }
-            }
-
-            // --- Leading flank: trim 3' to GT/GC donor ---
-            // Scan backwards from the stop/end boundary in the genomic
-            // sequence looking for a donor dinucleotide.  The donor can
-            // sit at any phase offset (0, 1, 2 orphan bp before it).
-            if is_leading {
-                let orf_nt_start = frame + aa_from * 3;
-                let orf_nt_end = frame + aa_to * 3;
-                // Don't scan past the point where the remaining exon
-                // would be shorter than min_aa.
-                let scan_floor = orf_nt_start + min_aa * 3;
-                let mut donor_nt: Option<usize> = None;
-                if orf_nt_end > scan_floor {
-                    let mut pos = orf_nt_end;
-                    while pos > scan_floor {
-                        pos -= 1;
-                        if pos + 1 < seq_len {
-                            let d0 = seq[pos].to_ascii_uppercase();
-                            let d1 = seq[pos + 1].to_ascii_uppercase();
-                            if (d0 == b'G' && d1 == b'T') || (d0 == b'G' && d1 == b'C') {
-                                donor_nt = Some(pos);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Some(dpos) = donor_nt {
-                    // Exon coding ends before the donor. The orphan bp
-                    // (0-2 nt between last full codon and donor) are not
-                    // translated. Round down to whole codons.
-                    let coding_nt = dpos - orf_nt_start;
-                    let coding_aa = coding_nt / 3;
-                    if coding_aa >= min_aa {
-                        aa_to = aa_from + coding_aa;
-                    }
-                }
-            }
-
-            // --- Trailing flank: trim 5' to AG acceptor ---
-            // Scan forwards from the start boundary looking for an
-            // acceptor dinucleotide preceding the exon.
-            if !is_leading {
-                let orf_nt_start = frame + aa_from * 3;
-                let orf_nt_end = frame + aa_to * 3;
-                // Don't scan past the point where the remaining exon
-                // would be shorter than min_aa.
-                let scan_ceil = if orf_nt_end >= min_aa * 3 {
-                    orf_nt_end - min_aa * 3
-                } else {
-                    orf_nt_start
-                };
-                let mut acceptor_nt: Option<usize> = None;
-                let mut pos = orf_nt_start;
-                while pos <= scan_ceil {
-                    // AG sits in the intron, immediately before the exon.
-                    // Check positions before `pos` for AG.
-                    if pos >= 2 {
-                        let a0 = seq[pos - 2].to_ascii_uppercase();
-                        let a1 = seq[pos - 1].to_ascii_uppercase();
-                        if a0 == b'A' && a1 == b'G' {
-                            acceptor_nt = Some(pos);
-                            break;
-                        }
-                    }
-                    pos += 1;
-                }
-                if let Some(apos) = acceptor_nt {
-                    // Exon starts at apos. Orphan bp (0-2 nt between
-                    // acceptor and first full codon) are not translated.
-                    // Round up to whole codons.
-                    let skipped_nt = apos - (frame + aa_from * 3);
-                    let skipped_aa = (skipped_nt + 2) / 3;
-                    if aa_from + skipped_aa + min_aa <= aa_to {
-                        aa_from += skipped_aa;
-                    }
                 }
             }
 
@@ -404,24 +344,18 @@ fn flank_extract_orfs(
     cluster_key: &str,
     results: &mut Vec<FlankCandidate>,
 ) {
-    let amount = (gap_end - gap_start) * 3;
     let direction = if is_leading { "Left leading" } else { "Right trailing" };
+
+    let (effective_gap, scaled_min_aa) = match qualify_gap(gap_start, gap_end, ref_consensus) {
+        Some(v) => v,
+        None => return,
+    };
+    let total_cols = gap_end - gap_start;
+
     log.push(format!(
-        "{} gap of {} with size {}",
-        direction, node.header, amount
+        "{} gap of {} ({}/{} cols effective/total)",
+        direction, node.header, effective_gap, total_cols
     ));
-
-    const MINIMUM_GAP_BP: usize = 15;
-    const MAX_GAP_BP: usize = 750;
-    const REF_GAP_THR: f64 = 0.7;
-    const MIN_CONSEC: usize = 5;
-    const MINIMUM_AA: usize = 10;
-    const FLANK_BP: usize = 15000;
-
-    if amount < MINIMUM_GAP_BP || amount >= MAX_GAP_BP {
-        log.push("Gap too small or too large\n".to_string());
-        return;
-    }
 
     let node_field = parse_node_field(&node.header).replace("NODE_", "");
     let node_name = if node_field.contains("&&") {
@@ -508,25 +442,8 @@ fn flank_extract_orfs(
         seq.len()
     ));
 
-    // Validate that the gap region has enough consecutive ref-data columns
-    let (ref_gaps, _insert_at, longest_consecutive) =
-        flank_count_ref_gaps(gap_start, gap_end, ref_consensus, REF_GAP_THR);
-    if longest_consecutive < MIN_CONSEC {
-        log.push(format!(
-            "Longest consecutive ref cols {} < {}\n",
-            longest_consecutive, MIN_CONSEC
-        ));
-        return;
-    }
-
-    // Effective gap = columns where refs actually have data (not mostly gapped).
-    // This matches how the DP path sizes its PSSM via filter_ref_consensus.
-    let total_cols = gap_end - gap_start;
-    let effective_gap = total_cols - ref_gaps.len();
-    let scaled_min_aa = MINIMUM_AA.max((effective_gap * 2) / 3);
-
     // Extract ORFs from all 3 frames
-    let orfs = extract_flank_orfs(&seq, scaled_min_aa, is_leading, is_leading);
+    let orfs = extract_flank_orfs(&seq, scaled_min_aa, is_leading);
     if orfs.is_empty() {
         log.push(format!(
             "No ORFs >= {} AA found in flank region\n",
@@ -1339,49 +1256,18 @@ fn process_gene(
             } else {
                 0
             };
-            let gap_nt = gap_aa * 3;
-
-            if gap_aa == 0
-                || gap_nt < _MINIMUM_GAP_BP
-                || gap_nt > _MAX_INTERNAL_GAP_BP
-            {
+            if gap_aa == 0 {
                 continue;
             }
 
             let gap_start = left_end;
             let gap_end = right_start;
 
-            // Ref-presence filter: gap columns must have enough
-            // consecutive reference-occupied positions to build a
-            // usable PSSM.  Gaps in insertion columns are padding.
-            {
-                let mut longest_consec = 0usize;
-                let mut cur_consec = 0usize;
-                for col in gap_start..gap_end {
-                    let has_ref = match rc.get(&col) {
-                        Some(chars) if !chars.is_empty() => {
-                            let gf = chars.iter().filter(|&&c| c == b'-').count() as f64
-                                / chars.len() as f64;
-                            gf < 0.67
-                        }
-                        _ => false,
-                    };
-                    if has_ref {
-                        cur_consec += 1;
-                    } else {
-                        if cur_consec > longest_consec {
-                            longest_consec = cur_consec;
-                        }
-                        cur_consec = 0;
-                    }
-                }
-                if cur_consec > longest_consec {
-                    longest_consec = cur_consec;
-                }
-                if longest_consec < MIN_CONSEC_CHAR {
-                    continue;
-                }
-            }
+            let (effective_gap, gap_min_aa) = match qualify_gap(gap_start, gap_end, &rc) {
+                Some(v) => v,
+                None => continue,
+            };
+            let total_gap_cols = gap_end - gap_start;
 
             tgaps += 1;
 
@@ -1520,19 +1406,9 @@ fn process_gene(
                 continue;
             }
 
-            if gap_end <= gap_start || gap_end - gap_start < 3 {
-                continue;
-            }
-
             // Extract ORFs from the gap region.  No M requirement for
             // internal exons. min_aa scaled by effective gap (ref-presence cols).
-            let (ref_gaps_set, _, _) =
-                flank_count_ref_gaps(gap_start, gap_end, &rc, 0.67);
-            let total_gap_cols = gap_end - gap_start;
-            let effective_gap = total_gap_cols - ref_gaps_set.len();
-            let gap_min_aa = MIN_CONSEC_CHAR.max((effective_gap * 2) / 3);
-
-            let orfs = extract_flank_orfs(&sr, gap_min_aa, false, false);
+            let orfs = extract_flank_orfs(&sr, gap_min_aa, false);
 
             flog.push(format!(
                 "  {} candidate ORFs (min_aa={}, gap={}/{} eff/total cols)",
@@ -1542,8 +1418,6 @@ fn process_gene(
             if orfs.is_empty() {
                 continue;
             }
-
-            tgaps += 1;
 
             for (aa_bytes, nt_start, nt_end, frame) in &orfs {
                 let aa_str = String::from_utf8_lossy(aa_bytes).to_string();

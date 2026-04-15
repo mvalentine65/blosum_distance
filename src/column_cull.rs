@@ -10,42 +10,43 @@ use std::path::Path;
 // ---------------------------------------------------------------------------
 const MIN_INTRON_NT: usize = 30;
 
-fn is_donor(di: &str) -> bool {
-    di == "GT" || di == "GC"
+fn is_donor(a: u8, b: u8) -> bool {
+    (a == b'G' && b == b'T') || (a == b'G' && b == b'C')
 }
 
-fn is_acceptor(di: &str) -> bool {
-    di == "AG"
+fn is_acceptor(a: u8, b: u8) -> bool {
+    a == b'A' && b == b'G'
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn normalize_records(records: &[(String, String)]) -> Vec<(String, String)> {
+/// Single-pass normalize: replace '.' with '-', strip ' ', uppercase. One allocation.
+fn normalize_records(records: &[(String, String)]) -> Vec<(String, Vec<u8>)> {
     records
         .iter()
         .map(|(h, s)| {
-            let norm = s
-                .replace('.', "-")
-                .replace(' ', "")
-                .to_ascii_uppercase();
+            let mut norm = Vec::with_capacity(s.len());
+            for &b in s.as_bytes() {
+                match b {
+                    b'.' => norm.push(b'-'),
+                    b' ' => {}
+                    _ => norm.push(b.to_ascii_uppercase()),
+                }
+            }
             (h.clone(), norm)
         })
         .collect()
 }
 
-fn mask_columns(seq: &str, columns: &HashSet<usize>) -> String {
-    if columns.is_empty() {
-        return seq.to_string();
-    }
-    let mut chars: Vec<u8> = seq.bytes().collect();
-    for &i in columns {
-        if i < chars.len() {
-            chars[i] = b'-';
+/// Apply a boolean column mask in-place: set masked positions to b'-'.
+fn mask_columns_bool(seq: &mut [u8], mask: &[bool]) {
+    for (i, m) in mask.iter().enumerate() {
+        if *m && i < seq.len() {
+            seq[i] = b'-';
         }
     }
-    String::from_utf8(chars).unwrap()
 }
 
 fn has_splice_sites(
@@ -68,13 +69,11 @@ fn has_splice_sites(
         if d_start + 1 >= nt.len() || a_end > nt.len() {
             continue;
         }
-        let donor = std::str::from_utf8(&nt[d_start..d_start + 2])
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        let acceptor = std::str::from_utf8(&nt[a_end - 2..a_end])
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        if is_donor(&donor) && is_acceptor(&acceptor) {
+        let da = nt[d_start].to_ascii_uppercase();
+        let db = nt[d_start + 1].to_ascii_uppercase();
+        let aa = nt[a_end - 2].to_ascii_uppercase();
+        let ab = nt[a_end - 1].to_ascii_uppercase();
+        if is_donor(da, db) && is_acceptor(aa, ab) {
             return true;
         }
     }
@@ -83,12 +82,12 @@ fn has_splice_sites(
 
 /// Detect and mask retained same-frame introns in candidate sequences.
 fn mask_retained_introns(
-    normalized: &[(String, String)],
+    normalized: &[(String, Vec<u8>)],
     ref_suffix: &str,
     nt_seqs: &Option<HashMap<String, String>>,
     debug: i32,
     log_dir: &Option<String>,
-) -> (Vec<(String, String)>, HashMap<String, HashSet<usize>>) {
+) -> (Vec<(String, Vec<u8>)>, HashMap<String, HashSet<usize>>) {
     let min_intron_aa: usize = 3;
     let ref_gap_threshold: f64 = 0.95;
     let max_bridge_residues: usize = 8;
@@ -101,7 +100,7 @@ fn mask_retained_introns(
     let ref_seqs: Vec<&[u8]> = normalized
         .iter()
         .filter(|(h, _)| h.ends_with(ref_suffix))
-        .map(|(_, s)| s.as_bytes())
+        .map(|(_, s)| s.as_slice())
         .collect();
 
     if ref_seqs.is_empty() {
@@ -110,7 +109,7 @@ fn mask_retained_introns(
 
     let n_refs = ref_seqs.len();
 
-    // Pre-compute reference-gap columns.
+    // Pre-compute reference-gap columns as Vec<bool>.
     let mut ref_gap_col = vec![false; aln_len];
     for i in 0..aln_len {
         let gap_count = ref_seqs.iter().filter(|s| s[i] == b'-').count();
@@ -127,7 +126,7 @@ fn mask_retained_introns(
             continue;
         }
 
-        let sb = seq.as_bytes();
+        let sb = seq.as_slice();
 
         // Find contiguous insertion blocks.
         let mut blocks: Vec<(usize, usize)> = Vec::new();
@@ -166,13 +165,13 @@ fn mask_retained_introns(
         let candidate_nt = nt_seqs.as_ref().and_then(|m| m.get(header));
 
         for &(bs, be) in &blocks {
-            let block_residues: String =
-                sb[bs..be].iter().filter(|&&c| c != b'-').map(|&c| c as char).collect();
+            let block_residues: Vec<u8> =
+                sb[bs..be].iter().filter(|&&c| c != b'-').copied().collect();
             if block_residues.len() < min_intron_aa {
                 continue;
             }
 
-            let has_stop = block_residues.contains('*');
+            let has_stop = block_residues.contains(&b'*');
 
             let has_splice = if let Some(nt) = candidate_nt {
                 let block_first_residue = sb[..bs].iter().filter(|&&c| c != b'-').count();
@@ -205,12 +204,13 @@ fn mask_retained_introns(
                 if has_splice {
                     reason.push("splice");
                 }
+                let block_str: String = block_residues.iter().map(|&c| c as char).collect();
                 intron_log.push((
                     header.clone(),
                     bs,
                     be,
                     block_residues.len(),
-                    block_residues.clone(),
+                    block_str,
                     reason.join("+"),
                 ));
             }
@@ -219,7 +219,12 @@ fn mask_retained_introns(
         if cols_to_mask.is_empty() {
             result.push((header.clone(), seq.clone()));
         } else {
-            let masked = mask_columns(seq, &cols_to_mask);
+            let mut masked = seq.clone();
+            for &i in &cols_to_mask {
+                if i < masked.len() {
+                    masked[i] = b'-';
+                }
+            }
             intron_columns.insert(header.clone(), cols_to_mask);
             result.push((header.clone(), masked));
         }
@@ -418,12 +423,12 @@ fn trim_sparse_tail_end(
     end
 }
 
-fn codon_drops_from_mask(orig_seq: &str, masked_columns: &HashSet<usize>) -> HashSet<usize> {
+fn codon_drops_from_mask(orig_seq: &[u8], masked_columns: &[bool]) -> HashSet<usize> {
     let mut drops = HashSet::new();
     let mut res_idx = 0usize;
-    for (col, aa) in orig_seq.bytes().enumerate() {
+    for (col, &aa) in orig_seq.iter().enumerate() {
         if aa != b'-' {
-            if masked_columns.contains(&col) {
+            if col < masked_columns.len() && masked_columns[col] {
                 drops.insert(res_idx);
             }
             res_idx += 1;
@@ -433,12 +438,11 @@ fn codon_drops_from_mask(orig_seq: &str, masked_columns: &HashSet<usize>) -> Has
 }
 
 fn count_edge_residue_trims_from_removed(
-    orig_seq: &str,
-    removed_columns: &HashSet<usize>,
+    orig_seq: &[u8],
+    removed_columns: &[bool],
 ) -> Option<(usize, usize)> {
-    let ob = orig_seq.as_bytes();
-    let kept_indices: Vec<usize> = (0..ob.len())
-        .filter(|&i| !removed_columns.contains(&i) && ob[i] != b'-')
+    let kept_indices: Vec<usize> = (0..orig_seq.len())
+        .filter(|&i| !(i < removed_columns.len() && removed_columns[i]) && orig_seq[i] != b'-')
         .collect();
     if kept_indices.is_empty() {
         return None;
@@ -447,41 +451,21 @@ fn count_edge_residue_trims_from_removed(
     let last_kept = *kept_indices.last().unwrap();
 
     let left_trim = (0..first_kept)
-        .filter(|&i| ob[i] != b'-' && removed_columns.contains(&i))
+        .filter(|&i| orig_seq[i] != b'-' && i < removed_columns.len() && removed_columns[i])
         .count();
-    let right_trim = (last_kept + 1..ob.len())
-        .filter(|&i| ob[i] != b'-' && removed_columns.contains(&i))
+    let right_trim = (last_kept + 1..orig_seq.len())
+        .filter(|&i| orig_seq[i] != b'-' && i < removed_columns.len() && removed_columns[i])
         .count();
     Some((left_trim, right_trim))
 }
 
-fn classify_intron_splits(orig_seq: &str, intron_cols: &HashSet<usize>) -> Vec<(usize, usize)> {
-    let ob = orig_seq.as_bytes();
-
-    if intron_cols.is_empty() {
-        let total_res = ob.iter().filter(|&&c| c != b'-').count();
-        return if total_res > 0 {
-            vec![(0, total_res)]
-        } else {
-            Vec::new()
-        };
-    }
-
-    let res_positions: Vec<usize> = (0..ob.len()).filter(|&i| ob[i] != b'-').collect();
-    if res_positions.is_empty() {
+/// Group contiguous column indices into (start, end_exclusive) blocks.
+fn group_contiguous_blocks(cols: &HashSet<usize>) -> Vec<(usize, usize)> {
+    if cols.is_empty() {
         return Vec::new();
     }
-    let total_res = res_positions.len();
-
-    // res_prefix[i] = number of non-gap chars in orig_seq[..i]
-    let mut res_prefix = vec![0usize; ob.len() + 1];
-    for i in 0..ob.len() {
-        res_prefix[i + 1] = res_prefix[i] + if ob[i] != b'-' { 1 } else { 0 };
-    }
-
-    // Group contiguous intron columns into blocks.
-    let mut sorted_cols: Vec<usize> = intron_cols.iter().copied().collect();
-    sorted_cols.sort();
+    let mut sorted_cols: Vec<usize> = cols.iter().copied().collect();
+    sorted_cols.sort_unstable();
 
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut bs = sorted_cols[0];
@@ -496,12 +480,49 @@ fn classify_intron_splits(orig_seq: &str, intron_cols: &HashSet<usize>) -> Vec<(
         }
     }
     blocks.push((bs, be + 1));
+    blocks
+}
+
+fn classify_intron_splits(orig_seq: &[u8], intron_cols: &HashSet<usize>) -> Vec<(usize, usize)> {
+    if intron_cols.is_empty() {
+        let total_res = orig_seq.iter().filter(|&&c| c != b'-').count();
+        return if total_res > 0 {
+            vec![(0, total_res)]
+        } else {
+            Vec::new()
+        };
+    }
+
+    let res_positions: Vec<usize> = (0..orig_seq.len()).filter(|&i| orig_seq[i] != b'-').collect();
+    if res_positions.is_empty() {
+        return Vec::new();
+    }
+    let total_res = res_positions.len();
+
+    // res_prefix[i] = number of non-gap chars in orig_seq[..i]
+    let mut res_prefix = vec![0usize; orig_seq.len() + 1];
+    for i in 0..orig_seq.len() {
+        res_prefix[i + 1] = res_prefix[i] + if orig_seq[i] != b'-' { 1 } else { 0 };
+    }
+
+    // Reuse shared block grouping.
+    let blocks = group_contiguous_blocks(intron_cols);
+
+    // Compute all intron residues for subtraction.
+    let mut all_intron_residues: HashSet<usize> = HashSet::new();
+    for &(block_start, block_end) in &blocks {
+        for i in block_start..block_end {
+            if orig_seq[i] != b'-' {
+                all_intron_residues.insert(res_prefix[i]);
+            }
+        }
+    }
 
     // Convert blocks to residue-space intervals and classify.
     let mut intron_intervals: Vec<(usize, usize)> = Vec::new();
     for &(block_start, block_end) in &blocks {
         let intron_residues: Vec<usize> = (block_start..block_end)
-            .filter(|&i| ob[i] != b'-')
+            .filter(|&i| orig_seq[i] != b'-')
             .collect();
         if intron_residues.is_empty() {
             continue;
@@ -514,16 +535,6 @@ fn classify_intron_splits(orig_seq: &str, intron_cols: &HashSet<usize>) -> Vec<(
         let has_right = res_end < total_res;
         if has_left && has_right {
             intron_intervals.push((res_start, res_end));
-        }
-    }
-
-    // Compute all intron residues for subtraction.
-    let mut all_intron_residues: HashSet<usize> = HashSet::new();
-    for &(block_start, block_end) in &blocks {
-        for i in block_start..block_end {
-            if ob[i] != b'-' {
-                all_intron_residues.insert(res_prefix[i]);
-            }
         }
     }
 
@@ -542,7 +553,7 @@ fn classify_intron_splits(orig_seq: &str, intron_cols: &HashSet<usize>) -> Vec<(
     let mut kept_residues: Vec<usize> = (0..total_res)
         .filter(|r| !all_intron_residues.contains(r))
         .collect();
-    kept_residues.sort();
+    kept_residues.sort_unstable();
     if kept_residues.is_empty() {
         return Vec::new();
     }
@@ -550,7 +561,7 @@ fn classify_intron_splits(orig_seq: &str, intron_cols: &HashSet<usize>) -> Vec<(
     let seq_start = kept_residues[0];
     let seq_end = *kept_residues.last().unwrap() + 1;
 
-    intron_intervals.sort();
+    intron_intervals.sort_unstable();
     let mut exons: Vec<(usize, usize)> = Vec::new();
     let mut cursor = seq_start;
     for &(intron_start, intron_end) in &intron_intervals {
@@ -614,9 +625,9 @@ pub fn cull_columns(
     let mut gap_cull_log: Vec<(String, usize, usize)> = Vec::new();
 
     let normalized = normalize_records(&records);
-    let orig_seq_map: HashMap<&str, &str> = normalized
+    let orig_seq_map: HashMap<&str, &[u8]> = normalized
         .iter()
-        .map(|(h, s)| (h.as_str(), s.as_str()))
+        .map(|(h, s)| (h.as_str(), s.as_slice()))
         .collect();
     let orig_aln_len = normalized[0].1.len();
     let mut aln_len = orig_aln_len;
@@ -633,32 +644,37 @@ pub fn cull_columns(
     let (after_intron, intron_masked_cols) =
         mask_retained_introns(&normalized, ref_suffix, &nt_seqs, debug, &log_dir);
 
-    // Gap cull: remove all-gap columns.
-    let mut gap_cull_columns: HashSet<usize> = HashSet::new();
+    // Gap cull: remove all-gap columns. Use Vec<bool> instead of HashSet.
+    let mut gap_cull_mask = vec![false; aln_len];
+    let mut gap_cull_count = 0usize;
     if gap_cull_threshold > 0.0 {
         let mut col_non_gap = vec![0usize; aln_len];
         for (_, seq) in &after_intron {
-            for (i, ch) in seq.bytes().enumerate() {
+            for (i, &ch) in seq.iter().enumerate() {
                 if ch != b'-' {
                     col_non_gap[i] += 1;
                 }
             }
         }
-        gap_cull_columns = (0..aln_len).filter(|&i| col_non_gap[i] == 0).collect();
+        for i in 0..aln_len {
+            if col_non_gap[i] == 0 {
+                gap_cull_mask[i] = true;
+                gap_cull_count += 1;
+            }
+        }
     }
 
-    let after_gap_cull: Vec<(String, String)>;
+    let after_gap_cull: Vec<(String, Vec<u8>)>;
     let orig_index_map: Option<Vec<usize>>;
 
-    if !gap_cull_columns.is_empty() {
+    if gap_cull_count > 0 {
         let oimap: Vec<usize> = (0..aln_len)
-            .filter(|i| !gap_cull_columns.contains(i))
+            .filter(|&i| !gap_cull_mask[i])
             .collect();
         after_gap_cull = after_intron
             .iter()
             .map(|(h, s)| {
-                let sb = s.as_bytes();
-                let new_seq: String = oimap.iter().map(|&i| sb[i] as char).collect();
+                let new_seq: Vec<u8> = oimap.iter().map(|&i| s[i]).collect();
                 (h.clone(), new_seq)
             })
             .collect();
@@ -677,10 +693,11 @@ pub fn cull_columns(
     let ref_seqs: Vec<&[u8]> = after_gap_cull
         .iter()
         .filter(|(h, _)| h.ends_with(ref_suffix))
-        .map(|(_, s)| s.as_bytes())
+        .map(|(_, s)| s.as_slice())
         .collect();
 
-    let mut edge_columns: HashSet<usize> = HashSet::new();
+    // Edge columns as Vec<bool>.
+    let mut edge_mask = vec![false; aln_len];
 
     // Compute ref_non_gap
     let ref_non_gap: Option<Vec<usize>> = if !ref_seqs.is_empty() {
@@ -719,8 +736,12 @@ pub fn cull_columns(
                 right -= 1;
             }
             if left <= right {
-                edge_columns.extend(0..left);
-                edge_columns.extend(right + 1..aln_len);
+                for i in 0..left {
+                    edge_mask[i] = true;
+                }
+                for i in (right + 1)..aln_len {
+                    edge_mask[i] = true;
+                }
             }
         }
     }
@@ -735,38 +756,42 @@ pub fn cull_columns(
         vec![false; aln_len]
     };
 
-    let mut masked_records: Vec<(String, String)> = Vec::new();
-    let mut trim_sets: HashMap<String, HashSet<usize>> = HashMap::new();
+    let mut masked_records: Vec<(String, Vec<u8>)> = Vec::new();
+    // Store trim masks as Vec<bool> instead of HashSet<usize>.
+    let mut trim_masks: Vec<Vec<bool>> = Vec::new();
 
-    // Process each record.
+    // Process each record. Single combined mask per record instead of two mask_columns calls.
     for (idx, (header, _)) in records.iter().enumerate() {
-        let (_, seq) = &after_gap_cull[idx];
-        let sb = seq.as_bytes();
+        let seq = &after_gap_cull[idx].1;
 
-        let edge_masked = mask_columns(seq, &edge_columns);
-        let eb = edge_masked.as_bytes();
-        let mut to_trim: HashSet<usize> = edge_columns.clone();
+        // Start with edge mask as base.
+        let mut combined_mask = edge_mask.clone();
 
         if !header.ends_with(ref_suffix) && !ref_seqs.is_empty() {
-            let first_data = eb.iter().position(|&c| c != b'-');
+            // Apply edge mask to find data boundaries.
+            let first_data = seq.iter().enumerate().position(|(i, &c)| c != b'-' && !edge_mask[i]);
             let (start, end_data) = if let Some(fd) = first_data {
-                let last_data = eb.len()
-                    - 1
-                    - eb.iter().rev().position(|&c| c != b'-').unwrap();
+                let last_data = seq.iter().enumerate().rposition(|(i, &c)| c != b'-' && !edge_mask[i]).unwrap();
                 (fd, last_data + 1)
             } else {
                 (0usize, 0usize)
             };
 
             // Trim outside data region.
-            to_trim.extend(0..start);
-            to_trim.extend(end_data..eb.len());
+            for i in 0..start {
+                combined_mask[i] = true;
+            }
+            for i in end_data..aln_len {
+                combined_mask[i] = true;
+            }
 
-            let effective_len = if end_data > start { end_data - start } else { 0 };
-            let _limit_len = std::cmp::min((effective_len as f64 * 0.15) as usize, 40);
+            // Build effective sequence for block picking (apply combined mask so far).
+            let eb: Vec<u8> = seq.iter().enumerate().map(|(i, &c)| {
+                if combined_mask[i] { b'-' } else { c }
+            }).collect();
 
             let left_trim_point = pick_final_block_start(
-                eb,
+                &eb,
                 &ref_has_data,
                 min_ref_supported_gap,
                 anchor_run,
@@ -774,7 +799,7 @@ pub fn cull_columns(
             );
 
             let right_trim_point = trim_sparse_tail_end(
-                eb,
+                &eb,
                 &ref_has_data,
                 left_trim_point,
                 min_ref_supported_gap,
@@ -793,22 +818,28 @@ pub fn cull_columns(
                 gap_cull_log.push((header.clone(), left_aa_trimmed, right_aa_trimmed));
             }
 
-            to_trim.extend(start..left_trim_point);
-            to_trim.extend(right_trim_point..eb.len());
+            for i in start..left_trim_point {
+                combined_mask[i] = true;
+            }
+            for i in right_trim_point..aln_len {
+                combined_mask[i] = true;
+            }
         }
 
-        let masked_seq = mask_columns(&edge_masked, &to_trim);
+        // Apply combined mask in one pass.
+        let mut masked_seq = seq.clone();
+        mask_columns_bool(&mut masked_seq, &combined_mask);
 
         // Min length filter.
         if !header.ends_with(ref_suffix) && min_seq_len > 0 {
-            let non_gap = masked_seq.bytes().filter(|&c| c != b'-').count();
+            let non_gap = masked_seq.iter().filter(|&&c| c != b'-').count();
             if non_gap < min_seq_len {
                 continue;
             }
         }
 
         masked_records.push((header.clone(), masked_seq));
-        trim_sets.insert(header.clone(), to_trim);
+        trim_masks.push(combined_mask);
     }
 
     if masked_records.is_empty() {
@@ -819,73 +850,112 @@ pub fn cull_columns(
     let masked_len = masked_records[0].1.len();
     let mut masked_non_gap = vec![0usize; masked_len];
     for (_, seq) in &masked_records {
-        for (i, ch) in seq.bytes().enumerate() {
+        for (i, &ch) in seq.iter().enumerate() {
             if ch != b'-' {
                 masked_non_gap[i] += 1;
             }
         }
     }
-    let global_empty_columns: HashSet<usize> =
-        (0..masked_len).filter(|&i| masked_non_gap[i] == 0).collect();
+    let mut global_empty_mask = vec![false; masked_len];
+    let mut has_global_empty = false;
+    for i in 0..masked_len {
+        if masked_non_gap[i] == 0 {
+            global_empty_mask[i] = true;
+            has_global_empty = true;
+        }
+    }
 
-    let trimmed_records: Vec<(String, String)> = if !global_empty_columns.is_empty() {
+    let trimmed_records: Vec<(String, String)> = if has_global_empty {
         let keep_indices: Vec<usize> = (0..masked_len)
-            .filter(|i| !global_empty_columns.contains(i))
+            .filter(|&i| !global_empty_mask[i])
             .collect();
         masked_records
             .iter()
             .map(|(h, s)| {
-                let sb = s.as_bytes();
-                let new_seq: String = keep_indices.iter().map(|&i| sb[i] as char).collect();
+                let new_seq: String = keep_indices.iter().map(|&i| s[i] as char).collect();
                 (h.clone(), new_seq)
             })
             .collect()
     } else {
-        masked_records.clone()
+        masked_records
+            .iter()
+            .map(|(h, s)| {
+                let new_seq: String = s.iter().map(|&c| c as char).collect();
+                (h.clone(), new_seq)
+            })
+            .collect()
     };
 
-    let global_empty_original: HashSet<usize> = global_empty_columns
-        .iter()
-        .filter(|&&i| i < current_to_orig.len())
-        .map(|&i| current_to_orig[i])
-        .collect();
+    let global_empty_original: Vec<bool> = {
+        let mut v = vec![false; orig_aln_len];
+        for (i, &is_empty) in global_empty_mask.iter().enumerate() {
+            if is_empty && i < current_to_orig.len() {
+                v[current_to_orig[i]] = true;
+            }
+        }
+        v
+    };
 
     // Build nt_trim_map, gff_trim_map.
     let mut nt_trim_map: HashMap<String, HashSet<usize>> = HashMap::new();
     let mut gff_trim_map: HashMap<String, (usize, usize)> = HashMap::new();
 
-    for (header, _) in &masked_records {
+    for (rec_i, (header, _)) in masked_records.iter().enumerate() {
         if header.ends_with(ref_suffix) {
             continue;
         }
 
-        let to_trim = trim_sets.get(header.as_str()).cloned().unwrap_or_default();
-        let mut to_trim_original: HashSet<usize> = to_trim
-            .iter()
-            .filter(|&&i| i < current_to_orig.len())
-            .map(|&i| current_to_orig[i])
-            .collect();
+        let trim_mask = &trim_masks[rec_i];
 
-        let mut removed_original: HashSet<usize> = gap_cull_columns.clone();
-        removed_original.extend(to_trim_original.iter());
-        removed_original.extend(global_empty_original.iter());
+        // Build removed_original as Vec<bool> over orig_aln_len.
+        let mut removed_original = vec![false; orig_aln_len];
 
-        let intron_cols = intron_masked_cols.get(header.as_str());
-        if let Some(ic) = intron_cols {
-            removed_original.extend(ic.iter());
+        // gap_cull_mask columns
+        for i in 0..orig_aln_len {
+            if gap_cull_mask[i] {
+                removed_original[i] = true;
+            }
         }
 
-        let orig_seq = orig_seq_map.get(header.as_str()).unwrap_or(&"");
+        // trim mask mapped back through current_to_orig
+        for (i, &is_trimmed) in trim_mask.iter().enumerate() {
+            if is_trimmed && i < current_to_orig.len() {
+                removed_original[current_to_orig[i]] = true;
+            }
+        }
+
+        // global empty
+        for i in 0..orig_aln_len {
+            if global_empty_original[i] {
+                removed_original[i] = true;
+            }
+        }
+
+        // intron masked cols
+        let intron_cols = intron_masked_cols.get(header.as_str());
+        if let Some(ic) = intron_cols {
+            for &col in ic {
+                if col < orig_aln_len {
+                    removed_original[col] = true;
+                }
+            }
+        }
+
+        let orig_seq = orig_seq_map.get(header.as_str()).copied().unwrap_or(&[] as &[u8]);
         let drops = codon_drops_from_mask(orig_seq, &removed_original);
         if !drops.is_empty() {
             nt_trim_map.insert(header.clone(), drops);
         }
 
-        let edge_removed: HashSet<usize> = if let Some(ic) = intron_cols {
-            removed_original.difference(ic).copied().collect()
-        } else {
-            removed_original.clone()
-        };
+        // edge_removed = removed_original minus intron cols
+        let mut edge_removed = removed_original.clone();
+        if let Some(ic) = intron_cols {
+            for &col in ic {
+                if col < orig_aln_len {
+                    edge_removed[col] = false;
+                }
+            }
+        }
         if let Some(trims) = count_edge_residue_trims_from_removed(orig_seq, &edge_removed) {
             if trims.0 > 0 || trims.1 > 0 {
                 gff_trim_map.insert(header.clone(), trims);
@@ -893,31 +963,20 @@ pub fn cull_columns(
         }
     }
 
-    // Build gff_intron_map.
+    // Build gff_intron_map and exon_split_map in one pass over intron_masked_cols.
     let mut gff_intron_map: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut exon_split_map: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+
     for (header, cols) in &intron_masked_cols {
         let orig_seq = match orig_seq_map.get(header.as_str()) {
-            Some(s) => s.as_bytes(),
+            Some(s) => *s,
             None => continue,
         };
 
-        let mut sorted_cols: Vec<usize> = cols.iter().copied().collect();
-        sorted_cols.sort();
+        // Compute blocks once, reuse for both maps.
+        let blocks = group_contiguous_blocks(cols);
 
-        let mut blocks: Vec<(usize, usize)> = Vec::new();
-        let mut bs = sorted_cols[0];
-        let mut be = bs;
-        for &c in &sorted_cols[1..] {
-            if c == be + 1 {
-                be = c;
-            } else {
-                blocks.push((bs, be + 1));
-                bs = c;
-                be = c;
-            }
-        }
-        blocks.push((bs, be + 1));
-
+        // gff_intron_map
         let mut splits: Vec<(usize, usize)> = Vec::new();
         for &(block_start, block_end) in &blocks {
             let res_offset = orig_seq[..block_start]
@@ -934,15 +993,8 @@ pub fn cull_columns(
         if !splits.is_empty() {
             gff_intron_map.insert(header.clone(), splits);
         }
-    }
 
-    // Build exon_split_map.
-    let mut exon_split_map: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-    for (header, cols) in &intron_masked_cols {
-        let orig_seq = match orig_seq_map.get(header.as_str()) {
-            Some(s) => *s,
-            None => continue,
-        };
+        // exon_split_map
         let exons = classify_intron_splits(orig_seq, cols);
         if exons.len() > 1 {
             exon_split_map.insert(header.clone(), exons);
@@ -1037,14 +1089,15 @@ pub fn apply_gff_culls(
         let name = match extract_gff_attr(attributes, "Name") {
             Some(n) => n.to_string(),
             None => {
-                gff_lines.push(fields.join("\t"));
+                // No modification needed, push original line directly.
+                gff_lines.push(line);
                 continue;
             }
         };
         let gene = match extract_gff_attr(attributes, "Parent") {
             Some(g) => g.to_string(),
             None => {
-                gff_lines.push(fields.join("\t"));
+                gff_lines.push(line);
                 continue;
             }
         };
@@ -1164,10 +1217,17 @@ pub fn apply_gff_culls(
                 gff_lines.push(row.join("\t"));
             }
         } else {
-            let mut row: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-            row[3] = start.to_string();
-            row[4] = end.to_string();
-            gff_lines.push(row.join("\t"));
+            // Avoid re-splitting+joining when no coordinate changes needed.
+            let orig_start: i64 = fields[3].parse().unwrap_or(0);
+            let orig_end: i64 = fields[4].parse().unwrap_or(0);
+            if start == orig_start && end == orig_end {
+                gff_lines.push(line);
+            } else {
+                let mut row: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+                row[3] = start.to_string();
+                row[4] = end.to_string();
+                gff_lines.push(row.join("\t"));
+            }
         }
     }
 
@@ -1227,22 +1287,49 @@ pub fn apply_gff_culls(
         groups.entry(key).or_default().push(ri);
     }
 
+    // O(n log n) containment detection instead of O(n^2).
     let mut drop_indices: HashSet<usize> = HashSet::new();
     for members in groups.values() {
         if members.len() < 2 {
             continue;
         }
-        for &ai in members {
-            for &bi in members {
-                if ai == bi {
-                    continue;
+        // Sort by start ascending, then by end descending (wider intervals first).
+        let mut sorted_members: Vec<usize> = members.clone();
+        sorted_members.sort_by(|&a, &b| {
+            let ra = &parsed_rows[a];
+            let rb = &parsed_rows[b];
+            ra.start.cmp(&rb.start).then(rb.end.cmp(&ra.end))
+        });
+
+        // Walk the sorted list. For each interval, if its end fits within a
+        // previously seen interval's end, it is contained. Because we sorted
+        // by (start ASC, end DESC), the first interval at each start position
+        // is the widest, so a simple running max_end sweep works.
+        //
+        // Edge case: the original O(n^2) code drops BOTH intervals when they
+        // are identical (each contains the other). We replicate that here by
+        // tracking duplicate (start, end) pairs.
+        let mut max_end = i64::MIN;
+        let mut max_end_idx: Option<usize> = None;
+        for &mi in &sorted_members {
+            let row = &parsed_rows[mi];
+            if row.end <= max_end {
+                // Contained by a previously seen wider (or equal) interval.
+                drop_indices.insert(row.line_idx);
+                contained_kicked_names.insert(row.name.clone());
+                // If this interval is identical to the one that set max_end,
+                // the original code would also drop that one.
+                if let Some(prev_mi) = max_end_idx {
+                    let prev = &parsed_rows[prev_mi];
+                    if row.start == prev.start && row.end == prev.end {
+                        drop_indices.insert(prev.line_idx);
+                        contained_kicked_names.insert(prev.name.clone());
+                    }
                 }
-                let a = &parsed_rows[ai];
-                let b = &parsed_rows[bi];
-                if a.start >= b.start && a.end <= b.end {
-                    drop_indices.insert(a.line_idx);
-                    contained_kicked_names.insert(a.name.clone());
-                }
+            }
+            if row.end > max_end {
+                max_end = row.end;
+                max_end_idx = Some(mi);
             }
         }
     }

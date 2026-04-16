@@ -245,11 +245,6 @@ fn _dumb_consensus_dupe2(sequences: Vec<(String, u32)>, threshold: f64, min_dept
 }
 
 
-#[pyfunction]
-pub fn filter_regions(sequence: String, min_length: usize) -> String {
-    _mask_small_regions(&sequence, min_length)
-}
-
 fn _mask_small_regions(sequence: &str, min_length: usize) -> String {
     let sequence = sequence.as_bytes();
     let mut start = Option::None;

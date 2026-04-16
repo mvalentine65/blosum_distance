@@ -1,61 +1,22 @@
-mod align;
 mod aligner;
 mod column_cull;
 mod consensus;
 mod dedupe;
-mod entropy;
 mod exon_dp;
 mod flexcull;
-mod hit;
 mod identity;
 mod interval_tree;
-mod motif;
 mod overlap;
-mod sigclust;
 mod translate;
-mod utils;
 
 use bio::alignment::distance::simd::hamming;
 use dedupe::fast_dedupe as rust_fast_dedupe;
 use flexcull::*;
-use hit::Hit;
-use hit::ReferenceHit;
-use itertools::enumerate;
-use overlap::{get_overlap, get_overlap_percent};
+use overlap::get_overlap;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
-
-#[pyfunction]
-fn asm_index_split(sequence: String) -> Vec<(usize, usize)> {
-    let mut start = 0_usize;
-    let mut in_data = false;
-    let mut gap_count = 0_usize;
-    let mut output = Vec::new();
-
-    for (i, bp) in enumerate(sequence.as_bytes()) {
-        if *bp == b'-' {
-            gap_count += 1;
-            if gap_count >= 20 {
-                if in_data {
-                    output.push((start, i - gap_count + 1))
-                }
-                in_data = false
-            }
-        } else {
-            gap_count = 0;
-            if !in_data {
-                in_data = true;
-                start = i
-            }
-        }
-    }
-    if in_data {
-        output.push((start, sequence.len() - gap_count))
-    }
-    output
-}
 
 #[pyfunction]
 fn bio_revcomp(sequence: String) -> String {
@@ -78,57 +39,9 @@ fn find_index_pair(sequence: &str, gap: &str) -> (usize, usize) {
     find_indices(sequence.as_bytes(), gap_char)
 }
 
-fn find_character_indices(sequence: &[u8], character: u8) -> Option<(usize, usize)> {
-    match (
-        sequence.iter().position(|c: &u8| *c == character),
-        sequence.iter().rposition(|c: &u8| *c == character),
-    ) {
-        (Some(first), Some(last)) => Some((first, last + 1)),
-        _ => None,
-    }
-}
-// Searches the given sequence for the first and last occurrence of the given character.
-// Returns an Option[tuple[int, int]].
-// If found, returns tuple with the indices. Start is inclusive, stop is exclusive. [start, stop)
-// If the character is not found, returns None.
-// Requires ascii input for both arguments. Character must be a single ascii character. (length of 1)
-// Search is case sensitive.
-#[pyfunction]
-fn find_first_last_character(sequence: &str, character: &str) -> Option<(usize, usize)> {
-    if character.len() != 1 {
-        panic!("Search character must be a single ascii character.");
-    }
-    find_character_indices(sequence.as_bytes(), character.as_bytes()[0])
-}
-
-#[pyfunction]
-fn has_data(sequence: &str, gap: char) -> bool {
-    sequence.as_bytes().iter().any(|x| *x != gap as u8)
-}
-
-#[pyfunction]
-fn simd_hamming(one: &str, two: &str) -> u64 {
-    return hamming(one.as_ref(), two.as_ref());
-}
-
 #[pyfunction]
 fn is_same_kmer(one: &str, two: &str) -> bool {
     hamming(one.as_ref(), two.as_ref()) == 0
-}
-
-#[pyfunction]
-fn score_splits(ref_slice: &str, splits: Vec<(String, u64)>) -> u64 {
-    let mut min_distance: u64 = ref_slice.len() as u64;
-    let mut winning_index: u64 = 0;
-    let mut current: u64 = ref_slice.len() as u64;
-    for (seq, index) in splits {
-        current = simd_hamming(ref_slice, seq.as_ref());
-        if current < min_distance {
-            min_distance = current;
-            winning_index = index;
-        }
-    }
-    winning_index
 }
 
 #[pyfunction]
@@ -145,45 +58,6 @@ fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
         true => hamming_distance - blank_count,
         false => 0,
     }
-}
-
-#[pyfunction]
-fn len_without_gaps(x: String) -> usize {
-    return x.as_bytes().iter().filter(|&&c| c != b'-').count();
-}
-
-fn _excise_consensus_tail(consensus: &String, limit: f64) -> (String, usize) {
-    let step = 16_usize;
-    let mut percent_invalid = 1.0_f64;
-    let mut num_invalid = 0;
-    let mut denominator = 0;
-    let length = consensus.len();
-    let mut end = length;
-    let mut start = length - step;
-    while start >= step && percent_invalid > limit {
-        num_invalid = consensus[start..end].bytes().filter(|&x| x == b'X').count();
-        denominator = step;
-        percent_invalid = num_invalid as f64 / denominator as f64;
-        if percent_invalid < limit {
-            break;
-        }
-        start -= step;
-        end -= step;
-    }
-    while end > 0 && end < usize::MAX && percent_invalid > limit {
-        end -= 1;
-        if &consensus[end..end + 1] == "X" {
-            num_invalid += 1;
-        }
-        denominator += 1;
-        percent_invalid = num_invalid as f64 / denominator as f64;
-    }
-    (consensus[0..end].to_string(), end)
-}
-
-#[pyfunction]
-fn excise_consensus_tail(consensus: String, limit: f64) -> (String, usize) {
-    _excise_consensus_tail(&consensus, limit)
 }
 
 #[pyfunction]
@@ -266,154 +140,213 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
     1.0_f64 - (score as f64 / maximum_score as f64)
 }
 
+/// Column-filter helper: drops alignment columns where every sequence holds
+/// a gap.  Operates on `(header, sequence)` pairs the SAPPHYRE Python side
+/// already has on hand.
 #[pyfunction]
-pub fn debug_blosum62_candidate_to_reference(
-    candidate: &str,
-    reference: &str,
-) -> (
-    f64,
-    i32,
-    Vec<i32>,
-    Vec<i32>,
-    Vec<i32>,
-    Vec<i32>,
-    Vec<i32>,
-    Vec<i32>,
-) {
-    let mut cand_locations = Vec::with_capacity(candidate.len());
-    let mut cand_sums = Vec::with_capacity(candidate.len());
-
-    let mut ref_locations = Vec::with_capacity(reference.len());
-    let mut ref_sums = Vec::with_capacity(reference.len());
-
-    let mut score_locations = Vec::with_capacity(candidate.len());
-    let mut score_sums = Vec::with_capacity(candidate.len());
-
-    let cand_bytes: &[u8] = candidate.as_bytes();
-    let ref_bytes: &[u8] = reference.as_bytes();
-
-    let mut this_score = 0;
-    let mut this_max_first = 0;
-    let mut this_max_second = 0;
-    let mut score = 0;
-    let mut max_first = 0;
-    let mut max_second = 0;
-    let length = cand_bytes.len();
-    let allowed: HashSet<u8> = HashSet::from([
-        65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
-        66, 79, 85, 42,
-    ]);
-    for i in 0..length {
-        let mut char1 = cand_bytes[i];
-        let char2 = ref_bytes[i];
-        if cand_bytes[i] == 45 {
-            char1 = b'*';
-        }
-        if ref_bytes[i] == 45 {
-            cand_locations.push(0);
-            cand_sums.push(max_first);
-
-            ref_locations.push(0);
-            ref_sums.push(max_second);
-
-            score_locations.push(0);
-            score_sums.push(score);
-            continue;
-        }
-        if !(allowed.contains(&char1)) {
-            panic!("first[i]  {} not in allowed\n{}", char1 as char, candidate);
-        }
-        if !(allowed.contains(&char2)) {
-            panic!("second[i] {} not in allowed\n{}", char2 as char, reference);
-        }
-        if char1 == b'*' || char1 == b'-' {
-            this_score = -11;
-            this_max_first = -11;
-            this_max_second += bio::scores::blosum62(char2, char2);
-        } else {
-            this_score += bio::scores::blosum62(char1, char2);
-            this_max_first += bio::scores::blosum62(char1, char1);
-            this_max_second += bio::scores::blosum62(char2, char2);
-        }
-
-        score += this_score;
-        max_first += this_max_first;
-        max_second += this_max_second;
-
-        cand_locations.push(this_max_first);
-        cand_sums.push(max_first);
-
-        ref_locations.push(this_max_second);
-        ref_sums.push(max_second);
-
-        score_locations.push(this_score);
-        score_sums.push(score);
+fn delete_empty_columns_pairs(records: Vec<(String, String)>) -> Vec<(String, String)> {
+    if records.is_empty() {
+        return Vec::new();
     }
-    let maximum_score = std::cmp::max(max_first, max_second);
-    let end_result = 1.0_f64 - (score as f64 / maximum_score as f64);
+    let len = records[0].1.len();
+    let n_recs = records.len();
 
-    (
-        end_result,
-        maximum_score,
-        cand_locations,
-        cand_sums,
-        ref_locations,
-        ref_sums,
-        score_locations,
-        score_sums,
-    )
-}
-
-#[pyfunction]
-fn delete_empty_columns(raw_fed_sequences: Vec<String>) -> (Vec<String>, Vec<usize>) {
-    let mut result = Vec::<String>::with_capacity(raw_fed_sequences.len());
-    let mut headers = Vec::<&String>::with_capacity(raw_fed_sequences.len() / 2 + 1);
-    let mut sequences = Vec::<&[u8]>::with_capacity(raw_fed_sequences.len() / 2 + 1);
-    for i in (1..raw_fed_sequences.len()).step_by(2) {
-        headers.push(&raw_fed_sequences[i - 1]);
-        sequences.push(raw_fed_sequences[i].as_bytes())
-    }
-    if sequences.is_empty() {
-        return (result, Vec::<usize>::new());
-    }
-    let mut positions_to_keep: Vec<usize> = Vec::with_capacity(sequences[0].len());
-    for i in 0..sequences[0].len() {
-        for sequence in &sequences {
-            if sequence[i] != b'-' {
-                positions_to_keep.push(i);
+    // Mark each column as kept the moment we see a non-gap character.
+    let mut keep = vec![false; len];
+    let mut remaining = len;
+    'cols: for col in 0..len {
+        for (_, seq) in &records {
+            // Defensive: ragged inputs shouldn't happen but skip past the end.
+            if col >= seq.len() {
+                continue;
+            }
+            if seq.as_bytes()[col] != b'-' {
+                keep[col] = true;
+                remaining -= 1;
+                if remaining == 0 {
+                    break 'cols;
+                }
                 break;
             }
         }
     }
-    let mut temp = Vec::<u8>::with_capacity(sequences[0].len());
-    for i in 0..sequences.len() {
-        temp = positions_to_keep
-            .iter()
-            .map(|index| sequences[i][*index])
-            .collect();
-        result.push(headers[i].to_string());
-        result.push(String::from_utf8(temp).unwrap());
+
+    let kept_indices: Vec<usize> = keep
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &k)| if k { Some(i) } else { None })
+        .collect();
+
+    let mut out = Vec::with_capacity(n_recs);
+    let mut buf = Vec::with_capacity(kept_indices.len());
+    for (header, seq) in records {
+        let bytes = seq.as_bytes();
+        buf.clear();
+        for &i in &kept_indices {
+            if i < bytes.len() {
+                buf.push(bytes[i]);
+            }
+        }
+        out.push((header, String::from_utf8(buf.clone()).unwrap()));
     }
-    (result, positions_to_keep)
+    out
 }
 
-fn _check_index(sequences: &Vec<&[u8]>, i: usize, target: u8) -> bool {
-    for seq in sequences.iter() {
-        if seq[i] != target {
-            return false;
-        }
+/// Sliding-window low-complexity check on a nucleotide sequence.
+///
+/// Mirrors `sapphyre.utils.low_complexity.is_low_complexity_nt` but runs the
+/// inner counting / entropy loops in Rust.  Returns `true` if any window in
+/// any non-N segment falls below either entropy threshold.
+#[pyfunction]
+#[pyo3(signature = (
+    seq,
+    window_size = 60,
+    step = 15,
+    dinuc_entropy_threshold = 2.5,
+    trinuc_entropy_threshold = 3.75,
+    min_segment_length = 30,
+))]
+fn is_low_complexity_nt(
+    seq: &str,
+    window_size: usize,
+    step: usize,
+    dinuc_entropy_threshold: f64,
+    trinuc_entropy_threshold: f64,
+    min_segment_length: usize,
+) -> bool {
+    // Encode bases A/C/G/T -> 0..3, anything else -> 4 ("N").
+    let mut codes = Vec::with_capacity(seq.len());
+    for b in seq.as_bytes() {
+        let c = match b.to_ascii_uppercase() {
+            b'A' => 0u8,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            _ => 4,
+        };
+        codes.push(c);
     }
-    true
-}
 
-fn _find_replaceble(sequences: Vec<&[u8]>, target: u8) -> HashSet<usize> {
-    let mut output = HashSet::new();
-    for i in 0..sequences[0].len() {
-        if _check_index(&sequences, i, target) {
-            output.insert(i);
+    // Collect inclusive (start, end) spans of contiguous non-N bases.
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let n = codes.len();
+    let mut i = 0;
+    while i < n {
+        if codes[i] == 4 {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < n && codes[j] != 4 {
+            j += 1;
+        }
+        segments.push((i, j - 1));
+        i = j;
+    }
+    if segments.is_empty() {
+        return false;
+    }
+
+    let entropy_from_counts = |counts: &[u32], total: u32| -> f64 {
+        if total == 0 {
+            return 0.0;
+        }
+        let inv_total = 1.0 / total as f64;
+        let log_total = (total as f64).ln();
+        let mut sum_clogc = 0.0;
+        for &c in counts {
+            if c > 0 {
+                let cf = c as f64;
+                sum_clogc += cf * cf.ln();
+            }
+        }
+        // H = sum(-(c/T) log2(c/T)) = (log T - (1/T) sum(c log c)) / ln 2
+        (log_total - sum_clogc * inv_total) / std::f64::consts::LN_2
+    };
+
+    for (seg_start, seg_end) in segments {
+        let seg_len = seg_end - seg_start + 1;
+        if seg_len < min_segment_length {
+            continue;
+        }
+
+        // Helper that evaluates one window over the segment.
+        let mut check_window = |wstart: usize, wend: usize| -> bool {
+            let abs_start = seg_start + wstart;
+            let abs_end = seg_start + wend; // inclusive
+
+            // Dinucleotides: positions abs_start..abs_end (i to i+1)
+            let mut di = [0u32; 16];
+            let mut di_total = 0u32;
+            for k in abs_start..abs_end {
+                let a = codes[k];
+                let b = codes[k + 1];
+                if a < 4 && b < 4 {
+                    di[(a as usize) * 4 + b as usize] += 1;
+                    di_total += 1;
+                }
+            }
+            let dinuc_h = if di_total == 0 {
+                4.0
+            } else {
+                entropy_from_counts(&di, di_total)
+            };
+            if dinuc_h < dinuc_entropy_threshold {
+                return true;
+            }
+
+            // Trinucleotides: positions abs_start..abs_end-1 (i to i+2)
+            if abs_end >= abs_start + 1 {
+                let mut tri = [0u32; 64];
+                let mut tri_total = 0u32;
+                let stop = abs_end.saturating_sub(1);
+                for k in abs_start..stop {
+                    let a = codes[k];
+                    let b = codes[k + 1];
+                    let c = codes[k + 2];
+                    if a < 4 && b < 4 && c < 4 {
+                        tri[(a as usize) * 16 + (b as usize) * 4 + c as usize] += 1;
+                        tri_total += 1;
+                    }
+                }
+                let trinuc_h = if tri_total == 0 {
+                    6.0
+                } else {
+                    entropy_from_counts(&tri, tri_total)
+                };
+                if trinuc_h < trinuc_entropy_threshold {
+                    return true;
+                }
+            }
+
+            false
+        };
+
+        // Sliding windows over the segment.
+        if window_size >= seg_len {
+            if check_window(0, seg_len - 1) {
+                return true;
+            }
+            continue;
+        }
+
+        let mut w = 0usize;
+        while w + window_size <= seg_len {
+            if check_window(w, w + window_size - 1) {
+                return true;
+            }
+            w += step;
+        }
+        // Tail window aligned to the end if it isn't already covered.
+        let last_start = seg_len - window_size;
+        if last_start > w.saturating_sub(step) {
+            if check_window(last_start, seg_len - 1) {
+                return true;
+            }
         }
     }
-    output
+
+    false
 }
 
 fn find_question_marks(sequences: Vec<&[u8]>, start: usize, stop: usize) -> HashSet<usize> {
@@ -537,55 +470,31 @@ fn fast_dedupe(
 fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(preprocess_n_chunks, m)?)?;
     m.add_function(wrap_pyfunction!(fast_dedupe, m)?)?;
-    m.add_function(wrap_pyfunction!(asm_index_split, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
     m.add_function(wrap_pyfunction!(constrained_distance, m)?)?;
     m.add_function(wrap_pyfunction!(convert_consensus, m)?)?;
-    m.add_function(wrap_pyfunction!(len_without_gaps, m)?)?;
     m.add_function(wrap_pyfunction!(consensus::dumb_consensus, m)?)?;
     m.add_function(wrap_pyfunction!(consensus::dumb_consensus_dupe, m)?)?;
-    m.add_function(wrap_pyfunction!(consensus::filter_regions, m)?)?;
     m.add_function(wrap_pyfunction!(consensus::consensus_distance, m)?)?;
-    m.add_function(wrap_pyfunction!(excise_consensus_tail, m)?)?;
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
-    m.add_function(wrap_pyfunction!(find_first_last_character, m)?)?;
-    m.add_function(wrap_pyfunction!(has_data, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference, m)?)?;
-    m.add_function(wrap_pyfunction!(debug_blosum62_candidate_to_reference, m)?)?;
     m.add_function(wrap_pyfunction!(identity::filter_nt, m)?)?;
-    m.add_function(wrap_pyfunction!(score_splits, m)?)?;
-    m.add_function(wrap_pyfunction!(simd_hamming, m)?)?;
-    m.add_function(wrap_pyfunction!(delete_empty_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(delete_empty_columns_pairs, m)?)?;
+    m.add_function(wrap_pyfunction!(is_low_complexity_nt, m)?)?;
     m.add_function(wrap_pyfunction!(exon_dp::exon_dp, m)?)?;
     m.add_function(wrap_pyfunction!(join_by_tripled_index, m)?)?;
     m.add_function(wrap_pyfunction!(join_with_exclusions, m)?)?;
     m.add_function(wrap_pyfunction!(join_triplets_with_exclusions, m)?)?;
     m.add_function(wrap_pyfunction!(get_overlap, m)?)?;
     m.add_function(wrap_pyfunction!(is_same_kmer, m)?)?;
-    m.add_function(wrap_pyfunction!(get_overlap_percent, m)?)?;
-    m.add_function(wrap_pyfunction!(align::make_aligned_ingredients, m)?)?;
-    m.add_function(wrap_pyfunction!(align::run_intermediate, m)?)?;
-    m.add_function(wrap_pyfunction!(align::process_clusters, m)?)?;
-    m.add_function(wrap_pyfunction!(align::align_remove_empty_columns, m)?)?;
-    m.add_function(wrap_pyfunction!(align::align_remove_dashes, m)?)?;
-    m.add_function(wrap_pyfunction!(entropy::entropy_filter, m)?)?;
-    m.add_function(wrap_pyfunction!(entropy::entropy, m)?)?;
-    m.add_function(wrap_pyfunction!(sigclust::sigclust, m)?)?;
-    m.add_function(wrap_pyfunction!(sigclust::sigclust_with_sequence, m)?)?;
-    m.add_function(wrap_pyfunction!(utils::write_fasta_compressed, m)?)?;
-    m.add_function(wrap_pyfunction!(utils::write_fasta_uncompressed, m)?)?;
     m.add_function(wrap_pyfunction!(translate::translate, m)?)?;
     m.add_function(wrap_pyfunction!(interval_tree::del_cols, m)?)?;
     m.add_function(wrap_pyfunction!(aligner::hmm_align, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::cull_columns, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::apply_gff_culls, m)?)?;
 
-    m.add_class::<Hit>()?;
-    m.add_class::<ReferenceHit>()?;
     m.add_class::<interval_tree::OverlapTree>()?;
-    m.add_class::<motif::ScoredPosition>()?;
-    m.add_class::<motif::ProteinMotif>()?;
 
     Ok(())
 }

@@ -85,6 +85,7 @@ fn mask_retained_introns(
     normalized: &[(String, Vec<u8>)],
     ref_suffix: &str,
     nt_seqs: &Option<HashMap<String, String>>,
+    min_ref_supported_gap: usize,
     debug: i32,
     log_dir: &Option<String>,
 ) -> (Vec<(String, Vec<u8>)>, HashMap<String, HashSet<usize>>) {
@@ -168,6 +169,16 @@ fn mask_retained_introns(
             let block_residues: Vec<u8> =
                 sb[bs..be].iter().filter(|&&c| c != b'-').copied().collect();
             if block_residues.len() < min_intron_aa {
+                continue;
+            }
+
+            // The ref-gap run backing this block must be wide enough to
+            // plausibly represent an intron.  A tiny ref-gap (e.g. a
+            // 3-column alignment indel) should not trigger a split even
+            // if it contains a stop codon.  This mirrors the
+            // min_ref_supported_gap check used by the sparse tail trim.
+            let ref_gap_cols_in_block = (bs..be).filter(|&i| ref_gap_col[i]).count();
+            if ref_gap_cols_in_block < min_ref_supported_gap {
                 continue;
             }
 
@@ -642,7 +653,7 @@ pub fn cull_columns(
 
     // Detect and mask retained introns.
     let (after_intron, intron_masked_cols) =
-        mask_retained_introns(&normalized, ref_suffix, &nt_seqs, debug, &log_dir);
+        mask_retained_introns(&normalized, ref_suffix, &nt_seqs, min_ref_supported_gap, debug, &log_dir);
 
     // Gap cull: remove all-gap columns. Use Vec<bool> instead of HashSet.
     let mut gap_cull_mask = vec![false; aln_len];

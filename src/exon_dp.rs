@@ -2,7 +2,7 @@ use flate2::read::GzDecoder;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rocksdb::{Options, DB};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -15,7 +15,6 @@ const MINIMUM_GAP_AA: usize = 10;
 const MAX_GAP_AA: usize = 250;
 /// Genomic search region cap for flank scans (bp).
 const FLANK_BP: usize = 15000;
-
 
 fn codon_to_aa(c1: u8, c2: u8, c3: u8) -> u8 {
     match (c1, c2, c3) {
@@ -48,9 +47,6 @@ fn codon_to_aa(c1: u8, c2: u8, c3: u8) -> u8 {
     }
 }
 
-
-
-
 fn bio_revcomp(seq: &[u8]) -> Vec<u8> {
     seq.iter()
         .rev()
@@ -63,13 +59,6 @@ fn bio_revcomp(seq: &[u8]) -> Vec<u8> {
         })
         .collect()
 }
-
-
-
-
-
-
-
 
 fn find_index_pair(seq: &[u8], gap: u8) -> (usize, usize) {
     let s = seq.iter().position(|&c| c != gap).unwrap_or(0);
@@ -346,9 +335,8 @@ fn flank_extract_orfs(
 ) {
     let direction = if is_leading { "Left leading" } else { "Right trailing" };
 
-    let (effective_gap, scaled_min_aa) = match qualify_gap(gap_start, gap_end, ref_consensus) {
-        Some(v) => v,
-        None => return,
+    let Some((effective_gap, scaled_min_aa)) = qualify_gap(gap_start, gap_end, ref_consensus) else {
+        return;
     };
     let total_cols = gap_end - gap_start;
 
@@ -371,21 +359,14 @@ fn flank_extract_orfs(
         node_field.split('_').next().unwrap_or(&node_field)
     };
 
-    let gff_entry = gff.get(&node_field).or_else(|| gff.get(node_name));
-    let gff_entry = match gff_entry {
-        Some(e) => e,
-        None => {
-            log.push(format!("No GFF entry for {}\n", node_field));
-            return;
-        }
+    let Some(gff_entry) = gff.get(&node_field).or_else(|| gff.get(node_name)) else {
+        log.push(format!("No GFF entry for {}\n", node_field));
+        return;
     };
 
-    let scaffold_seq = match genome.get(&gff_entry.scaffold) {
-        Some(s) => s,
-        None => {
-            log.push(format!("Scaffold {} not loaded\n", gff_entry.scaffold));
-            return;
-        }
+    let Some(scaffold_seq) = genome.get(&gff_entry.scaffold) else {
+        log.push(format!("Scaffold {} not loaded\n", gff_entry.scaffold));
+        return;
     };
     let scaffold_len = scaffold_seq.len();
 
@@ -586,12 +567,15 @@ fn flank_scan_gene(
     let ref_median_end = *ref_ends.select_nth_unstable(median_idx).1;
 
     // Get cluster sets for this gene
-    let clusters = match clusters_map.get(gene) {
-        Some(c) => c,
-        None => return (log, all_candidates),
+    let Some(clusters) = clusters_map.get(gene) else {
+        return (log, all_candidates);
     };
 
-    let cluster_sets: Vec<(&str, HashSet<String>, &str)> = clusters
+    // Sort by cluster key for deterministic iteration order: `clusters`
+    // is a HashMap whose iteration order is hash-randomized per process.
+    // Without this sort, `all_candidates` ends up in a run-varying order
+    // and downstream Python tie-breaking produces different survivors.
+    let mut cluster_sets: Vec<(&str, HashSet<String>, &str)> = clusters
         .iter()
         .map(|(key, (nodes, iso_type))| {
             (
@@ -601,6 +585,7 @@ fn flank_scan_gene(
             )
         })
         .collect();
+    cluster_sets.sort_unstable_by_key(|(ck, _, _)| *ck);
 
     for (cluster_key, cluster_set, iso_type) in &cluster_sets {
         // Only search flanks for base clusters, not isoforms (e.g. "6" not "6_1", "6_2").
@@ -876,15 +861,7 @@ fn read_gff(path: &str) -> HashMap<String, GffEntry> {
             }
         }
         if let Some(n) = name {
-            nodes.insert(
-                n,
-                GffEntry {
-                    scaffold,
-                    start,
-                    end,
-                    strand,
-                },
-            );
+            nodes.insert(n, GffEntry { scaffold, start, end, strand });
         }
     }
     nodes
@@ -1021,18 +998,11 @@ fn process_gene(
     let mut gap_candidates: Vec<GapCandidate> = Vec::new();
     let (mut tgaps, thits) = (0usize, 0usize);
 
-    let clusters = match clusters_map.get(gene) {
-        Some(clusters) => clusters,
-        None => {
-            return GeneResult {
-                log: flog,
-                gaps: 0,
-                hits: 0,
-                gff_lines,
-                recovered,
-                gap_candidates,
-            };
-        }
+    let Some(clusters) = clusters_map.get(gene) else {
+        return GeneResult {
+            log: flog, gaps: 0, hits: 0,
+            gff_lines, recovered, gap_candidates,
+        };
     };
 
     #[allow(dead_code)]
@@ -1078,12 +1048,8 @@ fn process_gene(
 
     if rcount == 0 || cands.is_empty() {
         return GeneResult {
-            log: flog,
-            gaps: 0,
-            hits: 0,
-            gff_lines,
-            recovered,
-            gap_candidates,
+            log: flog, gaps: 0, hits: 0,
+            gff_lines, recovered, gap_candidates,
         };
     }
 
@@ -1172,8 +1138,11 @@ fn process_gene(
     // could be "C-terminal" if the cluster has both MXE and C-terminal
     // splicing).  We identify base clusters by checking whether any
     // child key (with '_') is typed MXE.
-    let mxe_base_modular: HashMap<String, HashSet<String>> = {
-        let mut result: HashMap<String, HashSet<String>> = HashMap::new();
+    // BTreeMap: sorted iteration order is free and stable across runs.
+    // Downstream loops push to `gap_candidates` in this order; a HashMap
+    // here would randomize that and break downstream tie-breaking.
+    let mxe_base_modular: BTreeMap<String, HashSet<String>> = {
+        let mut result: BTreeMap<String, HashSet<String>> = BTreeMap::new();
         // Group MXE isoform node-sets by base key
         let mut iso_sets: HashMap<String, Vec<HashSet<String>>> = HashMap::new();
         for (ck, (node_tokens, iso_type)) in clusters.iter() {
@@ -1276,9 +1245,8 @@ fn process_gene(
             let gap_start = left_end;
             let gap_end = right_start;
 
-            let (effective_gap, gap_min_aa) = match qualify_gap(gap_start, gap_end, &rc) {
-                Some(v) => v,
-                None => continue,
+            let Some((effective_gap, gap_min_aa)) = qualify_gap(gap_start, gap_end, &rc) else {
+                continue;
             };
             let total_gap_cols = gap_end - gap_start;
 
@@ -1301,14 +1269,8 @@ fn process_gene(
                 }
             }
 
-            let ga = match gff.get(&node_a_name) {
-                Some(gff_entry) => gff_entry,
-                None => continue,
-            };
-            let gb = match gff.get(&node_b_name) {
-                Some(gff_entry) => gff_entry,
-                None => continue,
-            };
+            let Some(ga) = gff.get(&node_a_name) else { continue; };
+            let Some(gb) = gff.get(&node_b_name) else { continue; };
 
             if ga.scaffold != gb.scaffold {
                 continue;
@@ -1387,10 +1349,7 @@ fn process_gene(
 
             }
 
-            let scaffold_seq = match genome.get(&ga.scaffold) {
-                Some(sequence) => sequence,
-                None => continue,
-            };
+            let Some(scaffold_seq) = genome.get(&ga.scaffold) else { continue; };
 
             if re < rs || rs == 0 || re > scaffold_seq.len() {
                 continue;
@@ -1480,9 +1439,8 @@ fn process_gene(
         let mut mxe_scanned: HashSet<(String, String, String)> = HashSet::new();
 
         for (base_key, modular_set) in &mxe_base_modular {
-            let base_tokens = match clusters.get(base_key.as_str()) {
-                Some((tokens, _)) => tokens,
-                None => continue,
+            let Some((base_tokens, _)) = clusters.get(base_key.as_str()) else {
+                continue;
             };
             if modular_set.is_empty() {
                 continue;
@@ -1508,14 +1466,8 @@ fn process_gene(
                     continue;
                 }
 
-                let left_gff = match gff.get(left_node.as_str()) {
-                    Some(e) => e,
-                    None => continue,
-                };
-                let right_gff = match gff.get(right_node.as_str()) {
-                    Some(e) => e,
-                    None => continue,
-                };
+                let Some(left_gff) = gff.get(left_node.as_str()) else { continue; };
+                let Some(right_gff) = gff.get(right_node.as_str()) else { continue; };
                 if left_gff.scaffold != right_gff.scaffold {
                     continue;
                 }
@@ -1541,9 +1493,8 @@ fn process_gene(
                     continue;
                 }
 
-                let (effective_gap, gap_min_aa) = match qualify_gap(gap_start, gap_end, &rc) {
-                    Some(v) => v,
-                    None => continue,
+                let Some((effective_gap, gap_min_aa)) = qualify_gap(gap_start, gap_end, &rc) else {
+                    continue;
                 };
 
                 // Genomic region between the two constitutive flanks
@@ -1556,10 +1507,7 @@ fn process_gene(
                     continue;
                 }
 
-                let scaffold_seq = match genome.get(scaffold) {
-                    Some(s) => s,
-                    None => continue,
-                };
+                let Some(scaffold_seq) = genome.get(scaffold) else { continue; };
                 if re > scaffold_seq.len() {
                     continue;
                 }
@@ -1797,15 +1745,11 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
                     let parts: Vec<&str> = coords.split('-').collect();
                     if parts.len() == 2 {
                         if let (Ok(s), Ok(e)) = (parts[0].parse(), parts[1].parse()) {
-                            gff_nodes.insert(
-                                dp_name,
-                                GffEntry {
-                                    scaffold: scaffold.to_string(),
-                                    start: s,
-                                    end: e,
-                                    strand: strand.to_string(),
-                                },
-                            );
+                            gff_nodes.insert(dp_name, GffEntry {
+                                scaffold: scaffold.to_string(),
+                                start: s, end: e,
+                                strand: strand.to_string(),
+                            });
                         }
                     }
                 }

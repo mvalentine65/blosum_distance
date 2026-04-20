@@ -1446,7 +1446,9 @@ fn process_gene(
                 continue;
             }
 
-            // Collect known cassette intervals for this MXE group
+            // Known sibling cassette intervals for this MXE group.
+            // Used to trim (not reject) overlapping ORFs so novel cassettes
+            // flanking or between known siblings can still surface.
             let known_intervals: Vec<(String, usize, usize)> = mxe_sibling_gff
                 .get(base_key)
                 .cloned()
@@ -1512,10 +1514,11 @@ fn process_gene(
                     continue;
                 }
 
+                let total_gap_cols = gap_end - gap_start;
                 flog.push(format!(
-                    "  MXE_SCAN slot={} flanks={}..{} region={}:{}-{}({}) gap_cols={}-{} eff={} min_aa={}",
+                    "  MXE_SCAN slot={} flanks={}..{} region={}:{}-{}({}) gap_cols={}-{} eff={}/{} min_aa={}",
                     token, left_node, right_node, scaffold,
-                    rs, re, strand, gap_start, gap_end, effective_gap, gap_min_aa,
+                    rs, re, strand, gap_start, gap_end, effective_gap, total_gap_cols, gap_min_aa,
                 ));
 
                 let sr: Vec<u8> = if strand == "+" {
@@ -1527,55 +1530,137 @@ fn process_gene(
                     continue;
                 }
 
+                flog.push(format!(
+                    "  >mxe_region {}:{}-{}({}) len={}",
+                    scaffold, rs, re, strand, sr.len()
+                ));
+                flog.push(format!("  {}", String::from_utf8_lossy(&sr)));
+
                 let orfs = extract_flank_orfs(&sr, gap_min_aa, false);
                 let mut kept = 0usize;
 
+                flog.push(format!(
+                    "  {} candidate ORFs (min_aa={}, gap={}/{} eff/total cols)",
+                    orfs.len(), gap_min_aa, effective_gap, total_gap_cols
+                ));
+
                 for (aa_bytes, nt_start, nt_end, frame) in &orfs {
-                    let (hss, hse) = if strand == "+" {
+                    let (orf_hss, orf_hse) = if strand == "+" {
                         (rs + nt_start, rs + nt_end - 1)
                     } else {
                         let rl = re - rs + 1;
                         (rs + (rl - nt_end), rs + (rl - nt_start) - 1)
                     };
 
-                    // Skip ORFs overlapping known cassette exons
-                    let overlaps = known_intervals.iter().any(|(s, ks, ke)| {
-                        *s == *scaffold && hss <= *ke && hse >= *ks
-                    });
-                    if overlaps {
-                        continue;
-                    }
-
                     let fv = if strand == "+" {
                         (*frame as i32) + 1
                     } else {
                         -((*frame as i32) + 1)
                     };
-                    let aa_str = String::from_utf8_lossy(aa_bytes).to_string();
-                    let nt_slice = &sr[*nt_start..*nt_end];
-                    let nt_str = String::from_utf8_lossy(nt_slice).to_string();
 
-                    flog.push(format!(
-                        "    MXE_ORF: frame={} aa_len={} genomic={}:{}-{}({})",
-                        fv, aa_bytes.len(), scaffold, hss, hse, strand,
-                    ));
+                    let aa_len = aa_bytes.len();
 
-                    gap_candidates.push(GapCandidate {
-                        aa_seq: aa_str,
-                        nt_seq: nt_str,
-                        frame: fv,
-                        scaffold: scaffold.clone(),
-                        hit_start: hss,
-                        hit_end: hse,
-                        strand: strand.clone(),
-                        gap_start,
-                        gap_end,
-                        cluster_key: base_key.clone(),
-                        node_a_name: left_node.clone(),
-                        node_b_name: right_node.clone(),
-                        mxe_slot_node: token.clone(),
-                    });
-                    kept += 1;
+                    // Project each overlapping known interval onto this ORF's
+                    // AA index space, rounding inward (ceil on both sides) so
+                    // fragments never contain partial-codon overlap with a known.
+                    // For + strand the ORF's AA index i covers genomic
+                    // [orf_hss + i*3, orf_hss + i*3 + 2]. For - strand the AA
+                    // string runs 5' -> 3' on the reverse complement, so AA
+                    // index i covers genomic [orf_hse - i*3 - 2, orf_hse - i*3],
+                    // and knowns project with the orientation flipped.
+                    let mut proj: Vec<(usize, usize)> = Vec::new();
+                    for (ks_scaf, ks, ke) in &known_intervals {
+                        if ks_scaf != scaffold {
+                            continue;
+                        }
+                        let ks = *ks;
+                        let ke = *ke;
+                        if ke < orf_hss || ks > orf_hse {
+                            continue;
+                        }
+                        let (aa_ks, aa_ke) = if strand == "+" {
+                            // AA i on + strand covers genomic [orf_hss + 3i, orf_hss + 3i + 2].
+                            // First overlapping AA: smallest i with (orf_hss + 3i + 2) >= ks
+                            //   => i >= ceil((ks - orf_hss - 2) / 3)
+                            // First non-overlapping AA past the known: smallest i with
+                            // (orf_hss + 3i) > ke  =>  i >= ceil((ke + 1 - orf_hss) / 3)
+                            let a = ((ks.saturating_sub(orf_hss + 2) + 2) / 3).min(aa_len);
+                            let b = (((ke + 1).saturating_sub(orf_hss) + 2) / 3).min(aa_len);
+                            (a, b)
+                        } else {
+                            // AA i on - strand covers genomic [orf_hse - 3i - 2, orf_hse - 3i].
+                            // First overlapping AA: smallest i with (orf_hse - 3i - 2) <= ke
+                            //   => i >= ceil((orf_hse - ke - 2) / 3)
+                            // First non-overlapping AA past the known: smallest i with
+                            // (orf_hse - 3i) < ks  =>  i >= ceil((orf_hse + 1 - ks) / 3)
+                            let a = ((orf_hse.saturating_sub(ke + 2) + 2) / 3).min(aa_len);
+                            let b = (((orf_hse + 1).saturating_sub(ks) + 2) / 3).min(aa_len);
+                            (a, b)
+                        };
+                        if aa_ke > aa_ks {
+                            proj.push((aa_ks, aa_ke));
+                        }
+                    }
+                    proj.sort_by_key(|&(s, _)| s);
+
+                    // Walk left-to-right, emitting fragments between knowns.
+                    let mut fragments: Vec<(usize, usize)> = Vec::new();
+                    let mut cursor = 0usize;
+                    for (s, e) in &proj {
+                        if *s > cursor {
+                            fragments.push((cursor, *s));
+                        }
+                        if *e > cursor {
+                            cursor = *e;
+                        }
+                    }
+                    if cursor < aa_len {
+                        fragments.push((cursor, aa_len));
+                    }
+
+                    for (aa_from, aa_to) in fragments {
+                        let frag_len = aa_to - aa_from;
+                        if frag_len < gap_min_aa {
+                            continue;
+                        }
+
+                        let frag_aa = &aa_bytes[aa_from..aa_to];
+                        let frag_nt_start = nt_start + aa_from * 3;
+                        let frag_nt_end = nt_start + aa_to * 3;
+
+                        let (hss, hse) = if strand == "+" {
+                            (rs + frag_nt_start, rs + frag_nt_end - 1)
+                        } else {
+                            let rl = re - rs + 1;
+                            (rs + (rl - frag_nt_end), rs + (rl - frag_nt_start) - 1)
+                        };
+
+                        let aa_str = String::from_utf8_lossy(frag_aa).to_string();
+                        let nt_slice = &sr[frag_nt_start..frag_nt_end];
+                        let nt_str = String::from_utf8_lossy(nt_slice).to_string();
+
+                        flog.push(format!(
+                            "    MXE_ORF: frame={} aa_len={} genomic={}:{}-{}({})\n      aa={}",
+                            fv, frag_len, scaffold, hss, hse, strand, aa_str,
+                        ));
+
+                        gap_candidates.push(GapCandidate {
+                            aa_seq: aa_str,
+                            nt_seq: nt_str,
+                            frame: fv,
+                            scaffold: scaffold.clone(),
+                            hit_start: hss,
+                            hit_end: hse,
+                            strand: strand.clone(),
+                            gap_start,
+                            gap_end,
+                            cluster_key: base_key.clone(),
+                            node_a_name: left_node.clone(),
+                            node_b_name: right_node.clone(),
+                            mxe_slot_node: token.clone(),
+                        });
+                        kept += 1;
+                    }
                 }
 
                 flog.push(format!(

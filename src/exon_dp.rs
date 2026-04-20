@@ -993,6 +993,9 @@ struct GapCandidate {
     cluster_key: String,
     node_a_name: String,
     node_b_name: String,
+    /// For MXE region scan candidates: the base cluster's modular node
+    /// at this slot.  Empty for normal gap candidates.
+    mxe_slot_node: String,
 }
 
 struct GeneResult {
@@ -1144,6 +1147,19 @@ fn process_gene(
                     }
                 }
             }
+            // Also include nodes from the base cluster itself, which
+            // may not be typed MXE (e.g. "C-terminal" with MXE children).
+            if let Some((base_tokens, _)) = clusters.get(base_key.as_str()) {
+                for token in base_tokens {
+                    if let Some(entry) = gff.get(token.as_str()) {
+                        intervals.push((
+                            entry.scaffold.clone(),
+                            entry.start,
+                            entry.end,
+                        ));
+                    }
+                }
+            }
             result.insert(base_key.clone(), intervals);
         }
         result
@@ -1152,11 +1168,14 @@ fn process_gene(
     // For each MXE base cluster key, compute which of its nodes are
     // modular (i.e. get swapped out in at least one isoform).
     // A base node is modular if any isoform child does NOT contain it.
+    // Note: the base cluster itself may not be typed "MXE" (e.g. it
+    // could be "C-terminal" if the cluster has both MXE and C-terminal
+    // splicing).  We identify base clusters by checking whether any
+    // child key (with '_') is typed MXE.
     let mxe_base_modular: HashMap<String, HashSet<String>> = {
         let mut result: HashMap<String, HashSet<String>> = HashMap::new();
-        // Group isoform node-sets by base key
+        // Group MXE isoform node-sets by base key
         let mut iso_sets: HashMap<String, Vec<HashSet<String>>> = HashMap::new();
-        let mut base_sets: HashMap<String, HashSet<String>> = HashMap::new();
         for (ck, (node_tokens, iso_type)) in clusters.iter() {
             if iso_type != "MXE" {
                 continue;
@@ -1164,20 +1183,23 @@ fn process_gene(
             let fields: HashSet<String> = node_tokens.iter().cloned().collect();
             if let Some(bk) = ck.rsplit_once('_').map(|(k, _)| k.to_string()) {
                 iso_sets.entry(bk).or_default().push(fields);
-            } else {
-                base_sets.insert(ck.clone(), fields);
             }
         }
-        for (bk, base_fields) in &base_sets {
-            if let Some(children) = iso_sets.get(bk) {
-                // A base node is modular if ANY child lacks it
-                let modular: HashSet<String> = base_fields
-                    .iter()
-                    .filter(|node| children.iter().any(|child| !child.contains(*node)))
-                    .cloned()
-                    .collect();
-                result.insert(bk.clone(), modular);
-            }
+        // For each base key that has MXE children, look up the base
+        // cluster's node list (regardless of its own iso_type) and
+        // find which nodes are swapped out in at least one child.
+        for (bk, children) in &iso_sets {
+            let base_tokens = match clusters.get(bk.as_str()) {
+                Some((tokens, _)) => tokens,
+                None => continue,
+            };
+            let base_fields: HashSet<String> = base_tokens.iter().cloned().collect();
+            let modular: HashSet<String> = base_fields
+                .iter()
+                .filter(|node| children.iter().any(|child| !child.contains(*node)))
+                .cloned()
+                .collect();
+            result.insert(bk.clone(), modular);
         }
         result
     };
@@ -1445,7 +1467,173 @@ fn process_gene(
                     cluster_key: ck.to_string(),
                     node_a_name: node_a_name.clone(),
                     node_b_name: node_b_name.clone(),
+                    mxe_slot_node: String::new(),
                 });
+            }
+        }
+    }
+
+    // MXE region scan: for each modular slot, simulate a gap between
+    // the two constitutive flanking nodes and extract ORFs from the
+    // full intervening genomic region.
+    {
+        let mut mxe_scanned: HashSet<(String, String, String)> = HashSet::new();
+
+        for (base_key, modular_set) in &mxe_base_modular {
+            let base_tokens = match clusters.get(base_key.as_str()) {
+                Some((tokens, _)) => tokens,
+                None => continue,
+            };
+            if modular_set.is_empty() {
+                continue;
+            }
+
+            // Collect known cassette intervals for this MXE group
+            let known_intervals: Vec<(String, usize, usize)> = mxe_sibling_gff
+                .get(base_key)
+                .cloned()
+                .unwrap_or_default();
+
+            for (slot_idx, token) in base_tokens.iter().enumerate() {
+                if !modular_set.contains(token) {
+                    continue;
+                }
+                if slot_idx == 0 || slot_idx >= base_tokens.len() - 1 {
+                    continue;
+                }
+
+                let left_node = &base_tokens[slot_idx - 1];
+                let right_node = &base_tokens[slot_idx + 1];
+                if modular_set.contains(left_node) || modular_set.contains(right_node) {
+                    continue;
+                }
+
+                let left_gff = match gff.get(left_node.as_str()) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let right_gff = match gff.get(right_node.as_str()) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if left_gff.scaffold != right_gff.scaffold {
+                    continue;
+                }
+                let scaffold = &left_gff.scaffold;
+                let strand = &left_gff.strand;
+
+                let scan_key = (scaffold.clone(), left_node.clone(), right_node.clone());
+                if mxe_scanned.contains(&scan_key) {
+                    continue;
+                }
+                mxe_scanned.insert(scan_key);
+
+                // MSA gap window between the two constitutive flanks
+                let left_cand = cands.iter().find(|c| c.nf == *left_node);
+                let right_cand = cands.iter().find(|c| c.nf == *right_node);
+                let (gap_start, gap_end) = match (left_cand, right_cand) {
+                    (Some(lc), Some(rc)) => {
+                        if strand == "-" { (rc.end, lc.start) } else { (lc.end, rc.start) }
+                    }
+                    _ => continue,
+                };
+                if gap_end <= gap_start {
+                    continue;
+                }
+
+                let (effective_gap, gap_min_aa) = match qualify_gap(gap_start, gap_end, &rc) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                // Genomic region between the two constitutive flanks
+                let (rs, re) = if left_gff.start < right_gff.start {
+                    (left_gff.end + 1, right_gff.start.saturating_sub(1))
+                } else {
+                    (right_gff.end + 1, left_gff.start.saturating_sub(1))
+                };
+                if rs >= re {
+                    continue;
+                }
+
+                let scaffold_seq = match genome.get(scaffold) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if re > scaffold_seq.len() {
+                    continue;
+                }
+
+                flog.push(format!(
+                    "  MXE_SCAN slot={} flanks={}..{} region={}:{}-{}({}) gap_cols={}-{} eff={} min_aa={}",
+                    token, left_node, right_node, scaffold,
+                    rs, re, strand, gap_start, gap_end, effective_gap, gap_min_aa,
+                ));
+
+                let sr: Vec<u8> = if strand == "+" {
+                    scaffold_seq[rs - 1..re].to_vec()
+                } else {
+                    bio_revcomp(&scaffold_seq[rs - 1..re])
+                };
+                if sr.len() < 6 {
+                    continue;
+                }
+
+                let orfs = extract_flank_orfs(&sr, gap_min_aa, false);
+                let mut kept = 0usize;
+
+                for (aa_bytes, nt_start, nt_end, frame) in &orfs {
+                    let (hss, hse) = if strand == "+" {
+                        (rs + nt_start, rs + nt_end - 1)
+                    } else {
+                        let rl = re - rs + 1;
+                        (rs + (rl - nt_end), rs + (rl - nt_start) - 1)
+                    };
+
+                    // Skip ORFs overlapping known cassette exons
+                    let overlaps = known_intervals.iter().any(|(s, ks, ke)| {
+                        *s == *scaffold && hss <= *ke && hse >= *ks
+                    });
+                    if overlaps {
+                        continue;
+                    }
+
+                    let fv = if strand == "+" {
+                        (*frame as i32) + 1
+                    } else {
+                        -((*frame as i32) + 1)
+                    };
+                    let aa_str = String::from_utf8_lossy(aa_bytes).to_string();
+                    let nt_slice = &sr[*nt_start..*nt_end];
+                    let nt_str = String::from_utf8_lossy(nt_slice).to_string();
+
+                    flog.push(format!(
+                        "    MXE_ORF: frame={} aa_len={} genomic={}:{}-{}({})",
+                        fv, aa_bytes.len(), scaffold, hss, hse, strand,
+                    ));
+
+                    gap_candidates.push(GapCandidate {
+                        aa_seq: aa_str,
+                        nt_seq: nt_str,
+                        frame: fv,
+                        scaffold: scaffold.clone(),
+                        hit_start: hss,
+                        hit_end: hse,
+                        strand: strand.clone(),
+                        gap_start,
+                        gap_end,
+                        cluster_key: base_key.clone(),
+                        node_a_name: left_node.clone(),
+                        node_b_name: right_node.clone(),
+                        mxe_slot_node: token.clone(),
+                    });
+                    kept += 1;
+                }
+
+                flog.push(format!(
+                    "  MXE_SCAN_RESULT: {} ORFs extracted, {} new candidates",
+                    orfs.len(), kept,
+                ));
             }
         }
     }
@@ -1695,6 +1883,9 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
             gcd.set_item("cluster_key", &gc.cluster_key)?;
             gcd.set_item("node_a_name", &gc.node_a_name)?;
             gcd.set_item("node_b_name", &gc.node_b_name)?;
+            if !gc.mxe_slot_node.is_empty() {
+                gcd.set_item("mxe_slot_node", &gc.mxe_slot_node)?;
+            }
             py_gap_cands.append(gcd)?;
         }
         rd.set_item("gap_candidates", py_gap_cands)?;

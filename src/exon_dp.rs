@@ -1509,32 +1509,6 @@ fn process_gene(
                     continue;
                 }
 
-                // Alternative-path check: the pair-loop gap scan above,
-                // with its per-pair narrowing, runs first and recovers
-                // isoform-specific exons that sit between sibling
-                // cassettes in the slot. By construction those recoveries
-                // land in inter-sibling intergenic space (the narrowing
-                // excludes sibling intervals), so any gap_candidate
-                // falling inside [rs, re] is evidence that this slot has
-                // alternative-path structure (multiple exons per isoform)
-                // rather than tandem-cassette structure (one exon per
-                // isoform). The MXE tandem-variant scan is designed for
-                // the latter; running it on the former produces spurious
-                // candidates overlapping real isoform-specific exons.
-                let has_alt_path_recoveries = gap_candidates.iter().any(|gc| {
-                    gc.scaffold == *scaffold
-                        && gc.hit_start >= rs
-                        && gc.hit_end <= re
-                });
-                if has_alt_path_recoveries {
-                    flog.push(format!(
-                        "  MXE_SCAN_SKIP slot={} flanks={}..{} region={}:{}-{}({}) \
-                         reason=alt_path (pair-loop recovered exons in slot)",
-                        token, left_node, right_node, scaffold, rs, re, strand,
-                    ));
-                    continue;
-                }
-
                 let Some(scaffold_seq) = genome.get(scaffold) else { continue; };
                 if re > scaffold_seq.len() {
                     continue;

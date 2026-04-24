@@ -272,6 +272,287 @@ fn mask_retained_introns(
     (result, intron_columns)
 }
 
+/// Mask garbage regions around internal stop codons.
+///
+/// Uses the stop codon as a seed for a known-bad position, then expands
+/// outward in both directions using a sliding window of `recovery_window`
+/// scorable residues.  Masking continues until a window is found where
+/// at least `recovery_threshold` fraction of positions match the
+/// reference character set.  The recovery point is then advanced past
+/// any leading mismatches in the recovery window so that only truly
+/// matching sequence is kept.
+///
+/// If the scan reaches the edge of the sequence data without finding a
+/// recovery window, the entire side is masked.  The smaller surviving
+/// fragment is tossed.
+///
+/// Columns masked here are merged into `intron_columns` so that
+/// downstream NT trimming and GFF coordinate adjustment account for
+/// the removal.  Because the orphan eviction guarantees only one
+/// contiguous fragment survives, the intron split logic will not
+/// produce multiple exons from these columns.
+fn mask_stop_sides(
+    records: &[(String, Vec<u8>)],
+    intron_columns: &mut HashMap<String, HashSet<usize>>,
+    ref_suffix: &str,
+    recovery_threshold: f64,
+    recovery_window: usize,
+    debug: i32,
+    log_dir: &Option<String>,
+) -> Vec<(String, Vec<u8>)> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+
+    let aln_len = records[0].1.len();
+    let ref_seqs: Vec<&[u8]> = records
+        .iter()
+        .filter(|(h, _)| h.ends_with(ref_suffix))
+        .map(|(_, s)| s.as_slice())
+        .collect();
+
+    if ref_seqs.is_empty() {
+        return records.to_vec();
+    }
+
+    // Build per-column ref character sets, considering only positions
+    // inside each reference's data range (between first and last
+    // non-gap character).
+    let mut ref_char_sets: Vec<HashSet<u8>> = vec![HashSet::new(); aln_len];
+    for rseq in &ref_seqs {
+        let first = rseq.iter().position(|&c| c != b'-');
+        let last = rseq.iter().rposition(|&c| c != b'-');
+        if let (Some(f), Some(l)) = (first, last) {
+            for i in f..=l {
+                let c = rseq[i];
+                if c != b'-' && c != b'*' {
+                    ref_char_sets[i].insert(c);
+                }
+            }
+        }
+    }
+
+    let mut stop_log: Vec<(String, usize, String, usize)> = Vec::new();
+    let mut result = Vec::with_capacity(records.len());
+
+    for (header, seq) in records {
+        if header.ends_with(ref_suffix) {
+            result.push((header.clone(), seq.clone()));
+            continue;
+        }
+
+        // Fast path: no stops remaining.
+        if !seq.contains(&b'*') {
+            result.push((header.clone(), seq.clone()));
+            continue;
+        }
+
+        // Find data range.
+        let data_start = match seq.iter().position(|&c| c != b'-') {
+            Some(p) => p,
+            None => {
+                result.push((header.clone(), seq.clone()));
+                continue;
+            }
+        };
+        let data_end = seq.iter().rposition(|&c| c != b'-').unwrap() + 1;
+
+        // Collect stop positions.
+        let stops: Vec<usize> = (data_start..data_end)
+            .filter(|&i| seq[i] == b'*')
+            .collect();
+
+        if stops.is_empty() {
+            result.push((header.clone(), seq.clone()));
+            continue;
+        }
+
+        // Helper: collect scorable (column, matches_ref) pairs.
+        let collect_scorable = |range_iter: Box<dyn Iterator<Item = usize>>| -> Vec<(usize, bool)> {
+            range_iter
+                .filter_map(|i| {
+                    let c = seq[i];
+                    if c == b'-' || c == b'*' {
+                        return None;
+                    }
+                    if ref_char_sets[i].is_empty() {
+                        return None;
+                    }
+                    Some((i, ref_char_sets[i].contains(&c)))
+                })
+                .collect()
+        };
+
+        // Helper: scan outward from a stop, return the column where
+        // good sequence resumes (or the data edge if it never does).
+        let find_recovery = |positions: &[(usize, bool)], toward_start: bool| -> usize {
+            if positions.len() < recovery_window {
+                // Not enough scorable positions to fill a window.
+                return if toward_start { data_start } else { data_end };
+            }
+            let required = (recovery_window as f64 * recovery_threshold).ceil() as usize;
+            for w in 0..=(positions.len() - recovery_window) {
+                let w_matches = positions[w..w + recovery_window]
+                    .iter()
+                    .filter(|(_, m)| *m)
+                    .count();
+                if w_matches >= required {
+                    // Recovery window found.  Advance past leading
+                    // mismatches so only matching residues are kept.
+                    for j in w..w + recovery_window {
+                        if positions[j].1 {
+                            return positions[j].0;
+                        }
+                    }
+                }
+            }
+            // No recovery found.
+            if toward_start { data_start } else { data_end }
+        };
+
+        let mut cols_to_mask: HashSet<usize> = HashSet::new();
+
+        for &star in &stops {
+            // Always mask the stop itself.
+            cols_to_mask.insert(star);
+
+            // Scan RIGHT from stop.
+            let right_positions = collect_scorable(
+                Box::new((star + 1)..data_end),
+            );
+            let recovery_right = find_recovery(&right_positions, false);
+            let right_had_garbage = recovery_right > star + 1;
+            if right_had_garbage {
+                cols_to_mask.extend((star + 1)..recovery_right);
+                if debug >= 1 {
+                    stop_log.push((
+                        header.clone(),
+                        star,
+                        "right".to_string(),
+                        recovery_right,
+                    ));
+                }
+            }
+
+            // Scan LEFT from stop.
+            let left_positions = collect_scorable(
+                Box::new((data_start..star).rev()),
+            );
+            let recovery_left = find_recovery(&left_positions, true);
+            let left_had_garbage;
+            if recovery_left == data_start {
+                // No recovery: mask entire left side.
+                left_had_garbage = true;
+                cols_to_mask.extend(data_start..star);
+                if debug >= 1 {
+                    stop_log.push((
+                        header.clone(),
+                        star,
+                        "left_full".to_string(),
+                        data_start,
+                    ));
+                }
+            } else if recovery_left < star && recovery_left + 1 < star {
+                left_had_garbage = true;
+                cols_to_mask.extend((recovery_left + 1)..star);
+                if debug >= 1 {
+                    stop_log.push((
+                        header.clone(),
+                        star,
+                        "left".to_string(),
+                        recovery_left,
+                    ));
+                }
+            } else {
+                left_had_garbage = false;
+            }
+
+            // If garbage was found on exactly one side, the stop is a
+            // frameshift artifact.  Toss the smaller surviving fragment.
+            if left_had_garbage != right_had_garbage {
+                let left_residues = (data_start..star)
+                    .filter(|&i| seq[i] != b'-' && seq[i] != b'*' && !cols_to_mask.contains(&i))
+                    .count();
+                let right_residues = (star + 1..data_end)
+                    .filter(|&i| seq[i] != b'-' && seq[i] != b'*' && !cols_to_mask.contains(&i))
+                    .count();
+
+                if left_residues < right_residues && left_residues > 0 {
+                    cols_to_mask.extend(data_start..star);
+                    if debug >= 1 {
+                        stop_log.push((
+                            header.clone(),
+                            star,
+                            "left_orphan".to_string(),
+                            left_residues,
+                        ));
+                    }
+                } else if right_residues < left_residues && right_residues > 0 {
+                    cols_to_mask.extend((star + 1)..data_end);
+                    if debug >= 1 {
+                        stop_log.push((
+                            header.clone(),
+                            star,
+                            "right_orphan".to_string(),
+                            right_residues,
+                        ));
+                    }
+                }
+            }
+        }
+
+        if cols_to_mask.is_empty() {
+            result.push((header.clone(), seq.clone()));
+        } else {
+            let mut masked = seq.clone();
+            for &i in &cols_to_mask {
+                if i < masked.len() {
+                    masked[i] = b'-';
+                }
+            }
+            intron_columns
+                .entry(header.clone())
+                .or_default()
+                .extend(&cols_to_mask);
+            result.push((header.clone(), masked));
+        }
+    }
+
+    // Debug log.
+    if !stop_log.is_empty() && debug >= 1 {
+        if let Some(ld) = log_dir {
+            let log_path = Path::new(ld).join("stop_side_trim_debug.csv");
+            let write_header = !log_path.exists();
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                if write_header {
+                    let _ = writeln!(
+                        f,
+                        "header,stop_col,side,recovery_col"
+                    );
+                }
+                for (h, stop_col, side, recovery_col) in &stop_log {
+                    let safe = if h.contains(',') {
+                        format!("\"{}\"", h)
+                    } else {
+                        h.clone()
+                    };
+                    let _ = writeln!(
+                        f,
+                        "{},{},{},{}",
+                        safe, stop_col, side, recovery_col
+                    );
+                }
+            }
+        }
+    }
+
+    result
+}
+
 fn scan_gap_run(seq: &[u8], ref_has_data: &[bool], start: usize) -> (usize, usize) {
     let n = seq.len();
     let mut j = start;
@@ -607,6 +888,7 @@ fn classify_intron_splits(orig_seq: &[u8], intron_cols: &HashSet<usize>) -> Vec<
     nt_seqs = None,
     debug = 0,
     log_dir = None,
+    stop_codon_side_threshold = 0.50,
 ))]
 pub fn cull_columns(
     records: Vec<(String, String)>,
@@ -622,6 +904,7 @@ pub fn cull_columns(
     nt_seqs: Option<HashMap<String, String>>,
     debug: i32,
     log_dir: Option<String>,
+    stop_codon_side_threshold: f64,
 ) -> PyResult<(
     Vec<(String, String)>,
     HashMap<String, HashSet<usize>>,
@@ -652,15 +935,30 @@ pub fn cull_columns(
     }
 
     // Detect and mask retained introns.
-    let (after_intron, intron_masked_cols) =
+    let (after_intron, mut intron_masked_cols) =
         mask_retained_introns(&normalized, ref_suffix, &nt_seqs, min_ref_supported_gap, debug, &log_dir);
+
+    // Mask low-quality sides of internal stop codons.
+    let after_stop_sides = if stop_codon_side_threshold > 0.0 {
+        mask_stop_sides(
+            &after_intron,
+            &mut intron_masked_cols,
+            ref_suffix,
+            stop_codon_side_threshold,
+            8, // recovery_window
+            debug,
+            &log_dir,
+        )
+    } else {
+        after_intron
+    };
 
     // Gap cull: remove all-gap columns. Use Vec<bool> instead of HashSet.
     let mut gap_cull_mask = vec![false; aln_len];
     let mut gap_cull_count = 0usize;
     if gap_cull_threshold > 0.0 {
         let mut col_non_gap = vec![0usize; aln_len];
-        for (_, seq) in &after_intron {
+        for (_, seq) in &after_stop_sides {
             for (i, &ch) in seq.iter().enumerate() {
                 if ch != b'-' {
                     col_non_gap[i] += 1;
@@ -682,7 +980,7 @@ pub fn cull_columns(
         let oimap: Vec<usize> = (0..aln_len)
             .filter(|&i| !gap_cull_mask[i])
             .collect();
-        after_gap_cull = after_intron
+        after_gap_cull = after_stop_sides
             .iter()
             .map(|(h, s)| {
                 let new_seq: Vec<u8> = oimap.iter().map(|&i| s[i]).collect();
@@ -692,7 +990,7 @@ pub fn cull_columns(
         aln_len = oimap.len();
         orig_index_map = Some(oimap);
     } else {
-        after_gap_cull = after_intron;
+        after_gap_cull = after_stop_sides;
         orig_index_map = None;
     }
 

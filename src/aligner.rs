@@ -68,16 +68,21 @@ fn run_command(cmd: &mut Command, name: &str) -> Result<(), String> {
 /// `tmpdir` selects where the four scratch files live.  Pass the same path
 /// SAPPHYRE's Python side resolves with `get_temp_dir()` (``/dev/shm`` when
 /// available) so we keep the I/O off spinning disks.
+///
+/// `gene_name`, when provided, is embedded in each scratch file's prefix and
+/// used as the HMM's internal name.  This avoids collisions when many workers
+/// run hmmbuild/hmmalign concurrently against the same tmpdir.
 #[pyfunction]
-#[pyo3(signature = (candidates, references, tmpdir = None))]
+#[pyo3(signature = (candidates, references, tmpdir = None, gene_name = None))]
 pub fn hmm_align(
     py: Python<'_>,
     candidates: Vec<(String, String)>,
     references: Vec<(String, String)>,
     tmpdir: Option<String>,
+    gene_name: Option<String>,
 ) -> PyResult<Vec<(String, String)>> {
     py.allow_threads(move || {
-        hmm_align_inner(candidates, references, tmpdir)
+        hmm_align_inner(candidates, references, tmpdir, gene_name)
     })
     .map_err(PyRuntimeError::new_err)
 }
@@ -86,10 +91,27 @@ fn hmm_align_inner(
     candidates: Vec<(String, String)>,
     references: Vec<(String, String)>,
     tmpdir: Option<String>,
+    gene_name: Option<String>,
 ) -> Result<Vec<(String, String)>, String> {
-    let make_temp = |prefix: &str, suffix: &str| {
+    // Sanitise the gene name so it's safe inside a filename — strip anything
+    // that isn't alphanumeric/_/-/. so we don't accidentally inject path
+    // separators or shell metacharacters into the tempfile prefix.
+    let slug: String = gene_name
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect();
+    let tag = if slug.is_empty() {
+        String::new()
+    } else {
+        format!("{}_", slug)
+    };
+
+    let make_temp = |kind: &str, suffix: &str| {
+        let prefix = format!("{}{}_", tag, kind);
         let mut b = Builder::new();
-        b.prefix(prefix).suffix(suffix);
+        b.prefix(&prefix).suffix(suffix);
         match &tmpdir {
             Some(d) => b.tempfile_in(d),
             None => b.tempfile(),
@@ -97,10 +119,10 @@ fn hmm_align_inner(
         .map_err(|e| e.to_string())
     };
 
-    let mut temp_aln = make_temp("aln_", ".fa")?;
-    let temp_hmm = make_temp("hmm_", ".hmm")?;
-    let mut temp_cand = make_temp("cand_", ".fa")?;
-    let temp_result = make_temp("res_", ".afa")?;
+    let mut temp_aln = make_temp("aln", ".fa")?;
+    let temp_hmm = make_temp("hmm", ".hmm")?;
+    let mut temp_cand = make_temp("cand", ".fa")?;
+    let temp_result = make_temp("res", ".afa")?;
 
     // Write through the existing tempfile handles - no second open().
     {
@@ -124,9 +146,10 @@ fn hmm_align_inner(
     // --cpu 1 keeps each invocation single-threaded; SAPPHYRE drives this
     // function from a multiprocessing pool, so HMMER's default of 2 pthreads
     // per call would oversubscribe (N_workers x 2 threads).
+    let hmm_name = if slug.is_empty() { "hmm" } else { slug.as_str() };
     let mut hmmbuild = Command::new("hmmbuild");
     hmmbuild
-        .args(["-n", "hmm"])
+        .args(["-n", hmm_name])
         .args(["--cpu", "1"])
         .arg(&hmm_path)
         .arg(&aln_path);

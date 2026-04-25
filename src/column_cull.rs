@@ -10,6 +10,298 @@ use std::path::Path;
 // ---------------------------------------------------------------------------
 const MIN_INTRON_NT: usize = 30;
 
+// ---------------------------------------------------------------------------
+// Constants for stop-codon BLOSUM trim
+// ---------------------------------------------------------------------------
+
+/// Maximum distance (non-gap AA) from a data edge for a stop to be
+/// eligible for BLOSUM fragment scoring.  Stops deeper than this on
+/// both sides are internal pseudogenic stops -- skip them.
+const STOP_TRIM_MAX_DEPTH_AA: usize = 40;
+
+/// The smaller fragment must score below this to be considered junk.
+const STOP_TRIM_BAD_THRESHOLD: f64 = 0.50;
+
+/// The larger fragment must score above this to confirm it is real.
+const STOP_TRIM_GOOD_THRESHOLD: f64 = 0.60;
+
+/// Minimum fraction of refs that must have data at a column for it
+/// to enter the PSSM (matches exonfinder.py _compute_ref_data_cols).
+const STOP_TRIM_MIN_REF_OCC: f64 = 0.30;
+
+/// BLOSUM62 scoring matrix (upper-case AA only).
+/// Returns score for (query, reference) pair.
+fn blosum62(a: u8, b: u8) -> f64 {
+    let idx = |c: u8| -> usize {
+        match c {
+            b'A' => 0, b'R' => 1, b'N' => 2, b'D' => 3, b'C' => 4,
+            b'Q' => 5, b'E' => 6, b'G' => 7, b'H' => 8, b'I' => 9,
+            b'L' => 10, b'K' => 11, b'M' => 12, b'F' => 13, b'P' => 14,
+            b'S' => 15, b'T' => 16, b'W' => 17, b'Y' => 18, b'V' => 19,
+            _ => 20,
+        }
+    };
+    #[rustfmt::skip]
+    const MAT: [[i8; 20]; 20] = [
+      //  A   R   N   D   C   Q   E   G   H   I   L   K   M   F   P   S   T   W   Y   V
+        [ 4, -1, -2, -2,  0, -1, -1,  0, -2, -1, -1, -1, -1, -2, -1,  1,  0, -3, -2,  0], // A
+        [-1,  5,  0, -2, -3,  1,  0, -2,  0, -3, -2,  2, -1, -3, -2, -1, -1, -3, -2, -3], // R
+        [-2,  0,  6,  1, -3,  0,  0,  0,  1, -3, -3,  0, -2, -3, -2,  1,  0, -4, -2, -3], // N
+        [-2, -2,  1,  6, -3,  0,  2, -1, -1, -3, -4, -1, -3, -3, -1,  0, -1, -4, -3, -3], // D
+        [ 0, -3, -3, -3,  9, -3, -4, -3, -3, -1, -1, -3, -1, -2, -3, -1, -1, -2, -2, -1], // C
+        [-1,  1,  0,  0, -3,  5,  2, -2,  0, -3, -2,  1,  0, -3, -1,  0, -1, -2, -1, -2], // Q
+        [-1,  0,  0,  2, -4,  2,  5, -2,  0, -3, -3,  1, -2, -3, -1,  0, -1, -3, -2, -2], // E
+        [ 0, -2,  0, -1, -3, -2, -2,  6, -2, -4, -4, -2, -3, -3, -2,  0, -2, -2, -3, -3], // G
+        [-2,  0,  1, -1, -3,  0,  0, -2,  8, -3, -3, -1, -2, -1, -2, -1, -2, -2,  2, -3], // H
+        [-1, -3, -3, -3, -1, -3, -3, -4, -3,  4,  2, -3,  1,  0, -3, -2, -1, -3, -1,  3], // I
+        [-1, -2, -3, -4, -1, -2, -3, -4, -3,  2,  4, -2,  2,  0, -3, -2, -1, -2, -1,  1], // L
+        [-1,  2,  0, -1, -3,  1,  1, -2, -1, -3, -2,  5, -1, -3, -1,  0, -1, -3, -2, -2], // K
+        [-1, -1, -2, -3, -1,  0, -2, -3, -2,  1,  2, -1,  5,  0, -2, -1, -1, -1, -1,  1], // M
+        [-2, -3, -3, -3, -2, -3, -3, -3, -1,  0,  0, -3,  0,  6, -4, -2, -2,  1,  3, -1], // F
+        [-1, -2, -2, -1, -3, -1, -1, -2, -2, -3, -3, -1, -2, -4,  7, -1, -1, -4, -3, -2], // P
+        [ 1, -1,  1,  0, -1,  0,  0,  0, -1, -2, -2,  0, -1, -2, -1,  4,  1, -3, -2, -2], // S
+        [ 0, -1,  0, -1, -1, -1, -1, -2, -2, -1, -1, -1, -1, -2, -1,  1,  5, -2, -2,  0], // T
+        [-3, -3, -4, -4, -2, -2, -3, -2, -2, -3, -2, -3, -1,  1, -4, -3, -2, 11,  2, -3], // W
+        [-2, -2, -2, -3, -2, -1, -2, -3,  2, -1, -1, -2, -1,  3, -3, -2, -2,  2,  7, -1], // Y
+        [ 0, -3, -3, -3, -1, -2, -2, -3, -3,  3,  1, -2,  1, -1, -2, -2,  0, -3, -1,  4], // V
+    ];
+    let ai = idx(a);
+    let bi = idx(b);
+    if ai >= 20 || bi >= 20 {
+        return -4.0;
+    }
+    MAT[ai][bi] as f64
+}
+
+/// Build a BLOSUM62 PSSM from reference sequences.
+///
+/// For each column in `data_cols`, computes a weighted score for every
+/// possible query amino acid based on the reference residue frequencies.
+/// Returns {col: (scores_by_aa, max_possible_score)}.
+fn build_blosum_pssm(
+    ref_seqs: &[&[u8]],
+    n_refs: usize,
+    aln_len: usize,
+) -> HashMap<usize, (HashMap<u8, f64>, f64)> {
+    let mut pssm: HashMap<usize, (HashMap<u8, f64>, f64)> = HashMap::new();
+    let aas: [u8; 20] = *b"ARNDCQEGHILKMFPSTWYV";
+
+    for col in 0..aln_len {
+        // 30% ref occupancy gate.
+        let mut counts: HashMap<u8, f64> = HashMap::new();
+        let mut total = 0usize;
+        for rseq in ref_seqs {
+            if col >= rseq.len() { continue; }
+            let c = rseq[col];
+            if c == b'-' || c == b'*' || c == b'.' { continue; }
+            let cu = c.to_ascii_uppercase();
+            *counts.entry(cu).or_default() += 1.0;
+            total += 1;
+        }
+        if total == 0 { continue; }
+        if (total as f64 / n_refs as f64) < STOP_TRIM_MIN_REF_OCC { continue; }
+
+        let total_f = total as f64;
+        let mut scores: HashMap<u8, f64> = HashMap::new();
+        for &qa in &aas {
+            let mut s = 0.0f64;
+            for (&ref_aa, &cnt) in &counts {
+                s += blosum62(qa, ref_aa) * cnt;
+            }
+            scores.insert(qa, s / total_f);
+        }
+        let col_max = scores.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if col_max > 0.0 {
+            pssm.insert(col, (scores, col_max));
+        }
+    }
+    pssm
+}
+
+/// Score a fragment of a sequence against a precomputed BLOSUM PSSM.
+///
+/// Returns (ratio, scored_cols) where ratio = candidate_total / max_total.
+fn score_fragment(
+    seq: &[u8],
+    pssm: &HashMap<usize, (HashMap<u8, f64>, f64)>,
+    start: usize,
+    end: usize,
+) -> (f64, usize) {
+    let mut cand_total = 0.0f64;
+    let mut max_total = 0.0f64;
+    let mut scored = 0usize;
+    for i in start..end {
+        if i >= seq.len() { break; }
+        let c = seq[i];
+        if c == b'-' || c == b'*' { continue; }
+        if let Some((scores, col_max)) = pssm.get(&i) {
+            cand_total += scores.get(&c.to_ascii_uppercase()).copied().unwrap_or(-4.0);
+            max_total += col_max;
+            scored += 1;
+        }
+    }
+    if max_total > 0.0 {
+        (cand_total / max_total, scored)
+    } else {
+        (0.0, 0)
+    }
+}
+
+/// Trim the smaller fragment around a stop codon if BLOSUM PSSM scoring
+/// shows it is junk while the larger fragment is real.
+///
+/// Operates on sequences in post-gap-cull column space.  Returns a new
+/// alignment with trimmed fragments masked to gap.
+fn mask_stop_blosum(
+    records: &[(String, Vec<u8>)],
+    ref_suffix: &str,
+    debug: i32,
+    log_dir: &Option<String>,
+) -> (Vec<(String, Vec<u8>)>, HashMap<String, HashSet<usize>>) {
+    let aln_len = if records.is_empty() { 0 } else { records[0].1.len() };
+
+    let ref_seqs: Vec<&[u8]> = records
+        .iter()
+        .filter(|(h, _)| h.ends_with(ref_suffix))
+        .map(|(_, s)| s.as_slice())
+        .collect();
+
+    let n_refs = ref_seqs.len();
+    let mut masked_cols: HashMap<String, HashSet<usize>> = HashMap::new();
+
+    if n_refs == 0 || aln_len == 0 {
+        return (records.to_vec(), masked_cols);
+    }
+
+    // Build PSSM once for all sequences.
+    let pssm = build_blosum_pssm(&ref_seqs, n_refs, aln_len);
+
+    let mut stop_log: Vec<(String, usize, usize, usize, f64, f64, String)> = Vec::new();
+    let mut result = Vec::with_capacity(records.len());
+
+    for (header, seq) in records {
+        if header.ends_with(ref_suffix) {
+            result.push((header.clone(), seq.clone()));
+            continue;
+        }
+
+        let stops: Vec<usize> = seq.iter().enumerate()
+            .filter(|(_, &c)| c == b'*')
+            .map(|(i, _)| i)
+            .collect();
+
+        if stops.is_empty() {
+            result.push((header.clone(), seq.clone()));
+            continue;
+        }
+
+        let data_start = match seq.iter().position(|&c| c != b'-') {
+            Some(p) => p,
+            None => {
+                result.push((header.clone(), seq.clone()));
+                continue;
+            }
+        };
+        let data_end = seq.iter().rposition(|&c| c != b'-').unwrap() + 1;
+
+        let mut cols_to_mask: HashSet<usize> = HashSet::new();
+
+        for &star in &stops {
+            // Depth gate.
+            let aa_left = (data_start..star)
+                .filter(|&i| seq[i] != b'-' && seq[i] != b'*')
+                .count();
+            let aa_right = (star + 1..data_end)
+                .filter(|&i| seq[i] != b'-' && seq[i] != b'*')
+                .count();
+
+            if aa_left > STOP_TRIM_MAX_DEPTH_AA
+                && aa_right > STOP_TRIM_MAX_DEPTH_AA
+            {
+                continue;
+            }
+
+            // Score both fragments.
+            let (left_score, left_scored) = score_fragment(seq, &pssm, data_start, star);
+            let (right_score, right_scored) = score_fragment(seq, &pssm, star + 1, data_end);
+
+            // Determine smaller/larger.
+            let (smaller_score, larger_score, trim_side) = if aa_right <= aa_left {
+                (right_score, left_score, "right")
+            } else {
+                (left_score, right_score, "left")
+            };
+
+            // Apply thresholds.
+            if smaller_score >= STOP_TRIM_BAD_THRESHOLD {
+                continue;
+            }
+            if larger_score <= STOP_TRIM_GOOD_THRESHOLD {
+                continue;
+            }
+
+            // Mask the smaller fragment + the stop itself.
+            if trim_side == "right" {
+                cols_to_mask.extend(star..data_end);
+            } else {
+                cols_to_mask.extend(data_start..=star);
+            }
+
+            if debug >= 1 {
+                stop_log.push((
+                    header.clone(),
+                    star,
+                    aa_left,
+                    aa_right,
+                    left_score,
+                    right_score,
+                    trim_side.to_string(),
+                ));
+            }
+        }
+
+        if cols_to_mask.is_empty() {
+            result.push((header.clone(), seq.clone()));
+        } else {
+            let mut masked = seq.clone();
+            for &i in &cols_to_mask {
+                if i < masked.len() {
+                    masked[i] = b'-';
+                }
+            }
+            masked_cols.insert(header.clone(), cols_to_mask);
+            result.push((header.clone(), masked));
+        }
+    }
+
+    // Debug log.
+    if !stop_log.is_empty() && debug >= 1 {
+        if let Some(ld) = log_dir {
+            let log_path = Path::new(ld).join("stop_blosum_trim_debug.csv");
+            if let Ok(mut f) = File::create(&log_path) {
+                let _ = writeln!(
+                    f,
+                    "header,stop_col,aa_left,aa_right,left_score,right_score,trimmed_side"
+                );
+                for (h, stop_col, aa_l, aa_r, ls, rs, side) in &stop_log {
+                    let safe = if h.contains(',') {
+                        format!("\"{}\"", h)
+                    } else {
+                        h.clone()
+                    };
+                    let _ = writeln!(
+                        f,
+                        "{},{},{},{},{:.3},{:.3},{}",
+                        safe, stop_col, aa_l, aa_r, ls, rs, side
+                    );
+                }
+            }
+        }
+    }
+
+    (result, masked_cols)
+}
+
 fn is_donor(a: u8, b: u8) -> bool {
     (a == b'G' && b == b'T') || (a == b'G' && b == b'C')
 }
@@ -89,7 +381,7 @@ fn mask_retained_introns(
     debug: i32,
     log_dir: &Option<String>,
 ) -> (Vec<(String, Vec<u8>)>, HashMap<String, HashSet<usize>>) {
-    let min_intron_aa: usize = 3;
+    let min_intron_aa: usize = 10;
     let ref_gap_threshold: f64 = 0.95;
     let max_bridge_residues: usize = 8;
 
@@ -117,7 +409,7 @@ fn mask_retained_introns(
         ref_gap_col[i] = (gap_count as f64 / n_refs as f64) >= ref_gap_threshold;
     }
 
-    let mut intron_log: Vec<(String, usize, usize, usize, String, String)> = Vec::new();
+    let mut intron_log: Vec<(String, usize, usize, usize, String, String, usize, usize, usize)> = Vec::new();
     let mut result = Vec::with_capacity(normalized.len());
     let mut intron_columns: HashMap<String, HashSet<usize>> = HashMap::new();
 
@@ -223,6 +515,9 @@ fn mask_retained_introns(
                     block_residues.len(),
                     block_str,
                     reason.join("+"),
+                    ref_gap_cols_in_block,
+                    ref_gap_residues,
+                    total_block_residues,
                 ));
             }
         }
@@ -245,312 +540,25 @@ fn mask_retained_introns(
     if !intron_log.is_empty() && debug >= 1 {
         if let Some(ld) = log_dir {
             let log_path = Path::new(ld).join("retained_intron_debug.csv");
-            let write_header = !log_path.exists();
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
+            if let Ok(mut f) = File::create(&log_path)
             {
-                if write_header {
-                    let _ = writeln!(
-                        f,
-                        "header,block_start,block_end,residue_count,block_content,reason"
-                    );
-                }
-                for (h, bs, be, rc, content, reason) in &intron_log {
+                let _ = writeln!(
+                    f,
+                    "header,block_start,block_end,residue_count,block_content,reason,ref_gap_cols,ref_gap_residues,total_block_residues"
+                );
+                for (h, bs, be, rc, content, reason, rgc, rgr, tbr) in &intron_log {
                     let safe = if h.contains(',') {
                         format!("\"{}\"", h)
                     } else {
                         h.clone()
                     };
-                    let _ = writeln!(f, "{},{},{},{},{},{}", safe, bs, be, rc, content, reason);
+                    let _ = writeln!(f, "{},{},{},{},{},{},{},{},{}", safe, bs, be, rc, content, reason, rgc, rgr, tbr);
                 }
             }
         }
     }
 
     (result, intron_columns)
-}
-
-/// Mask garbage regions around internal stop codons.
-///
-/// Uses the stop codon as a seed for a known-bad position, then expands
-/// outward in both directions using a sliding window of `recovery_window`
-/// scorable residues.  Masking continues until a window is found where
-/// at least `recovery_threshold` fraction of positions match the
-/// reference character set.  The recovery point is then advanced past
-/// any leading mismatches in the recovery window so that only truly
-/// matching sequence is kept.
-///
-/// If the scan reaches the edge of the sequence data without finding a
-/// recovery window, the entire side is masked.  The smaller surviving
-/// fragment is tossed.
-///
-/// Columns masked here are merged into `intron_columns` so that
-/// downstream NT trimming and GFF coordinate adjustment account for
-/// the removal.  Because the orphan eviction guarantees only one
-/// contiguous fragment survives, the intron split logic will not
-/// produce multiple exons from these columns.
-fn mask_stop_sides(
-    records: &[(String, Vec<u8>)],
-    intron_columns: &mut HashMap<String, HashSet<usize>>,
-    ref_suffix: &str,
-    recovery_threshold: f64,
-    recovery_window: usize,
-    debug: i32,
-    log_dir: &Option<String>,
-) -> Vec<(String, Vec<u8>)> {
-    if records.is_empty() {
-        return Vec::new();
-    }
-
-    let aln_len = records[0].1.len();
-    let ref_seqs: Vec<&[u8]> = records
-        .iter()
-        .filter(|(h, _)| h.ends_with(ref_suffix))
-        .map(|(_, s)| s.as_slice())
-        .collect();
-
-    if ref_seqs.is_empty() {
-        return records.to_vec();
-    }
-
-    // Build per-column ref character sets, considering only positions
-    // inside each reference's data range (between first and last
-    // non-gap character).
-    let mut ref_char_sets: Vec<HashSet<u8>> = vec![HashSet::new(); aln_len];
-    for rseq in &ref_seqs {
-        let first = rseq.iter().position(|&c| c != b'-');
-        let last = rseq.iter().rposition(|&c| c != b'-');
-        if let (Some(f), Some(l)) = (first, last) {
-            for i in f..=l {
-                let c = rseq[i];
-                if c != b'-' && c != b'*' {
-                    ref_char_sets[i].insert(c);
-                }
-            }
-        }
-    }
-
-    let mut stop_log: Vec<(String, usize, String, usize)> = Vec::new();
-    let mut result = Vec::with_capacity(records.len());
-
-    for (header, seq) in records {
-        if header.ends_with(ref_suffix) {
-            result.push((header.clone(), seq.clone()));
-            continue;
-        }
-
-        // Fast path: no stops remaining.
-        if !seq.contains(&b'*') {
-            result.push((header.clone(), seq.clone()));
-            continue;
-        }
-
-        // Find data range.
-        let data_start = match seq.iter().position(|&c| c != b'-') {
-            Some(p) => p,
-            None => {
-                result.push((header.clone(), seq.clone()));
-                continue;
-            }
-        };
-        let data_end = seq.iter().rposition(|&c| c != b'-').unwrap() + 1;
-
-        // Collect stop positions.
-        let stops: Vec<usize> = (data_start..data_end)
-            .filter(|&i| seq[i] == b'*')
-            .collect();
-
-        if stops.is_empty() {
-            result.push((header.clone(), seq.clone()));
-            continue;
-        }
-
-        // Helper: collect scorable (column, matches_ref) pairs.
-        let collect_scorable = |range_iter: Box<dyn Iterator<Item = usize>>| -> Vec<(usize, bool)> {
-            range_iter
-                .filter_map(|i| {
-                    let c = seq[i];
-                    if c == b'-' || c == b'*' {
-                        return None;
-                    }
-                    if ref_char_sets[i].is_empty() {
-                        return None;
-                    }
-                    Some((i, ref_char_sets[i].contains(&c)))
-                })
-                .collect()
-        };
-
-        // Helper: scan outward from a stop, return the column where
-        // good sequence resumes (or the data edge if it never does).
-        let find_recovery = |positions: &[(usize, bool)], toward_start: bool| -> usize {
-            if positions.len() < recovery_window {
-                // Not enough scorable positions to fill a window.
-                return if toward_start { data_start } else { data_end };
-            }
-            let required = (recovery_window as f64 * recovery_threshold).ceil() as usize;
-            for w in 0..=(positions.len() - recovery_window) {
-                let w_matches = positions[w..w + recovery_window]
-                    .iter()
-                    .filter(|(_, m)| *m)
-                    .count();
-                if w_matches >= required {
-                    // Recovery window found.  Advance past leading
-                    // mismatches so only matching residues are kept.
-                    for j in w..w + recovery_window {
-                        if positions[j].1 {
-                            return positions[j].0;
-                        }
-                    }
-                }
-            }
-            // No recovery found.
-            if toward_start { data_start } else { data_end }
-        };
-
-        let mut cols_to_mask: HashSet<usize> = HashSet::new();
-
-        for &star in &stops {
-            // Always mask the stop itself.
-            cols_to_mask.insert(star);
-
-            // Scan RIGHT from stop.
-            let right_positions = collect_scorable(
-                Box::new((star + 1)..data_end),
-            );
-            let recovery_right = find_recovery(&right_positions, false);
-            let right_had_garbage = recovery_right > star + 1;
-            if right_had_garbage {
-                cols_to_mask.extend((star + 1)..recovery_right);
-                if debug >= 1 {
-                    stop_log.push((
-                        header.clone(),
-                        star,
-                        "right".to_string(),
-                        recovery_right,
-                    ));
-                }
-            }
-
-            // Scan LEFT from stop.
-            let left_positions = collect_scorable(
-                Box::new((data_start..star).rev()),
-            );
-            let recovery_left = find_recovery(&left_positions, true);
-            let left_had_garbage;
-            if recovery_left == data_start {
-                // No recovery: mask entire left side.
-                left_had_garbage = true;
-                cols_to_mask.extend(data_start..star);
-                if debug >= 1 {
-                    stop_log.push((
-                        header.clone(),
-                        star,
-                        "left_full".to_string(),
-                        data_start,
-                    ));
-                }
-            } else if recovery_left < star && recovery_left + 1 < star {
-                left_had_garbage = true;
-                cols_to_mask.extend((recovery_left + 1)..star);
-                if debug >= 1 {
-                    stop_log.push((
-                        header.clone(),
-                        star,
-                        "left".to_string(),
-                        recovery_left,
-                    ));
-                }
-            } else {
-                left_had_garbage = false;
-            }
-
-            // If garbage was found on exactly one side, the stop is a
-            // frameshift artifact.  Toss the smaller surviving fragment.
-            if left_had_garbage != right_had_garbage {
-                let left_residues = (data_start..star)
-                    .filter(|&i| seq[i] != b'-' && seq[i] != b'*' && !cols_to_mask.contains(&i))
-                    .count();
-                let right_residues = (star + 1..data_end)
-                    .filter(|&i| seq[i] != b'-' && seq[i] != b'*' && !cols_to_mask.contains(&i))
-                    .count();
-
-                if left_residues < right_residues && left_residues > 0 {
-                    cols_to_mask.extend(data_start..star);
-                    if debug >= 1 {
-                        stop_log.push((
-                            header.clone(),
-                            star,
-                            "left_orphan".to_string(),
-                            left_residues,
-                        ));
-                    }
-                } else if right_residues < left_residues && right_residues > 0 {
-                    cols_to_mask.extend((star + 1)..data_end);
-                    if debug >= 1 {
-                        stop_log.push((
-                            header.clone(),
-                            star,
-                            "right_orphan".to_string(),
-                            right_residues,
-                        ));
-                    }
-                }
-            }
-        }
-
-        if cols_to_mask.is_empty() {
-            result.push((header.clone(), seq.clone()));
-        } else {
-            let mut masked = seq.clone();
-            for &i in &cols_to_mask {
-                if i < masked.len() {
-                    masked[i] = b'-';
-                }
-            }
-            intron_columns
-                .entry(header.clone())
-                .or_default()
-                .extend(&cols_to_mask);
-            result.push((header.clone(), masked));
-        }
-    }
-
-    // Debug log.
-    if !stop_log.is_empty() && debug >= 1 {
-        if let Some(ld) = log_dir {
-            let log_path = Path::new(ld).join("stop_side_trim_debug.csv");
-            let write_header = !log_path.exists();
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-            {
-                if write_header {
-                    let _ = writeln!(
-                        f,
-                        "header,stop_col,side,recovery_col"
-                    );
-                }
-                for (h, stop_col, side, recovery_col) in &stop_log {
-                    let safe = if h.contains(',') {
-                        format!("\"{}\"", h)
-                    } else {
-                        h.clone()
-                    };
-                    let _ = writeln!(
-                        f,
-                        "{},{},{},{}",
-                        safe, stop_col, side, recovery_col
-                    );
-                }
-            }
-        }
-    }
-
-    result
 }
 
 fn scan_gap_run(seq: &[u8], ref_has_data: &[bool], start: usize) -> (usize, usize) {
@@ -888,7 +896,6 @@ fn classify_intron_splits(orig_seq: &[u8], intron_cols: &HashSet<usize>) -> Vec<
     nt_seqs = None,
     debug = 0,
     log_dir = None,
-    stop_codon_side_threshold = 0.50,
 ))]
 pub fn cull_columns(
     records: Vec<(String, String)>,
@@ -904,7 +911,6 @@ pub fn cull_columns(
     nt_seqs: Option<HashMap<String, String>>,
     debug: i32,
     log_dir: Option<String>,
-    stop_codon_side_threshold: f64,
 ) -> PyResult<(
     Vec<(String, String)>,
     HashMap<String, HashSet<usize>>,
@@ -934,84 +940,34 @@ pub fn cull_columns(
         }
     }
 
-    // Detect and mask retained introns.
-    let (after_intron, mut intron_masked_cols) =
-        mask_retained_introns(&normalized, ref_suffix, &nt_seqs, min_ref_supported_gap, debug, &log_dir);
 
-    // Mask low-quality sides of internal stop codons.
-    let after_stop_sides = if stop_codon_side_threshold > 0.0 {
-        mask_stop_sides(
-            &after_intron,
-            &mut intron_masked_cols,
-            ref_suffix,
-            stop_codon_side_threshold,
-            8, // recovery_window
-            debug,
-            &log_dir,
-        )
-    } else {
-        after_intron
-    };
-
-    // Gap cull: remove all-gap columns. Use Vec<bool> instead of HashSet.
-    let mut gap_cull_mask = vec![false; aln_len];
-    let mut gap_cull_count = 0usize;
-    if gap_cull_threshold > 0.0 {
-        let mut col_non_gap = vec![0usize; aln_len];
-        for (_, seq) in &after_stop_sides {
-            for (i, &ch) in seq.iter().enumerate() {
-                if ch != b'-' {
-                    col_non_gap[i] += 1;
-                }
-            }
-        }
-        for i in 0..aln_len {
-            if col_non_gap[i] == 0 {
-                gap_cull_mask[i] = true;
-                gap_cull_count += 1;
-            }
+    // ---------------------------------------------------------------
+    // Cumulative removal tracker: one Vec<bool> per non-ref record,
+    // always in original column space.  Every cull marks into this.
+    // ---------------------------------------------------------------
+    let mut removed_columns: HashMap<String, Vec<bool>> = HashMap::new();
+    let mut intron_removed_original: HashMap<String, HashSet<usize>> = HashMap::new();
+    for (h, _) in &normalized {
+        if !h.ends_with(ref_suffix) {
+            removed_columns.insert(h.clone(), vec![false; orig_aln_len]);
         }
     }
 
-    let after_gap_cull: Vec<(String, Vec<u8>)>;
-    let orig_index_map: Option<Vec<usize>>;
+    // ---------------------------------------------------------------
+    // Step 1: Ref edge cull + data boundary + sparse tail trim
+    // ---------------------------------------------------------------
 
-    if gap_cull_count > 0 {
-        let oimap: Vec<usize> = (0..aln_len)
-            .filter(|&i| !gap_cull_mask[i])
-            .collect();
-        after_gap_cull = after_stop_sides
-            .iter()
-            .map(|(h, s)| {
-                let new_seq: Vec<u8> = oimap.iter().map(|&i| s[i]).collect();
-                (h.clone(), new_seq)
-            })
-            .collect();
-        aln_len = oimap.len();
-        orig_index_map = Some(oimap);
-    } else {
-        after_gap_cull = after_stop_sides;
-        orig_index_map = None;
-    }
-
-    let current_to_orig: Vec<usize> = match &orig_index_map {
-        Some(m) => m.clone(),
-        None => (0..aln_len).collect(),
-    };
-
-    let ref_seqs: Vec<&[u8]> = after_gap_cull
+    let ref_seqs_pre: Vec<&[u8]> = normalized
         .iter()
         .filter(|(h, _)| h.ends_with(ref_suffix))
         .map(|(_, s)| s.as_slice())
         .collect();
 
-    // Edge columns as Vec<bool>.
     let mut edge_mask = vec![false; aln_len];
 
-    // Compute ref_non_gap
-    let ref_non_gap: Option<Vec<usize>> = if !ref_seqs.is_empty() {
+    let ref_non_gap: Option<Vec<usize>> = if !ref_seqs_pre.is_empty() {
         let mut rng = vec![0usize; aln_len];
-        for seq in &ref_seqs {
+        for seq in &ref_seqs_pre {
             for (i, &ch) in seq.iter().enumerate() {
                 if ch != b'-' {
                     rng[i] += 1;
@@ -1023,10 +979,9 @@ pub fn cull_columns(
         None
     };
 
-    // Edge trimming.
     if include_edge {
         if let Some(rng) = &ref_non_gap {
-            let n_refs = ref_seqs.len() as f64;
+            let n_refs = ref_seqs_pre.len() as f64;
             let mut left = 0usize;
             while left < aln_len {
                 if (rng[left] as f64 / n_refs) >= edge_ref_data_fraction {
@@ -1055,9 +1010,18 @@ pub fn cull_columns(
         }
     }
 
-    // ref_has_data
+    // Record edge mask.
+    for (h, _) in &normalized {
+        if h.ends_with(ref_suffix) { continue; }
+        if let Some(rv) = removed_columns.get_mut(h) {
+            for i in 0..orig_aln_len {
+                if edge_mask[i] { rv[i] = true; }
+            }
+        }
+    }
+
     let ref_has_data: Vec<bool> = if let Some(rng) = &ref_non_gap {
-        let n_refs = ref_seqs.len() as f64;
+        let n_refs = ref_seqs_pre.len() as f64;
         (0..aln_len)
             .map(|i| (1.0 - (rng[i] as f64 / n_refs)) < max_allowed_gaps_in_ref)
             .collect()
@@ -1065,19 +1029,12 @@ pub fn cull_columns(
         vec![false; aln_len]
     };
 
-    let mut masked_records: Vec<(String, Vec<u8>)> = Vec::new();
-    // Store trim masks as Vec<bool> instead of HashSet<usize>.
-    let mut trim_masks: Vec<Vec<bool>> = Vec::new();
-
-    // Process each record. Single combined mask per record instead of two mask_columns calls.
-    for (idx, (header, _)) in records.iter().enumerate() {
-        let seq = &after_gap_cull[idx].1;
-
-        // Start with edge mask as base.
+    // Per-sequence: edge mask + data boundary + sparse tail.
+    let mut structural_masks: Vec<Vec<bool>> = Vec::new();
+    for (header, seq) in &normalized {
         let mut combined_mask = edge_mask.clone();
 
-        if !header.ends_with(ref_suffix) && !ref_seqs.is_empty() {
-            // Apply edge mask to find data boundaries.
+        if !header.ends_with(ref_suffix) && !ref_seqs_pre.is_empty() {
             let first_data = seq.iter().enumerate().position(|(i, &c)| c != b'-' && !edge_mask[i]);
             let (start, end_data) = if let Some(fd) = first_data {
                 let last_data = seq.iter().enumerate().rposition(|(i, &c)| c != b'-' && !edge_mask[i]).unwrap();
@@ -1086,7 +1043,6 @@ pub fn cull_columns(
                 (0usize, 0usize)
             };
 
-            // Trim outside data region.
             for i in 0..start {
                 combined_mask[i] = true;
             }
@@ -1094,35 +1050,19 @@ pub fn cull_columns(
                 combined_mask[i] = true;
             }
 
-            // Build effective sequence for block picking (apply combined mask so far).
             let eb: Vec<u8> = seq.iter().enumerate().map(|(i, &c)| {
                 if combined_mask[i] { b'-' } else { c }
             }).collect();
 
             let left_trim_point = pick_final_block_start(
-                &eb,
-                &ref_has_data,
-                min_ref_supported_gap,
-                anchor_run,
-                tail_max_data,
+                &eb, &ref_has_data, min_ref_supported_gap, anchor_run, tail_max_data,
             );
-
             let right_trim_point = trim_sparse_tail_end(
-                &eb,
-                &ref_has_data,
-                left_trim_point,
-                min_ref_supported_gap,
-                anchor_run,
-                tail_max_data,
+                &eb, &ref_has_data, left_trim_point, min_ref_supported_gap, anchor_run, tail_max_data,
             );
 
-            // Count AA trimmed for debug.
-            let left_aa_trimmed = (start..left_trim_point)
-                .filter(|&i| eb[i] != b'-')
-                .count();
-            let right_aa_trimmed = (right_trim_point..end_data)
-                .filter(|&i| eb[i] != b'-')
-                .count();
+            let left_aa_trimmed = (start..left_trim_point).filter(|&i| eb[i] != b'-').count();
+            let right_aa_trimmed = (right_trim_point..end_data).filter(|&i| eb[i] != b'-').count();
             if left_aa_trimmed > 0 || right_aa_trimmed > 0 {
                 gap_cull_log.push((header.clone(), left_aa_trimmed, right_aa_trimmed));
             }
@@ -1133,22 +1073,131 @@ pub fn cull_columns(
             for i in right_trim_point..aln_len {
                 combined_mask[i] = true;
             }
+
+            // Record into removed_columns.
+            if let Some(rv) = removed_columns.get_mut(header) {
+                for i in 0..orig_aln_len {
+                    if combined_mask[i] { rv[i] = true; }
+                }
+            }
         }
 
-        // Apply combined mask in one pass.
-        let mut masked_seq = seq.clone();
-        mask_columns_bool(&mut masked_seq, &combined_mask);
+        structural_masks.push(combined_mask);
+    }
 
-        // Min length filter.
+    // Apply structural masks.
+    let after_structural: Vec<(String, Vec<u8>)> = normalized
+        .iter()
+        .zip(structural_masks.iter())
+        .map(|((h, seq), mask)| {
+            let mut masked = seq.clone();
+            mask_columns_bool(&mut masked, mask);
+            (h.clone(), masked)
+        })
+        .collect();
+
+    // ---------------------------------------------------------------
+    // Step 2: Gap cull (remove all-gap columns from structural trims)
+    // ---------------------------------------------------------------
+
+    let gap_cull_mask: Vec<bool> = {
+        let mut col_non_gap = vec![0usize; aln_len];
+        for (_, seq) in &after_structural {
+            for (i, &ch) in seq.iter().enumerate() {
+                if ch != b'-' {
+                    col_non_gap[i] += 1;
+                }
+            }
+        }
+        (0..aln_len).map(|i| col_non_gap[i] == 0).collect()
+    };
+
+    // Record gap cull (original space).
+    for (h, _) in &normalized {
+        if h.ends_with(ref_suffix) { continue; }
+        if let Some(rv) = removed_columns.get_mut(h) {
+            for i in 0..orig_aln_len {
+                if gap_cull_mask[i] { rv[i] = true; }
+            }
+        }
+    }
+
+    // Build column index map: post-gap-cull col -> original col.
+    let current_to_orig: Vec<usize> = (0..orig_aln_len)
+        .filter(|&i| !gap_cull_mask[i])
+        .collect();
+
+    let after_gap_cull: Vec<(String, Vec<u8>)> = if current_to_orig.len() < orig_aln_len {
+        after_structural
+            .iter()
+            .map(|(h, s)| {
+                let new_seq: Vec<u8> = current_to_orig.iter().map(|&i| s[i]).collect();
+                (h.clone(), new_seq)
+            })
+            .collect()
+    } else {
+        after_structural
+    };
+
+    aln_len = current_to_orig.len();
+
+    // ---------------------------------------------------------------
+    // Step 3: Retained intron detection (on structurally clean aln)
+    // ---------------------------------------------------------------
+
+    let (after_intron, intron_masked_cols) =
+        mask_retained_introns(&after_gap_cull, ref_suffix, &nt_seqs, min_ref_supported_gap, debug, &log_dir);
+
+    // Record intron masked cols (post-gap-cull space -> original).
+    for (header, cols) in &intron_masked_cols {
+        for &col in cols {
+            if col < current_to_orig.len() {
+                let orig_col = current_to_orig[col];
+                if let Some(rv) = removed_columns.get_mut(header) {
+                    if orig_col < rv.len() { rv[orig_col] = true; }
+                }
+                intron_removed_original.entry(header.clone()).or_default().insert(orig_col);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Step 4: Stop codon BLOSUM trim
+    // ---------------------------------------------------------------
+
+    let (after_stop_trim, stop_masked_cols) =
+        mask_stop_blosum(&after_intron, ref_suffix, debug, &log_dir);
+
+    // Record stop masked cols (post-gap-cull space -> original).
+    for (header, cols) in &stop_masked_cols {
+        for &col in cols {
+            if col < current_to_orig.len() {
+                let orig_col = current_to_orig[col];
+                if let Some(rv) = removed_columns.get_mut(header) {
+                    if orig_col < rv.len() { rv[orig_col] = true; }
+                }
+                intron_removed_original.entry(header.clone()).or_default().insert(orig_col);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Step 5: Min length filter + global empty column removal
+    // ---------------------------------------------------------------
+
+    let mut masked_records: Vec<(String, Vec<u8>)> = Vec::new();
+    for (idx, (header, _)) in records.iter().enumerate() {
+        if idx >= after_stop_trim.len() { continue; }
+        let seq = &after_stop_trim[idx].1;
+
         if !header.ends_with(ref_suffix) && min_seq_len > 0 {
-            let non_gap = masked_seq.iter().filter(|&&c| c != b'-').count();
+            let non_gap = seq.iter().filter(|&&c| c != b'-').count();
             if non_gap < min_seq_len {
                 continue;
             }
         }
 
-        masked_records.push((header.clone(), masked_seq));
-        trim_masks.push(combined_mask);
+        masked_records.push((header.clone(), seq.clone()));
     }
 
     if masked_records.is_empty() {
@@ -1157,20 +1206,38 @@ pub fn cull_columns(
 
     // Global empty column removal.
     let masked_len = masked_records[0].1.len();
-    let mut masked_non_gap = vec![0usize; masked_len];
-    for (_, seq) in &masked_records {
-        for (i, &ch) in seq.iter().enumerate() {
-            if ch != b'-' {
-                masked_non_gap[i] += 1;
+    let mut global_empty_mask = vec![false; masked_len];
+    let mut has_global_empty = false;
+    {
+        let mut masked_non_gap = vec![0usize; masked_len];
+        for (_, seq) in &masked_records {
+            for (i, &ch) in seq.iter().enumerate() {
+                if ch != b'-' {
+                    masked_non_gap[i] += 1;
+                }
+            }
+        }
+        for i in 0..masked_len {
+            if masked_non_gap[i] == 0 {
+                global_empty_mask[i] = true;
+                has_global_empty = true;
             }
         }
     }
-    let mut global_empty_mask = vec![false; masked_len];
-    let mut has_global_empty = false;
-    for i in 0..masked_len {
-        if masked_non_gap[i] == 0 {
-            global_empty_mask[i] = true;
-            has_global_empty = true;
+
+    // Record global empty (map through current_to_orig).
+    if has_global_empty {
+        for (i, &is_empty) in global_empty_mask.iter().enumerate() {
+            if !is_empty { continue; }
+            if i < current_to_orig.len() {
+                let orig_col = current_to_orig[i];
+                for (h, _) in &normalized {
+                    if h.ends_with(ref_suffix) { continue; }
+                    if let Some(rv) = removed_columns.get_mut(h) {
+                        if orig_col < rv.len() { rv[orig_col] = true; }
+                    }
+                }
+            }
         }
     }
 
@@ -1178,91 +1245,38 @@ pub fn cull_columns(
         let keep_indices: Vec<usize> = (0..masked_len)
             .filter(|&i| !global_empty_mask[i])
             .collect();
-        masked_records
-            .iter()
-            .map(|(h, s)| {
-                let new_seq: String = keep_indices.iter().map(|&i| s[i] as char).collect();
-                (h.clone(), new_seq)
-            })
-            .collect()
+        masked_records.iter().map(|(h, s)| {
+            let new_seq: String = keep_indices.iter().map(|&i| s[i] as char).collect();
+            (h.clone(), new_seq)
+        }).collect()
     } else {
-        masked_records
-            .iter()
-            .map(|(h, s)| {
-                let new_seq: String = s.iter().map(|&c| c as char).collect();
-                (h.clone(), new_seq)
-            })
-            .collect()
+        masked_records.iter().map(|(h, s)| {
+            let new_seq: String = s.iter().map(|&c| c as char).collect();
+            (h.clone(), new_seq)
+        }).collect()
     };
 
-    let global_empty_original: Vec<bool> = {
-        let mut v = vec![false; orig_aln_len];
-        for (i, &is_empty) in global_empty_mask.iter().enumerate() {
-            if is_empty && i < current_to_orig.len() {
-                v[current_to_orig[i]] = true;
-            }
-        }
-        v
-    };
+    // ---------------------------------------------------------------
+    // Build output maps from removed_columns
+    // ---------------------------------------------------------------
 
-    // Build nt_trim_map, gff_trim_map.
     let mut nt_trim_map: HashMap<String, HashSet<usize>> = HashMap::new();
     let mut gff_trim_map: HashMap<String, (usize, usize)> = HashMap::new();
 
-    for (rec_i, (header, _)) in masked_records.iter().enumerate() {
-        if header.ends_with(ref_suffix) {
-            continue;
-        }
-
-        let trim_mask = &trim_masks[rec_i];
-
-        // Build removed_original as Vec<bool> over orig_aln_len.
-        let mut removed_original = vec![false; orig_aln_len];
-
-        // gap_cull_mask columns
-        for i in 0..orig_aln_len {
-            if gap_cull_mask[i] {
-                removed_original[i] = true;
-            }
-        }
-
-        // trim mask mapped back through current_to_orig
-        for (i, &is_trimmed) in trim_mask.iter().enumerate() {
-            if is_trimmed && i < current_to_orig.len() {
-                removed_original[current_to_orig[i]] = true;
-            }
-        }
-
-        // global empty
-        for i in 0..orig_aln_len {
-            if global_empty_original[i] {
-                removed_original[i] = true;
-            }
-        }
-
-        // intron masked cols
-        let intron_cols = intron_masked_cols.get(header.as_str());
-        if let Some(ic) = intron_cols {
-            for &col in ic {
-                if col < orig_aln_len {
-                    removed_original[col] = true;
-                }
-            }
-        }
+    for (header, removed) in &removed_columns {
+        if !masked_records.iter().any(|(h, _)| h == header) { continue; }
 
         let orig_seq = orig_seq_map.get(header.as_str()).copied().unwrap_or(&[] as &[u8]);
-        let drops = codon_drops_from_mask(orig_seq, &removed_original);
+        let drops = codon_drops_from_mask(orig_seq, removed);
         if !drops.is_empty() {
             nt_trim_map.insert(header.clone(), drops);
         }
 
-        // edge_removed = removed_original minus intron cols
-        let mut edge_removed = removed_original.clone();
-        if let Some(ic) = intron_cols {
+        // gff_trim_map: edge trims only (removed minus intron cols).
+        let mut edge_removed = removed.clone();
+        if let Some(ic) = intron_removed_original.get(header.as_str()) {
             for &col in ic {
-                if col < orig_aln_len {
-                    edge_removed[col] = false;
-                }
+                if col < orig_aln_len { edge_removed[col] = false; }
             }
         }
         if let Some(trims) = count_edge_residue_trims_from_removed(orig_seq, &edge_removed) {
@@ -1272,57 +1286,35 @@ pub fn cull_columns(
         }
     }
 
-    // Build gff_intron_map and exon_split_map in one pass over intron_masked_cols.
+    // Build gff_intron_map and exon_split_map from intron_removed_original
+    // (already in original column space).
     let mut gff_intron_map: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     let mut exon_split_map: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
 
-    for (header, cols) in &intron_masked_cols {
+    for (header, orig_cols) in &intron_removed_original {
         let orig_seq = match orig_seq_map.get(header.as_str()) {
             Some(s) => *s,
             None => continue,
         };
 
-        // Compute blocks once, reuse for both maps.
-        let blocks = group_contiguous_blocks(cols);
-
-        // gff_intron_map
+        let blocks = group_contiguous_blocks(orig_cols);
         let mut splits: Vec<(usize, usize)> = Vec::new();
         for &(block_start, block_end) in &blocks {
-            let res_offset = orig_seq[..block_start]
-                .iter()
-                .filter(|&&c| c != b'-')
-                .count();
-            let intron_res = (block_start..block_end)
-                .filter(|&i| orig_seq[i] != b'-')
-                .count();
-            if intron_res > 0 {
-                splits.push((res_offset, intron_res));
-            }
+            let res_offset = orig_seq[..block_start].iter().filter(|&&c| c != b'-').count();
+            let intron_res = (block_start..block_end).filter(|&i| orig_seq[i] != b'-').count();
+            if intron_res > 0 { splits.push((res_offset, intron_res)); }
         }
-        if !splits.is_empty() {
-            gff_intron_map.insert(header.clone(), splits);
-        }
+        if !splits.is_empty() { gff_intron_map.insert(header.clone(), splits); }
 
-        // exon_split_map
-        let exons = classify_intron_splits(orig_seq, cols);
-        if exons.len() > 1 {
-            exon_split_map.insert(header.clone(), exons);
-        }
+        let exons = classify_intron_splits(orig_seq, orig_cols);
+        if exons.len() > 1 { exon_split_map.insert(header.clone(), exons); }
     }
-
-    // Debug CSV
     if !gap_cull_log.is_empty() && debug >= 1 {
         if let Some(ld) = &log_dir {
             let log_path = Path::new(ld).join("gap_cull_debug.csv");
-            let write_header = !log_path.exists();
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
+            if let Ok(mut f) = File::create(&log_path)
             {
-                if write_header {
-                    let _ = writeln!(f, "header,left_aa_trimmed,right_aa_trimmed");
-                }
+                let _ = writeln!(f, "header,left_aa_trimmed,right_aa_trimmed");
                 for (h, left, right) in &gap_cull_log {
                     let safe = if h.contains(',') {
                         format!("\"{}\"", h)

@@ -1724,9 +1724,18 @@ fn find_input_folder(folder: &Path, sub_dir: &str) -> Option<std::path::PathBuf>
 }
 
 #[pyfunction]
-#[pyo3(signature = (folder, sub_dir))]
-pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyObject> {
+#[pyo3(signature = (folder, sub_dir, taxa_path))]
+pub fn exon_dp(
+    py: Python<'_>,
+    folder: String,
+    sub_dir: String,
+    taxa_path: String,
+) -> PyResult<PyObject> {
+    // `folder` is the per-orthoset root (<taxa>/<orthoset>); subdirs like
+    // outlier/<sub_dir> live under it. `taxa_path` is the parent <taxa> folder
+    // and holds the shared sequences RocksDB.
     let folder_path = Path::new(&folder);
+    let taxa_path_p = Path::new(&taxa_path);
 
     let input_folder = find_input_folder(folder_path, &sub_dir).ok_or_else(|| {
         pyo3::exceptions::PyFileNotFoundError::new_err(format!(
@@ -1764,7 +1773,7 @@ pub fn exon_dp(py: Python<'_>, folder: String, sub_dir: String) -> PyResult<PyOb
         return Ok(output.into());
     }
 
-    let rocksdb_path = folder_path.join("rocksdb").join("sequences").join("nt");
+    let rocksdb_path = taxa_path_p.join("sequences").join("nt");
     let genome = load_genome_from_rocksdb(&rocksdb_path.to_string_lossy(), &needed_scaffolds);
 
     if genome.is_empty() {

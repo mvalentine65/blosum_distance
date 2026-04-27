@@ -195,8 +195,15 @@ fn delete_empty_columns_pairs(records: Vec<(String, String)>) -> Vec<(String, St
 /// Sliding-window low-complexity check on a nucleotide sequence.
 ///
 /// Mirrors `sapphyre.utils.low_complexity.is_low_complexity_nt` but runs the
-/// inner counting / entropy loops in Rust.  Returns `true` if any window in
-/// any non-N segment falls below either entropy threshold.
+/// inner counting / entropy loops in Rust.
+///
+/// Each window in each non-N segment is scored against the dinucleotide and
+/// trinucleotide entropy thresholds.  Failing windows are tallied across all
+/// segments; the sequence is flagged only when both the failing fraction and
+/// the absolute failing bp coverage exceed their thresholds.  This avoids
+/// false positives where a single localized compositionally-biased region
+/// (e.g. a polyK / polyE protein tail encoded with AAG / GAA codons) triggers
+/// removal of an otherwise normal coding sequence.
 #[pyfunction]
 #[pyo3(signature = (
     seq,
@@ -205,6 +212,9 @@ fn delete_empty_columns_pairs(records: Vec<(String, String)>) -> Vec<(String, St
     dinuc_entropy_threshold = 2.5,
     trinuc_entropy_threshold = 3.75,
     min_segment_length = 30,
+    min_failing_fraction = 0.5,
+    min_failing_bp = 100,
+    min_total_windows = 4,
 ))]
 fn is_low_complexity_nt(
     seq: &str,
@@ -213,6 +223,9 @@ fn is_low_complexity_nt(
     dinuc_entropy_threshold: f64,
     trinuc_entropy_threshold: f64,
     min_segment_length: usize,
+    min_failing_fraction: f64,
+    min_failing_bp: usize,
+    min_total_windows: usize,
 ) -> bool {
     // Encode bases A/C/G/T -> 0..3, anything else -> 4 ("N").
     let mut codes = Vec::with_capacity(seq.len());
@@ -264,6 +277,13 @@ fn is_low_complexity_nt(
         (log_total - sum_clogc * inv_total) / std::f64::consts::LN_2
     };
 
+    // Cross-segment aggregation.  We track failing windows (count and bp
+    // coverage) and total windows so the fraction threshold is applied once
+    // at the end rather than short-circuiting on the first failure.
+    let mut total_windows: usize = 0;
+    let mut failing_windows: usize = 0;
+    let mut failing_bp: usize = 0;
+
     for (seg_start, seg_end) in segments {
         let seg_len = seg_end - seg_start + 1;
         if seg_len < min_segment_length {
@@ -271,9 +291,11 @@ fn is_low_complexity_nt(
         }
 
         // Helper that evaluates one window over the segment.
-        let mut check_window = |wstart: usize, wend: usize| -> bool {
+        // Returns (failed, window_bp).
+        let check_window = |wstart: usize, wend: usize| -> (bool, usize) {
             let abs_start = seg_start + wstart;
             let abs_end = seg_start + wend; // inclusive
+            let win_bp = wend - wstart + 1;
 
             // Dinucleotides: positions abs_start..abs_end (i to i+1)
             let mut di = [0u32; 16];
@@ -292,7 +314,7 @@ fn is_low_complexity_nt(
                 entropy_from_counts(&di, di_total)
             };
             if dinuc_h < dinuc_entropy_threshold {
-                return true;
+                return (true, win_bp);
             }
 
             // Trinucleotides: positions abs_start..abs_end-1 (i to i+2)
@@ -315,38 +337,56 @@ fn is_low_complexity_nt(
                     entropy_from_counts(&tri, tri_total)
                 };
                 if trinuc_h < trinuc_entropy_threshold {
-                    return true;
+                    return (true, win_bp);
                 }
             }
 
-            false
+            (false, win_bp)
         };
 
-        // Sliding windows over the segment.
+        // Sliding windows over the segment.  Accumulate into the cross-segment
+        // tallies rather than returning early on the first failure.
         if window_size >= seg_len {
-            if check_window(0, seg_len - 1) {
-                return true;
+            let (failed, win_bp) = check_window(0, seg_len - 1);
+            total_windows += 1;
+            if failed {
+                failing_windows += 1;
+                failing_bp += win_bp;
             }
             continue;
         }
 
         let mut w = 0usize;
         while w + window_size <= seg_len {
-            if check_window(w, w + window_size - 1) {
-                return true;
+            let (failed, win_bp) = check_window(w, w + window_size - 1);
+            total_windows += 1;
+            if failed {
+                failing_windows += 1;
+                failing_bp += win_bp;
             }
             w += step;
         }
         // Tail window aligned to the end if it isn't already covered.
         let last_start = seg_len - window_size;
         if last_start > w.saturating_sub(step) {
-            if check_window(last_start, seg_len - 1) {
-                return true;
+            let (failed, win_bp) = check_window(last_start, seg_len - 1);
+            total_windows += 1;
+            if failed {
+                failing_windows += 1;
+                failing_bp += win_bp;
             }
         }
     }
 
-    false
+    // Need a minimum number of windows before any verdict can be trusted.
+    // Very short sequences with one or two windows shouldn't be flaggable on
+    // a single failing window.
+    if total_windows < min_total_windows {
+        return false;
+    }
+
+    let failing_fraction = failing_windows as f64 / total_windows as f64;
+    failing_fraction >= min_failing_fraction && failing_bp >= min_failing_bp
 }
 
 fn find_question_marks(sequences: Vec<&[u8]>, start: usize, stop: usize) -> HashSet<usize> {

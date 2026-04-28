@@ -112,7 +112,7 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
     ]);
     for i in 0..length {
         let mut char1 = cand_bytes[i];
-        let mut char2 = ref_bytes[i];
+        let char2 = ref_bytes[i];
         if cand_bytes[i] == 45 {
             char1 = b'*';
         }

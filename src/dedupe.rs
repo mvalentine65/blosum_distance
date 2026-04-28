@@ -125,15 +125,6 @@ fn forward_is_canonical(seq: &[u8]) -> bool {
     true
 }
 
-#[inline]
-fn get_canonical(seq: &[u8]) -> Vec<u8> {
-    if forward_is_canonical(seq) {
-        seq.to_vec()
-    } else {
-        seq.iter().rev().map(|&b| complement(b)).collect()
-    }
-}
-
 fn open_reader(path: &PathBuf) -> Result<Box<dyn Read + Send>> {
     let f = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let br = BufReader::with_capacity(8 << 20, f);

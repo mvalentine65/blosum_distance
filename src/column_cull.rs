@@ -222,8 +222,8 @@ fn mask_stop_blosum(
             }
 
             // Score both fragments.
-            let (left_score, left_scored) = score_fragment(seq, &pssm, data_start, star);
-            let (right_score, right_scored) = score_fragment(seq, &pssm, star + 1, data_end);
+            let (left_score, _left_scored) = score_fragment(seq, &pssm, data_start, star);
+            let (right_score, _right_scored) = score_fragment(seq, &pssm, star + 1, data_end);
 
             // Determine smaller/larger.
             let (smaller_score, larger_score, trim_side) = if aa_right <= aa_left {
@@ -929,8 +929,9 @@ pub fn cull_columns(
         .iter()
         .map(|(h, s)| (h.as_str(), s.as_slice()))
         .collect();
+    let _ = gap_cull_threshold;
     let orig_aln_len = normalized[0].1.len();
-    let mut aln_len = orig_aln_len;
+    let aln_len = orig_aln_len;
 
     for (_, seq) in &normalized {
         if seq.len() != aln_len {
@@ -1138,8 +1139,6 @@ pub fn cull_columns(
     } else {
         after_structural
     };
-
-    aln_len = current_to_orig.len();
 
     // ---------------------------------------------------------------
     // Step 3: Retained intron detection (on structurally clean aln)

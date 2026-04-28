@@ -154,54 +154,42 @@ fn find_right_bound(
     scaffold_len
 }
 
-/// Count reference gap columns in [gap_start..gap_end).
-fn flank_count_ref_gaps(
-    gap_start: usize,
-    gap_end: usize,
-    ref_consensus: &HashMap<usize, Vec<u8>>,
-    ref_gap_thresh: f64,
-) -> (HashSet<usize>, Vec<usize>, usize) {
-    let mut ref_gaps = HashSet::new();
-    let mut insert_at = Vec::new();
-    let mut longest_consecutive: usize = 0;
-    let mut consecutive_non_gap: usize = 0;
-    for (i, x) in (gap_start..gap_end).enumerate() {
-        let col = ref_consensus.get(&x);
-        let is_gap = if let Some(col) = col {
-            let gap_count = col.iter().filter(|&&c| c == b'-' || c == b' ').count();
-            (gap_count as f64 / col.len() as f64) >= ref_gap_thresh
-        } else {
-            true
-        };
-        if is_gap {
-            ref_gaps.insert(x);
-            insert_at.push(i);
-            longest_consecutive = longest_consecutive.max(consecutive_non_gap);
-            consecutive_non_gap = 0;
-        } else {
-            consecutive_non_gap += 1;
-        }
-    }
-    longest_consecutive = longest_consecutive.max(consecutive_non_gap);
-    (ref_gaps, insert_at, longest_consecutive)
-}
-
 /// Check whether a gap qualifies for scanning. Returns
 /// `Some((effective_gap, scaled_min_aa))` if it does, `None` otherwise.
 fn qualify_gap(
     gap_start: usize,
     gap_end: usize,
-    ref_consensus: &HashMap<usize, Vec<u8>>,
+    is_ref_gap: &[bool],
 ) -> Option<(usize, usize)> {
-    let (ref_gaps, _, _) =
-        flank_count_ref_gaps(gap_start, gap_end, ref_consensus, REF_GAP_THR);
     let total_cols = gap_end - gap_start;
-    let effective_gap = total_cols - ref_gaps.len();
+    let mut ref_gap_count: usize = 0;
+    for x in gap_start..gap_end {
+        // Out-of-range columns are treated as gaps, matching the original
+        // `ref_consensus.get(&x)` None branch behavior.
+        if x >= is_ref_gap.len() || is_ref_gap[x] {
+            ref_gap_count += 1;
+        }
+    }
+    let effective_gap = total_cols - ref_gap_count;
     if effective_gap < MINIMUM_GAP_AA || effective_gap >= MAX_GAP_AA {
         return None;
     }
     let scaled_min_aa = MINIMUM_GAP_AA.max(effective_gap / 2);
     Some((effective_gap, scaled_min_aa))
+}
+
+/// Build a per-column `is_ref_gap` array from a `ref_consensus` map.
+fn build_is_ref_gap(ref_consensus: &HashMap<usize, Vec<u8>>) -> Vec<bool> {
+    let max_col = ref_consensus.keys().copied().max().unwrap_or(0);
+    let mut is_ref_gap = vec![true; max_col + 1];
+    for (&col, vec) in ref_consensus.iter() {
+        if vec.is_empty() {
+            continue;
+        }
+        let gap_count = vec.iter().filter(|&&c| c == b'-' || c == b' ').count();
+        is_ref_gap[col] = (gap_count as f64 / vec.len() as f64) >= REF_GAP_THR;
+    }
+    is_ref_gap
 }
 
 /// Translate nucleotide bytes to amino acid string (standard code).
@@ -295,27 +283,9 @@ fn extract_flank_orfs(
         return raw;
     }
 
-    // Sort by AA length descending for containment check
+    // Sort by AA length descending.  No containment dedup is performed.
     raw.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-
-    let mut kept: Vec<(Vec<u8>, usize, usize, usize)> = Vec::new();
-    for entry in raw {
-        let dominated = kept.iter().any(|k| {
-            let needle = &entry.0;
-            let haystack = &k.0;
-            if needle.len() > haystack.len() {
-                return false;
-            }
-            haystack
-                .windows(needle.len())
-                .any(|w| w == needle.as_slice())
-        });
-        if !dominated {
-            kept.push(entry);
-        }
-    }
-
-    kept
+    raw
 }
 
 /// Extract candidate ORFs from a genomic flank region.
@@ -326,7 +296,7 @@ fn flank_extract_orfs(
     node: &FlankNode,
     is_leading: bool,
     log: &mut Vec<String>,
-    ref_consensus: &HashMap<usize, Vec<u8>>,
+    is_ref_gap: &[bool],
     gff: &HashMap<String, GffEntry>,
     genome: &HashMap<String, Vec<u8>>,
     scaffold_intervals: &HashMap<String, Vec<(usize, usize, String)>>,
@@ -335,7 +305,7 @@ fn flank_extract_orfs(
 ) {
     let direction = if is_leading { "Left leading" } else { "Right trailing" };
 
-    let Some((effective_gap, scaled_min_aa)) = qualify_gap(gap_start, gap_end, ref_consensus) else {
+    let Some((effective_gap, scaled_min_aa)) = qualify_gap(gap_start, gap_end, is_ref_gap) else {
         return;
     };
     let total_cols = gap_end - gap_start;
@@ -561,6 +531,8 @@ fn flank_scan_gene(
         return (log, all_candidates);
     }
 
+    let is_ref_gap = build_is_ref_gap(&ref_consensus);
+
     // Ref median start/end
     let median_idx = ref_starts.len() / 2;
     let ref_median_start = *ref_starts.select_nth_unstable(median_idx).1;
@@ -675,7 +647,7 @@ fn flank_scan_gene(
                 first_node,
                 true,
                 &mut log,
-                &ref_consensus,
+                &is_ref_gap,
                 gff,
                 genome,
                 scaffold_intervals,
@@ -692,7 +664,7 @@ fn flank_scan_gene(
                 last_node,
                 false,
                 &mut log,
-                &ref_consensus,
+                &is_ref_gap,
                 gff,
                 genome,
                 scaffold_intervals,
@@ -1053,6 +1025,8 @@ fn process_gene(
         };
     }
 
+    let is_ref_gap = build_is_ref_gap(&rc);
+
     flog.push(format!(
         "=== {}: {} refs, {} candidates ===",
         gene, rcount, cands.len()
@@ -1245,7 +1219,7 @@ fn process_gene(
             let gap_start = left_end;
             let gap_end = right_start;
 
-            let Some((effective_gap, gap_min_aa)) = qualify_gap(gap_start, gap_end, &rc) else {
+            let Some((effective_gap, gap_min_aa)) = qualify_gap(gap_start, gap_end, &is_ref_gap) else {
                 continue;
             };
             let total_gap_cols = gap_end - gap_start;
@@ -1495,7 +1469,7 @@ fn process_gene(
                     continue;
                 }
 
-                let Some((effective_gap, gap_min_aa)) = qualify_gap(gap_start, gap_end, &rc) else {
+                let Some((effective_gap, gap_min_aa)) = qualify_gap(gap_start, gap_end, &is_ref_gap) else {
                     continue;
                 };
 

@@ -81,7 +81,7 @@ pub fn hmm_align(
     tmpdir: Option<String>,
     gene_name: Option<String>,
 ) -> PyResult<Vec<(String, String)>> {
-    py.allow_threads(move || {
+    py.detach(move || {
         hmm_align_inner(candidates, references, tmpdir, gene_name)
     })
     .map_err(PyRuntimeError::new_err)

@@ -1,6 +1,6 @@
 [package]
 name = "sapphyre_tools"
-version = "0.10.20"
+version = "0.11.0"
 edition = "2021"
 include = ["/src", "/python", "/pyproject.toml", "/README.md", "/LICENSE"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -9,17 +9,17 @@ name = "sapphyre_tools"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.24.1", features = ["extension-module"] }
-bio = "*"
-itertools = "0.10.5"
-tempfile = "3.8.0"
-fastx = "0.2.0"
-meminterval = "0.4.1"
+pyo3 = { version = "0.28", features = ["extension-module"] }
+bio = "3"
+itertools = "0.14"
+tempfile = "3.27"
+fastx = "0.6"
+meminterval = "0.4.2"
 anyhow = "1"
 ahash = "0.8"
 seq_io = "0.3"
 flate2 = "1"
-rocksdb = { version = "0.22", default-features = false, features = ["zstd"] }
+rocksdb = { version = "0.24", default-features = false, features = ["zstd"] }
 
 
 [profile.dev]

@@ -1730,7 +1730,7 @@ pub fn exon_dp(
     folder: String,
     sub_dir: String,
     taxa_path: String,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     // `folder` is the per-orthoset root (<taxa>/<orthoset>); subdirs like
     // outlier/<sub_dir> live under it. `taxa_path` is the parent <taxa> folder
     // and holds the shared sequences RocksDB.

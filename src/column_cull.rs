@@ -1245,12 +1245,23 @@ pub fn cull_columns(
             .filter(|&i| !global_empty_mask[i])
             .collect();
         masked_records.iter().map(|(h, s)| {
-            let new_seq: String = keep_indices.iter().map(|&i| s[i] as char).collect();
+            // Build the kept bytes as Vec<u8> then validate once via
+            // String::from_utf8.  The previous `keep_indices.iter().map(|&i|
+            // s[i] as char).collect::<String>()` ran the per-char UTF-8
+            // encoding path for every byte, which is materially slower on
+            // long alignments.  Alignment data is ASCII, so utf8 validation
+            // is effectively a length check.
+            let mut buf: Vec<u8> = Vec::with_capacity(keep_indices.len());
+            for &i in &keep_indices {
+                buf.push(s[i]);
+            }
+            let new_seq = String::from_utf8(buf).expect("alignment is ASCII");
             (h.clone(), new_seq)
         }).collect()
     } else {
         masked_records.iter().map(|(h, s)| {
-            let new_seq: String = s.iter().map(|&c| c as char).collect();
+            // Same rationale as the has_global_empty branch above.
+            let new_seq = String::from_utf8(s.clone()).expect("alignment is ASCII");
             (h.clone(), new_seq)
         }).collect()
     };
@@ -1262,8 +1273,16 @@ pub fn cull_columns(
     let mut nt_trim_map: HashMap<String, HashSet<usize>> = HashMap::new();
     let mut gff_trim_map: HashMap<String, (usize, usize)> = HashMap::new();
 
+    // Build a O(1)-lookup set of surviving header strings.  The previous
+    // `masked_records.iter().any(|(h, _)| h == header)` was O(N) per
+    // iteration of the outer `for (header, ...) in &removed_columns` loop,
+    // making this section O(N^2) in candidate count -- the dominant cost
+    // of the build phase on large genes.
+    let masked_headers: HashSet<&str> =
+        masked_records.iter().map(|(h, _)| h.as_str()).collect();
+
     for (header, removed) in &removed_columns {
-        if !masked_records.iter().any(|(h, _)| h == header) { continue; }
+        if !masked_headers.contains(header.as_str()) { continue; }
 
         let orig_seq = orig_seq_map.get(header.as_str()).copied().unwrap_or(&[] as &[u8]);
         let drops = codon_drops_from_mask(orig_seq, removed);

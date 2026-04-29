@@ -23,6 +23,11 @@ fn parse_fasta_file(path: &str) -> Vec<(String, String)> {
 /// Build a FASTA blob from records and write it to `out` in a single buffered
 /// stream.  Mirrors the Python `fp.write("".join(...).encode())` pattern but
 /// avoids the intermediate Python string allocation.
+///
+/// Stop codons (`*`) are rewritten to `X` on the fly: HMMER rejects `*` in
+/// candidate input, and treating stops as unknown residues is the standard
+/// workaround.  Done here so it costs one byte-pass per record alongside the
+/// copy we were already doing.
 fn write_fasta_to_writer<W: Write>(out: &mut W, records: &[(String, String)]) -> std::io::Result<()> {
     let total: usize = records
         .iter()
@@ -33,7 +38,13 @@ fn write_fasta_to_writer<W: Write>(out: &mut W, records: &[(String, String)]) ->
         buf.push(b'>');
         buf.extend_from_slice(header.as_bytes());
         buf.push(b'\n');
+        let start = buf.len();
         buf.extend_from_slice(seq.as_bytes());
+        for b in &mut buf[start..] {
+            if *b == b'*' {
+                *b = b'X';
+            }
+        }
         buf.push(b'\n');
     }
     out.write_all(&buf)

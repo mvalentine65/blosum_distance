@@ -24,11 +24,14 @@ fn parse_fasta_file(path: &str) -> Vec<(String, String)> {
 /// stream.  Mirrors the Python `fp.write("".join(...).encode())` pattern but
 /// avoids the intermediate Python string allocation.
 ///
-/// Stop codons (`*`) are rewritten to `X` on the fly: HMMER rejects `*` in
-/// candidate input, and treating stops as unknown residues is the standard
-/// workaround.  Done here so it costs one byte-pass per record alongside the
-/// copy we were already doing.
-fn write_fasta_to_writer<W: Write>(out: &mut W, records: &[(String, String)]) -> std::io::Result<()> {
+/// When `mask_stops` is true, stop codons (`*`) are rewritten to `X` on the
+/// fly so HMMER's hmmbuild doesn't choke on them.  We only do this for the
+/// reference alignment; candidate `*`s are passed through verbatim.
+fn write_fasta_to_writer<W: Write>(
+    out: &mut W,
+    records: &[(String, String)],
+    mask_stops: bool,
+) -> std::io::Result<()> {
     let total: usize = records
         .iter()
         .map(|(h, s)| h.len() + s.len() + 3)
@@ -40,9 +43,11 @@ fn write_fasta_to_writer<W: Write>(out: &mut W, records: &[(String, String)]) ->
         buf.push(b'\n');
         let start = buf.len();
         buf.extend_from_slice(seq.as_bytes());
-        for b in &mut buf[start..] {
-            if *b == b'*' {
-                *b = b'X';
+        if mask_stops {
+            for b in &mut buf[start..] {
+                if *b == b'*' {
+                    *b = b'X';
+                }
             }
         }
         buf.push(b'\n');
@@ -136,14 +141,17 @@ fn hmm_align_inner(
     let temp_result = make_temp("res", ".afa")?;
 
     // Write through the existing tempfile handles - no second open().
+    // Mask stop codons (`*` -> `X`) in references only; the HMM model is
+    // built from these and HMMER won't accept `*`.  Candidate `*`s are
+    // preserved so downstream stages still see the stop signal.
     {
         let mut w = BufWriter::with_capacity(1 << 20, temp_aln.as_file_mut());
-        write_fasta_to_writer(&mut w, &references).map_err(|e| e.to_string())?;
+        write_fasta_to_writer(&mut w, &references, true).map_err(|e| e.to_string())?;
         w.flush().map_err(|e| e.to_string())?;
     }
     {
         let mut w = BufWriter::with_capacity(1 << 20, temp_cand.as_file_mut());
-        write_fasta_to_writer(&mut w, &candidates).map_err(|e| e.to_string())?;
+        write_fasta_to_writer(&mut w, &candidates, false).map_err(|e| e.to_string())?;
         w.flush().map_err(|e| e.to_string())?;
     }
 

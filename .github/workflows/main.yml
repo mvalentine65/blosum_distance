@@ -20,6 +20,15 @@ jobs:
     container: saferq/wrap-rocks:latest
     steps:
       - uses: actions/checkout@v4
+      - name: install libclang
+        # Required by librocksdb-sys >=0.18 (rocksdb 0.24+) which runs bindgen
+        # at build time instead of shipping pre-generated bindings.
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update && apt-get install -y --no-install-recommends clang libclang-dev
+          elif command -v yum >/dev/null; then
+            yum install -y clang clang-devel
+          fi
       - name: build-wheels
         run: |
           source /usr/local/cargo/env

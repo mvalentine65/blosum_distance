@@ -18,6 +18,20 @@ use pyo3::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+const BLOSUM_ALLOWED: [bool; 256] = {
+    let mut t = [false; 256];
+    let chars: &[u8] = &[
+        65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
+        66, 79, 85, 42,
+    ];
+    let mut i = 0;
+    while i < chars.len() {
+        t[chars[i] as usize] = true;
+        i += 1;
+    }
+    t
+};
+
 #[pyfunction]
 fn bio_revcomp(sequence: String) -> String {
     String::from_utf8(bio::alphabets::dna::revcomp(sequence.into_bytes())).unwrap()
@@ -69,10 +83,6 @@ fn blosum62_distance(one: String, two: String) -> f64 {
     let mut max_first = 0;
     let mut max_second = 0;
     let length = first.len();
-    let allowed: HashSet<u8> = HashSet::from([
-        65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
-        66, 79, 85, 42,
-    ]);
     for i in 0..length {
         let mut char1 = first[i];
         let mut char2 = second[i];
@@ -82,10 +92,10 @@ fn blosum62_distance(one: String, two: String) -> f64 {
         if second[i] == 45 {
             char2 = b'*';
         }
-        if !(allowed.contains(&char1)) {
+        if !BLOSUM_ALLOWED[char1 as usize] {
             panic!("first[i]  {} not in allowed\n{}", char1 as char, one);
         }
-        if !(allowed.contains(&char2)) {
+        if !BLOSUM_ALLOWED[char2 as usize] {
             panic!("second[i] {} not in allowed\n{}", char2 as char, two);
         }
         // score += bio::scores::blosum62(char1, char2);
@@ -106,10 +116,6 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
     let mut max_second = 0;
     let length = cand_bytes.len();
     assert!(length == ref_bytes.len());
-    let allowed: HashSet<u8> = HashSet::from([
-        65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
-        66, 79, 85, 42,
-    ]);
     for i in 0..length {
         let mut char1 = cand_bytes[i];
         let char2 = ref_bytes[i];
@@ -119,10 +125,10 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
         if ref_bytes[i] == 45 || ref_bytes[i] == b'*' {
             continue;
         }
-        if !(allowed.contains(&char1)) {
+        if !BLOSUM_ALLOWED[char1 as usize] {
             panic!("first[i]  {} not in allowed\n{}", char1 as char, candidate);
         }
-        if !(allowed.contains(&char2)) {
+        if !BLOSUM_ALLOWED[char2 as usize] {
             panic!("second[i] {} not in allowed\n{}", char2 as char, reference);
         }
 
@@ -178,16 +184,16 @@ fn delete_empty_columns_pairs(records: Vec<(String, String)>) -> Vec<(String, St
         .collect();
 
     let mut out = Vec::with_capacity(n_recs);
-    let mut buf = Vec::with_capacity(kept_indices.len());
     for (header, seq) in records {
         let bytes = seq.as_bytes();
-        buf.clear();
+        let mut buf = Vec::with_capacity(kept_indices.len());
         for &i in &kept_indices {
             if i < bytes.len() {
                 buf.push(bytes[i]);
             }
         }
-        out.push((header, String::from_utf8(buf.clone()).unwrap()));
+        // Alignment data is ASCII, so the UTF-8 invariant holds.
+        out.push((header, unsafe { String::from_utf8_unchecked(buf) }));
     }
     out
 }

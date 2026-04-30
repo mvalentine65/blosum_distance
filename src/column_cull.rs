@@ -29,18 +29,21 @@ const STOP_TRIM_GOOD_THRESHOLD: f64 = 0.60;
 /// to enter the PSSM (matches exonfinder.py _compute_ref_data_cols).
 const STOP_TRIM_MIN_REF_OCC: f64 = 0.30;
 
+/// Map an amino-acid byte to a dense 0..19 index (20 = unknown / sentinel).
+#[inline]
+fn aa_index(c: u8) -> usize {
+    match c {
+        b'A' => 0, b'R' => 1, b'N' => 2, b'D' => 3, b'C' => 4,
+        b'Q' => 5, b'E' => 6, b'G' => 7, b'H' => 8, b'I' => 9,
+        b'L' => 10, b'K' => 11, b'M' => 12, b'F' => 13, b'P' => 14,
+        b'S' => 15, b'T' => 16, b'W' => 17, b'Y' => 18, b'V' => 19,
+        _ => 20,
+    }
+}
+
 /// BLOSUM62 scoring matrix (upper-case AA only).
 /// Returns score for (query, reference) pair.
 fn blosum62(a: u8, b: u8) -> f64 {
-    let idx = |c: u8| -> usize {
-        match c {
-            b'A' => 0, b'R' => 1, b'N' => 2, b'D' => 3, b'C' => 4,
-            b'Q' => 5, b'E' => 6, b'G' => 7, b'H' => 8, b'I' => 9,
-            b'L' => 10, b'K' => 11, b'M' => 12, b'F' => 13, b'P' => 14,
-            b'S' => 15, b'T' => 16, b'W' => 17, b'Y' => 18, b'V' => 19,
-            _ => 20,
-        }
-    };
     #[rustfmt::skip]
     const MAT: [[i8; 20]; 20] = [
       //  A   R   N   D   C   Q   E   G   H   I   L   K   M   F   P   S   T   W   Y   V
@@ -65,8 +68,8 @@ fn blosum62(a: u8, b: u8) -> f64 {
         [-2, -2, -2, -3, -2, -1, -2, -3,  2, -1, -1, -2, -1,  3, -3, -2, -2,  2,  7, -1], // Y
         [ 0, -3, -3, -3, -1, -2, -2, -3, -3,  3,  1, -2,  1, -1, -2, -2,  0, -3, -1,  4], // V
     ];
-    let ai = idx(a);
-    let bi = idx(b);
+    let ai = aa_index(a);
+    let bi = aa_index(b);
     if ai >= 20 || bi >= 20 {
         return -4.0;
     }
@@ -75,44 +78,49 @@ fn blosum62(a: u8, b: u8) -> f64 {
 
 /// Build a BLOSUM62 PSSM from reference sequences.
 ///
-/// For each column in `data_cols`, computes a weighted score for every
-/// possible query amino acid based on the reference residue frequencies.
-/// Returns {col: (scores_by_aa, max_possible_score)}.
+/// For each column, computes a weighted score for every possible query amino
+/// acid based on the reference residue frequencies.  Returns a per-column
+/// Vec<Option<([f64; 20], col_max)>> indexed directly by column — the dense
+/// integer key never warranted a HashMap, and per-AA scores live in a fixed
+/// 20-slot array indexed via `aa_index`.
 fn build_blosum_pssm(
     ref_seqs: &[&[u8]],
     n_refs: usize,
     aln_len: usize,
-) -> HashMap<usize, (HashMap<u8, f64>, f64)> {
-    let mut pssm: HashMap<usize, (HashMap<u8, f64>, f64)> = HashMap::new();
-    let aas: [u8; 20] = *b"ARNDCQEGHILKMFPSTWYV";
+) -> Vec<Option<([f64; 20], f64)>> {
+    let mut pssm: Vec<Option<([f64; 20], f64)>> = vec![None; aln_len];
 
     for col in 0..aln_len {
         // 30% ref occupancy gate.
-        let mut counts: HashMap<u8, f64> = HashMap::new();
+        let mut counts = [0.0f64; 20];
         let mut total = 0usize;
         for rseq in ref_seqs {
             if col >= rseq.len() { continue; }
             let c = rseq[col];
             if c == b'-' || c == b'*' || c == b'.' { continue; }
-            let cu = c.to_ascii_uppercase();
-            *counts.entry(cu).or_default() += 1.0;
-            total += 1;
+            let i = aa_index(c.to_ascii_uppercase());
+            if i < 20 {
+                counts[i] += 1.0;
+                total += 1;
+            }
         }
         if total == 0 { continue; }
         if (total as f64 / n_refs as f64) < STOP_TRIM_MIN_REF_OCC { continue; }
 
         let total_f = total as f64;
-        let mut scores: HashMap<u8, f64> = HashMap::new();
-        for &qa in &aas {
+        let aas: [u8; 20] = *b"ARNDCQEGHILKMFPSTWYV";
+        let mut scores = [0.0f64; 20];
+        for (qi, &qa) in aas.iter().enumerate() {
             let mut s = 0.0f64;
-            for (&ref_aa, &cnt) in &counts {
-                s += blosum62(qa, ref_aa) * cnt;
+            for (ri, &cnt) in counts.iter().enumerate() {
+                if cnt == 0.0 { continue; }
+                s += blosum62(qa, aas[ri]) * cnt;
             }
-            scores.insert(qa, s / total_f);
+            scores[qi] = s / total_f;
         }
-        let col_max = scores.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let col_max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         if col_max > 0.0 {
-            pssm.insert(col, (scores, col_max));
+            pssm[col] = Some((scores, col_max));
         }
     }
     pssm
@@ -123,19 +131,20 @@ fn build_blosum_pssm(
 /// Returns (ratio, scored_cols) where ratio = candidate_total / max_total.
 fn score_fragment(
     seq: &[u8],
-    pssm: &HashMap<usize, (HashMap<u8, f64>, f64)>,
+    pssm: &[Option<([f64; 20], f64)>],
     start: usize,
     end: usize,
 ) -> (f64, usize) {
     let mut cand_total = 0.0f64;
     let mut max_total = 0.0f64;
     let mut scored = 0usize;
-    for i in start..end {
-        if i >= seq.len() { break; }
+    let lim = end.min(seq.len()).min(pssm.len());
+    for i in start..lim {
         let c = seq[i];
         if c == b'-' || c == b'*' { continue; }
-        if let Some((scores, col_max)) = pssm.get(&i) {
-            cand_total += scores.get(&c.to_ascii_uppercase()).copied().unwrap_or(-4.0);
+        if let Some((scores, col_max)) = &pssm[i] {
+            let qi = aa_index(c.to_ascii_uppercase());
+            cand_total += if qi < 20 { scores[qi] } else { -4.0 };
             max_total += col_max;
             scored += 1;
         }
@@ -153,15 +162,17 @@ fn score_fragment(
 /// Operates on sequences in post-gap-cull column space.  Returns a new
 /// alignment with trimmed fragments masked to gap.
 fn mask_stop_blosum(
-    records: &[(String, Vec<u8>)],
+    headers: &[String],
+    seqs: &[Vec<u8>],
     ref_suffix: &str,
     debug: i32,
     log_dir: &Option<String>,
-) -> (Vec<(String, Vec<u8>)>, HashMap<String, HashSet<usize>>) {
-    let aln_len = if records.is_empty() { 0 } else { records[0].1.len() };
+) -> (Vec<Vec<u8>>, HashMap<String, HashSet<usize>>) {
+    let aln_len = if seqs.is_empty() { 0 } else { seqs[0].len() };
 
-    let ref_seqs: Vec<&[u8]> = records
+    let ref_seqs: Vec<&[u8]> = headers
         .iter()
+        .zip(seqs.iter())
         .filter(|(h, _)| h.ends_with(ref_suffix))
         .map(|(_, s)| s.as_slice())
         .collect();
@@ -170,18 +181,18 @@ fn mask_stop_blosum(
     let mut masked_cols: HashMap<String, HashSet<usize>> = HashMap::new();
 
     if n_refs == 0 || aln_len == 0 {
-        return (records.to_vec(), masked_cols);
+        return (seqs.to_vec(), masked_cols);
     }
 
     // Build PSSM once for all sequences.
     let pssm = build_blosum_pssm(&ref_seqs, n_refs, aln_len);
 
     let mut stop_log: Vec<(String, usize, usize, usize, f64, f64, String)> = Vec::new();
-    let mut result = Vec::with_capacity(records.len());
+    let mut result: Vec<Vec<u8>> = Vec::with_capacity(seqs.len());
 
-    for (header, seq) in records {
+    for (header, seq) in headers.iter().zip(seqs.iter()) {
         if header.ends_with(ref_suffix) {
-            result.push((header.clone(), seq.clone()));
+            result.push(seq.clone());
             continue;
         }
 
@@ -191,14 +202,14 @@ fn mask_stop_blosum(
             .collect();
 
         if stops.is_empty() {
-            result.push((header.clone(), seq.clone()));
+            result.push(seq.clone());
             continue;
         }
 
         let data_start = match seq.iter().position(|&c| c != b'-') {
             Some(p) => p,
             None => {
-                result.push((header.clone(), seq.clone()));
+                result.push(seq.clone());
                 continue;
             }
         };
@@ -261,7 +272,7 @@ fn mask_stop_blosum(
         }
 
         if cols_to_mask.is_empty() {
-            result.push((header.clone(), seq.clone()));
+            result.push(seq.clone());
         } else {
             let mut masked = seq.clone();
             for &i in &cols_to_mask {
@@ -270,7 +281,7 @@ fn mask_stop_blosum(
                 }
             }
             masked_cols.insert(header.clone(), cols_to_mask);
-            result.push((header.clone(), masked));
+            result.push(masked);
         }
     }
 
@@ -314,22 +325,26 @@ fn is_acceptor(a: u8, b: u8) -> bool {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Single-pass normalize: replace '.' with '-', strip ' ', uppercase. One allocation.
-fn normalize_records(records: &[(String, String)]) -> Vec<(String, Vec<u8>)> {
-    records
-        .iter()
-        .map(|(h, s)| {
-            let mut norm = Vec::with_capacity(s.len());
-            for &b in s.as_bytes() {
-                match b {
-                    b'.' => norm.push(b'-'),
-                    b' ' => {}
-                    _ => norm.push(b.to_ascii_uppercase()),
-                }
+/// Single-pass normalize: replace '.' with '-', strip ' ', uppercase.
+///
+/// Returns headers and sequences in parallel Vecs so the pipeline can
+/// thread sequence-only stages without re-cloning the header per stage.
+fn normalize_records(records: Vec<(String, String)>) -> (Vec<String>, Vec<Vec<u8>>) {
+    let mut headers = Vec::with_capacity(records.len());
+    let mut seqs = Vec::with_capacity(records.len());
+    for (h, s) in records {
+        let mut norm = Vec::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            match b {
+                b'.' => norm.push(b'-'),
+                b' ' => {}
+                _ => norm.push(b.to_ascii_uppercase()),
             }
-            (h.clone(), norm)
-        })
-        .collect()
+        }
+        headers.push(h);
+        seqs.push(norm);
+    }
+    (headers, seqs)
 }
 
 /// Apply a boolean column mask in-place: set masked positions to b'-'.
@@ -374,30 +389,32 @@ fn has_splice_sites(
 
 /// Detect and mask retained same-frame introns in candidate sequences.
 fn mask_retained_introns(
-    normalized: &[(String, Vec<u8>)],
+    headers: &[String],
+    seqs: &[Vec<u8>],
     ref_suffix: &str,
     nt_seqs: &Option<HashMap<String, String>>,
     min_ref_supported_gap: usize,
     debug: i32,
     log_dir: &Option<String>,
-) -> (Vec<(String, Vec<u8>)>, HashMap<String, HashSet<usize>>) {
+) -> (Vec<Vec<u8>>, HashMap<String, HashSet<usize>>) {
     let min_intron_aa: usize = 10;
     let ref_gap_threshold: f64 = 0.95;
     let max_bridge_residues: usize = 8;
 
-    if normalized.is_empty() {
+    if seqs.is_empty() {
         return (Vec::new(), HashMap::new());
     }
 
-    let aln_len = normalized[0].1.len();
-    let ref_seqs: Vec<&[u8]> = normalized
+    let aln_len = seqs[0].len();
+    let ref_seqs: Vec<&[u8]> = headers
         .iter()
+        .zip(seqs.iter())
         .filter(|(h, _)| h.ends_with(ref_suffix))
         .map(|(_, s)| s.as_slice())
         .collect();
 
     if ref_seqs.is_empty() {
-        return (normalized.to_vec(), HashMap::new());
+        return (seqs.to_vec(), HashMap::new());
     }
 
     let n_refs = ref_seqs.len();
@@ -410,12 +427,12 @@ fn mask_retained_introns(
     }
 
     let mut intron_log: Vec<(String, usize, usize, usize, String, String, usize, usize, usize)> = Vec::new();
-    let mut result = Vec::with_capacity(normalized.len());
+    let mut result: Vec<Vec<u8>> = Vec::with_capacity(seqs.len());
     let mut intron_columns: HashMap<String, HashSet<usize>> = HashMap::new();
 
-    for (header, seq) in normalized {
+    for (header, seq) in headers.iter().zip(seqs.iter()) {
         if header.ends_with(ref_suffix) {
-            result.push((header.clone(), seq.clone()));
+            result.push(seq.clone());
             continue;
         }
 
@@ -523,7 +540,7 @@ fn mask_retained_introns(
         }
 
         if cols_to_mask.is_empty() {
-            result.push((header.clone(), seq.clone()));
+            result.push(seq.clone());
         } else {
             let mut masked = seq.clone();
             for &i in &cols_to_mask {
@@ -532,7 +549,7 @@ fn mask_retained_introns(
                 }
             }
             intron_columns.insert(header.clone(), cols_to_mask);
-            result.push((header.clone(), masked));
+            result.push(masked);
         }
     }
 
@@ -924,16 +941,22 @@ pub fn cull_columns(
 
     let mut gap_cull_log: Vec<(String, usize, usize)> = Vec::new();
 
-    let normalized = normalize_records(&records);
-    let orig_seq_map: HashMap<&str, &[u8]> = normalized
+    // Headers and sequences are kept in parallel Vecs through the pipeline.
+    // The previous `Vec<(String, Vec<u8>)>` representation forced a
+    // header.clone() at every stage transition (~5 redundant clones per
+    // record); splitting them lets each stage produce only the masked
+    // bytes and reuse the single owned headers Vec at the end.
+    let (norm_headers, norm_seqs) = normalize_records(records);
+    let orig_seq_map: HashMap<&str, &[u8]> = norm_headers
         .iter()
+        .zip(norm_seqs.iter())
         .map(|(h, s)| (h.as_str(), s.as_slice()))
         .collect();
     let _ = gap_cull_threshold;
-    let orig_aln_len = normalized[0].1.len();
+    let orig_aln_len = norm_seqs[0].len();
     let aln_len = orig_aln_len;
 
-    for (_, seq) in &normalized {
+    for seq in &norm_seqs {
         if seq.len() != aln_len {
             return Err(PyRuntimeError::new_err(
                 "ERROR: alignment records not the same length",
@@ -948,7 +971,7 @@ pub fn cull_columns(
     // ---------------------------------------------------------------
     let mut removed_columns: HashMap<String, Vec<bool>> = HashMap::new();
     let mut intron_removed_original: HashMap<String, HashSet<usize>> = HashMap::new();
-    for (h, _) in &normalized {
+    for h in &norm_headers {
         if !h.ends_with(ref_suffix) {
             removed_columns.insert(h.clone(), vec![false; orig_aln_len]);
         }
@@ -958,8 +981,9 @@ pub fn cull_columns(
     // Step 1: Ref edge cull + data boundary + sparse tail trim
     // ---------------------------------------------------------------
 
-    let ref_seqs_pre: Vec<&[u8]> = normalized
+    let ref_seqs_pre: Vec<&[u8]> = norm_headers
         .iter()
+        .zip(norm_seqs.iter())
         .filter(|(h, _)| h.ends_with(ref_suffix))
         .map(|(_, s)| s.as_slice())
         .collect();
@@ -1011,12 +1035,19 @@ pub fn cull_columns(
         }
     }
 
-    // Record edge mask.
-    for (h, _) in &normalized {
-        if h.ends_with(ref_suffix) { continue; }
-        if let Some(rv) = removed_columns.get_mut(h) {
-            for i in 0..orig_aln_len {
-                if edge_mask[i] { rv[i] = true; }
+    // Record edge mask. Edge masks are typically sparse (only the leading/
+    // trailing edges flip) — precompute the active indices once so per-record
+    // recording walks K << M positions instead of all M columns.
+    let edge_indices: Vec<usize> = (0..orig_aln_len)
+        .filter(|&i| edge_mask[i])
+        .collect();
+    if !edge_indices.is_empty() {
+        for h in &norm_headers {
+            if h.ends_with(ref_suffix) { continue; }
+            if let Some(rv) = removed_columns.get_mut(h) {
+                for &i in &edge_indices {
+                    rv[i] = true;
+                }
             }
         }
     }
@@ -1032,7 +1063,7 @@ pub fn cull_columns(
 
     // Per-sequence: edge mask + data boundary + sparse tail.
     let mut structural_masks: Vec<Vec<bool>> = Vec::new();
-    for (header, seq) in &normalized {
+    for (header, seq) in norm_headers.iter().zip(norm_seqs.iter()) {
         let mut combined_mask = edge_mask.clone();
 
         if !header.ends_with(ref_suffix) && !ref_seqs_pre.is_empty() {
@@ -1086,14 +1117,15 @@ pub fn cull_columns(
         structural_masks.push(combined_mask);
     }
 
-    // Apply structural masks.
-    let after_structural: Vec<(String, Vec<u8>)> = normalized
+    // Apply structural masks.  Sequence-only intermediate; headers stay
+    // owned in `norm_headers` and are not recloned per stage.
+    let after_structural: Vec<Vec<u8>> = norm_seqs
         .iter()
         .zip(structural_masks.iter())
-        .map(|((h, seq), mask)| {
+        .map(|(seq, mask)| {
             let mut masked = seq.clone();
             mask_columns_bool(&mut masked, mask);
-            (h.clone(), masked)
+            masked
         })
         .collect();
 
@@ -1103,7 +1135,7 @@ pub fn cull_columns(
 
     let gap_cull_mask: Vec<bool> = {
         let mut col_non_gap = vec![0usize; aln_len];
-        for (_, seq) in &after_structural {
+        for seq in &after_structural {
             for (i, &ch) in seq.iter().enumerate() {
                 if ch != b'-' {
                     col_non_gap[i] += 1;
@@ -1114,11 +1146,16 @@ pub fn cull_columns(
     };
 
     // Record gap cull (original space).
-    for (h, _) in &normalized {
-        if h.ends_with(ref_suffix) { continue; }
-        if let Some(rv) = removed_columns.get_mut(h) {
-            for i in 0..orig_aln_len {
-                if gap_cull_mask[i] { rv[i] = true; }
+    let gap_cull_indices: Vec<usize> = (0..orig_aln_len)
+        .filter(|&i| gap_cull_mask[i])
+        .collect();
+    if !gap_cull_indices.is_empty() {
+        for h in &norm_headers {
+            if h.ends_with(ref_suffix) { continue; }
+            if let Some(rv) = removed_columns.get_mut(h) {
+                for &i in &gap_cull_indices {
+                    rv[i] = true;
+                }
             }
         }
     }
@@ -1128,13 +1165,10 @@ pub fn cull_columns(
         .filter(|&i| !gap_cull_mask[i])
         .collect();
 
-    let after_gap_cull: Vec<(String, Vec<u8>)> = if current_to_orig.len() < orig_aln_len {
+    let after_gap_cull: Vec<Vec<u8>> = if current_to_orig.len() < orig_aln_len {
         after_structural
             .iter()
-            .map(|(h, s)| {
-                let new_seq: Vec<u8> = current_to_orig.iter().map(|&i| s[i]).collect();
-                (h.clone(), new_seq)
-            })
+            .map(|s| current_to_orig.iter().map(|&i| s[i]).collect::<Vec<u8>>())
             .collect()
     } else {
         after_structural
@@ -1144,8 +1178,10 @@ pub fn cull_columns(
     // Step 3: Retained intron detection (on structurally clean aln)
     // ---------------------------------------------------------------
 
-    let (after_intron, intron_masked_cols) =
-        mask_retained_introns(&after_gap_cull, ref_suffix, &nt_seqs, min_ref_supported_gap, debug, &log_dir);
+    let (after_intron, intron_masked_cols) = mask_retained_introns(
+        &norm_headers, &after_gap_cull, ref_suffix, &nt_seqs,
+        min_ref_supported_gap, debug, &log_dir,
+    );
 
     // Record intron masked cols (post-gap-cull space -> original).
     for (header, cols) in &intron_masked_cols {
@@ -1165,7 +1201,7 @@ pub fn cull_columns(
     // ---------------------------------------------------------------
 
     let (after_stop_trim, stop_masked_cols) =
-        mask_stop_blosum(&after_intron, ref_suffix, debug, &log_dir);
+        mask_stop_blosum(&norm_headers, &after_intron, ref_suffix, debug, &log_dir);
 
     // Record stop masked cols (post-gap-cull space -> original).
     for (header, cols) in &stop_masked_cols {
@@ -1184,10 +1220,12 @@ pub fn cull_columns(
     // Step 5: Min length filter + global empty column removal
     // ---------------------------------------------------------------
 
-    let mut masked_records: Vec<(String, Vec<u8>)> = Vec::new();
-    for (idx, (header, _)) in records.iter().enumerate() {
+    // Track which records survive the min-length filter via indices into
+    // `norm_headers` / `after_stop_trim` rather than copying strings.
+    let mut surviving_indices: Vec<usize> = Vec::new();
+    for (idx, header) in norm_headers.iter().enumerate() {
         if idx >= after_stop_trim.len() { continue; }
-        let seq = &after_stop_trim[idx].1;
+        let seq = &after_stop_trim[idx];
 
         if !header.ends_with(ref_suffix) && min_seq_len > 0 {
             let non_gap = seq.iter().filter(|&&c| c != b'-').count();
@@ -1196,21 +1234,21 @@ pub fn cull_columns(
             }
         }
 
-        masked_records.push((header.clone(), seq.clone()));
+        surviving_indices.push(idx);
     }
 
-    if masked_records.is_empty() {
+    if surviving_indices.is_empty() {
         return Ok((Vec::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new()));
     }
 
     // Global empty column removal.
-    let masked_len = masked_records[0].1.len();
+    let masked_len = after_stop_trim[surviving_indices[0]].len();
     let mut global_empty_mask = vec![false; masked_len];
     let mut has_global_empty = false;
     {
         let mut masked_non_gap = vec![0usize; masked_len];
-        for (_, seq) in &masked_records {
-            for (i, &ch) in seq.iter().enumerate() {
+        for &idx in &surviving_indices {
+            for (i, &ch) in after_stop_trim[idx].iter().enumerate() {
                 if ch != b'-' {
                     masked_non_gap[i] += 1;
                 }
@@ -1224,15 +1262,26 @@ pub fn cull_columns(
         }
     }
 
-    // Record global empty (map through current_to_orig).
+    // Record global empty (map through current_to_orig).  Precompute the
+    // sparse list of original columns that need flipping so each per-record
+    // pass walks only those positions instead of every alignment column.
     if has_global_empty {
-        for (i, &is_empty) in global_empty_mask.iter().enumerate() {
-            if !is_empty { continue; }
-            if i < current_to_orig.len() {
-                let orig_col = current_to_orig[i];
-                for (h, _) in &normalized {
-                    if h.ends_with(ref_suffix) { continue; }
-                    if let Some(rv) = removed_columns.get_mut(h) {
+        let global_empty_orig_indices: Vec<usize> = global_empty_mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &is_empty)| {
+                if is_empty && i < current_to_orig.len() {
+                    Some(current_to_orig[i])
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !global_empty_orig_indices.is_empty() {
+            for h in &norm_headers {
+                if h.ends_with(ref_suffix) { continue; }
+                if let Some(rv) = removed_columns.get_mut(h) {
+                    for &orig_col in &global_empty_orig_indices {
                         if orig_col < rv.len() { rv[orig_col] = true; }
                     }
                 }
@@ -1244,25 +1293,21 @@ pub fn cull_columns(
         let keep_indices: Vec<usize> = (0..masked_len)
             .filter(|&i| !global_empty_mask[i])
             .collect();
-        masked_records.iter().map(|(h, s)| {
-            // Build the kept bytes as Vec<u8> then validate once via
-            // String::from_utf8.  The previous `keep_indices.iter().map(|&i|
-            // s[i] as char).collect::<String>()` ran the per-char UTF-8
-            // encoding path for every byte, which is materially slower on
-            // long alignments.  Alignment data is ASCII, so utf8 validation
-            // is effectively a length check.
+        surviving_indices.iter().map(|&idx| {
+            let s = &after_stop_trim[idx];
+            // Alignment data is ASCII; bypass UTF-8 validation to avoid
+            // a redundant byte-scan on long alignments.
             let mut buf: Vec<u8> = Vec::with_capacity(keep_indices.len());
             for &i in &keep_indices {
                 buf.push(s[i]);
             }
-            let new_seq = String::from_utf8(buf).expect("alignment is ASCII");
-            (h.clone(), new_seq)
+            let new_seq = unsafe { String::from_utf8_unchecked(buf) };
+            (norm_headers[idx].clone(), new_seq)
         }).collect()
     } else {
-        masked_records.iter().map(|(h, s)| {
-            // Same rationale as the has_global_empty branch above.
-            let new_seq = String::from_utf8(s.clone()).expect("alignment is ASCII");
-            (h.clone(), new_seq)
+        surviving_indices.iter().map(|&idx| {
+            let new_seq = unsafe { String::from_utf8_unchecked(after_stop_trim[idx].clone()) };
+            (norm_headers[idx].clone(), new_seq)
         }).collect()
     };
 
@@ -1273,13 +1318,13 @@ pub fn cull_columns(
     let mut nt_trim_map: HashMap<String, HashSet<usize>> = HashMap::new();
     let mut gff_trim_map: HashMap<String, (usize, usize)> = HashMap::new();
 
-    // Build a O(1)-lookup set of surviving header strings.  The previous
-    // `masked_records.iter().any(|(h, _)| h == header)` was O(N) per
-    // iteration of the outer `for (header, ...) in &removed_columns` loop,
-    // making this section O(N^2) in candidate count -- the dominant cost
-    // of the build phase on large genes.
-    let masked_headers: HashSet<&str> =
-        masked_records.iter().map(|(h, _)| h.as_str()).collect();
+    // O(1) survivor lookup: the outer `for (header, ...) in &removed_columns`
+    // loop would otherwise re-scan the survivors per candidate, turning the
+    // build phase into O(N^2) on large genes.
+    let masked_headers: HashSet<&str> = surviving_indices
+        .iter()
+        .map(|&idx| norm_headers[idx].as_str())
+        .collect();
 
     for (header, removed) in &removed_columns {
         if !masked_headers.contains(header.as_str()) { continue; }

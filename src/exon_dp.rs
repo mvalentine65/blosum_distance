@@ -76,6 +76,7 @@ fn parse_node_field(h: &str) -> &str {
 
 struct FlankNode {
     header: String,
+    nf: String,
     frame: i32,
     start: usize,
     end: usize,
@@ -178,11 +179,10 @@ fn qualify_gap(
     Some((effective_gap, scaled_min_aa))
 }
 
-/// Build a per-column `is_ref_gap` array from a `ref_consensus` map.
-fn build_is_ref_gap(ref_consensus: &HashMap<usize, Vec<u8>>) -> Vec<bool> {
-    let max_col = ref_consensus.keys().copied().max().unwrap_or(0);
-    let mut is_ref_gap = vec![true; max_col + 1];
-    for (&col, vec) in ref_consensus.iter() {
+/// Build a per-column `is_ref_gap` array from a column-indexed ref consensus.
+fn build_is_ref_gap(ref_consensus: &[Vec<u8>]) -> Vec<bool> {
+    let mut is_ref_gap = vec![true; ref_consensus.len()];
+    for (col, vec) in ref_consensus.iter().enumerate() {
         if vec.is_empty() {
             continue;
         }
@@ -493,8 +493,9 @@ fn flank_scan_gene(
 
     log.push(format!("=== Flank ORF scan: {} ===", gene));
 
-    // Build ref consensus and node list from AA entries
-    let mut ref_consensus: HashMap<usize, Vec<u8>> = HashMap::new();
+    // Column-indexed ref consensus.  See process_gene rationale for why
+    // this is a Vec rather than a HashMap.
+    let mut ref_consensus: Vec<Vec<u8>> = Vec::new();
     let mut ref_starts: Vec<usize> = Vec::new();
     let mut ref_ends: Vec<usize> = Vec::new();
     let mut ref_count: usize = 0;
@@ -506,12 +507,15 @@ fn flank_scan_gene(
             let (start, end) = flank_find_index_pair(seq);
             ref_starts.push(start);
             ref_ends.push(end);
-            for (i, b) in seq.bytes().enumerate() {
-                let col = ref_consensus.entry(i).or_default();
+            let bytes = seq.as_bytes();
+            if ref_consensus.len() < bytes.len() {
+                ref_consensus.resize(bytes.len(), Vec::new());
+            }
+            for (i, &b) in bytes.iter().enumerate() {
                 if i >= start && i <= end {
-                    col.push(b);
+                    ref_consensus[i].push(b);
                 } else {
-                    col.push(b'-');
+                    ref_consensus[i].push(b'-');
                 }
             }
             continue;
@@ -519,8 +523,10 @@ fn flank_scan_gene(
         let fields: Vec<&str> = header.split('|').collect();
         let frame: i32 = fields.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
         let (start, end) = flank_find_index_pair(seq);
+        let nf = parse_node_field(header).to_string();
         aa_nodes.push(FlankNode {
             header: header.clone(),
+            nf,
             frame,
             start,
             end,
@@ -529,6 +535,15 @@ fn flank_scan_gene(
 
     if aa_nodes.is_empty() || ref_count == 0 || ref_starts.is_empty() {
         return (log, all_candidates);
+    }
+
+    // Index aa_nodes by node field.  Each cluster's filter previously
+    // walked every node and re-split the header to extract `nf`; building
+    // this index once removes both the per-cluster O(N) scan and the
+    // per-node `header.split('|').nth(3)` allocation.
+    let mut nodes_by_nf: HashMap<&str, Vec<usize>> = HashMap::with_capacity(aa_nodes.len());
+    for (i, n) in aa_nodes.iter().enumerate() {
+        nodes_by_nf.entry(n.nf.as_str()).or_default().push(i);
     }
 
     let is_ref_gap = build_is_ref_gap(&ref_consensus);
@@ -565,13 +580,18 @@ fn flank_scan_gene(
         if cluster_key.contains('_') {
             continue;
         }
-        let mut aa_subset: Vec<&FlankNode> = aa_nodes
-            .iter()
-            .filter(|n| {
-                let nf = n.header.split('|').nth(3).unwrap_or("");
-                cluster_set.contains(nf)
-            })
-            .collect();
+        // Gather matching nodes via the prebuilt index instead of scanning
+        // all aa_nodes and re-splitting `header` per node per cluster.
+        let mut subset_idx: Vec<usize> = Vec::new();
+        for nf in cluster_set.iter() {
+            if let Some(idxs) = nodes_by_nf.get(nf.as_str()) {
+                subset_idx.extend(idxs);
+            }
+        }
+        subset_idx.sort_unstable();
+        subset_idx.dedup();
+        let mut aa_subset: Vec<&FlankNode> =
+            subset_idx.iter().map(|&i| &aa_nodes[i]).collect();
 
         if aa_subset.is_empty() {
             continue;
@@ -987,7 +1007,11 @@ fn process_gene(
         nf: String,
     }
 
-    let mut rc: HashMap<usize, Vec<u8>> = HashMap::new();
+    // Column-indexed ref consensus.  HashMap was the wrong structure for
+    // a dense integer key; switching to Vec<Vec<u8>> drops the per-column
+    // hash on every insert.  Sized to the alignment length on the first
+    // ref encountered.
+    let mut rc: Vec<Vec<u8>> = Vec::new();
     let mut rcount = 0usize;
     let mut cands: Vec<Cand> = Vec::new();
 
@@ -996,9 +1020,11 @@ fn process_gene(
         if header.ends_with('.') {
             rcount += 1;
             let (s, e) = find_index_pair(sb, b'-');
+            if rc.len() < sb.len() {
+                rc.resize(sb.len(), Vec::new());
+            }
             for (i, &bp) in sb.iter().enumerate() {
-                let ent = rc.entry(i).or_default();
-                ent.push(if i >= s && i <= e { bp } else { b'-' });
+                rc[i].push(if i >= s && i <= e { bp } else { b'-' });
             }
         } else {
             let parts: Vec<&str> = header.split('|').collect();
@@ -1023,6 +1049,14 @@ fn process_gene(
             log: flog, gaps: 0, hits: 0,
             gff_lines, recovered, gap_candidates,
         };
+    }
+
+    // Index candidates by `nf` once. The MXE region scan and the per-cluster
+    // filter both lookup candidates by node field — without this index they
+    // each ran O(N) linear scans for every cluster / slot.
+    let mut cands_by_nf: HashMap<&str, Vec<usize>> = HashMap::with_capacity(cands.len());
+    for (i, c) in cands.iter().enumerate() {
+        cands_by_nf.entry(c.nf.as_str()).or_default().push(i);
     }
 
     let is_ref_gap = build_is_ref_gap(&rc);
@@ -1150,6 +1184,21 @@ fn process_gene(
     for (ck, node_tokens, iso_type) in &all_clusters {
         let cluster_node_fields: HashSet<String> = node_tokens.iter().cloned().collect();
 
+        // Pre-resolve this cluster's GFF intervals once, grouped by scaffold.
+        // The MXE sibling-narrowing filter inside the per-gap loop previously
+        // did a linear `cluster_node_fields.iter().any(|nf| gff.get(nf)...)`
+        // per sibling interval per gap; with this index the check is an
+        // O(1) HashSet lookup with no String allocation.
+        let mut cluster_intervals: HashMap<&str, HashSet<(usize, usize)>> = HashMap::new();
+        for nf in cluster_node_fields.iter() {
+            if let Some(entry) = gff.get(nf.as_str()) {
+                cluster_intervals
+                    .entry(entry.scaffold.as_str())
+                    .or_default()
+                    .insert((entry.start, entry.end));
+            }
+        }
+
         // For MXE clusters, identify modular nodes.
         // Isoform clusters: nodes present in the isoform but not the base.
         // Base clusters: nodes in the base that are replaced in at
@@ -1176,13 +1225,20 @@ fn process_gene(
             HashSet::new()
         };
 
-        // Filter candidates by cluster membership
-        let mut aa_subset: Vec<usize> = cands
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| cluster_node_fields.contains(&c.nf))
-            .map(|(i, _)| i)
-            .collect();
+        // Filter candidates by cluster membership.  Iterate the cluster's
+        // node tokens (small) and gather candidate indices through the
+        // pre-built `cands_by_nf` index instead of scanning every candidate
+        // with a HashSet contains check per cluster.  Dedup defensively
+        // because `node_tokens` is a Vec and may carry duplicates that the
+        // original `HashSet::contains` filter would have collapsed.
+        let mut aa_subset: Vec<usize> = Vec::new();
+        for nf in node_tokens.iter() {
+            if let Some(idxs) = cands_by_nf.get(nf.as_str()) {
+                aa_subset.extend(idxs);
+            }
+        }
+        aa_subset.sort_unstable();
+        aa_subset.dedup();
 
         if aa_subset.len() < 2 {
             continue;
@@ -1283,15 +1339,9 @@ fn process_gene(
                             *sscaf == ga.scaffold
                                 && *ss >= rs
                                 && *se <= re
-                                && !cluster_node_fields.iter().any(|nf| {
-                                    if let Some(entry) = gff.get(nf.as_str()) {
-                                        entry.scaffold == *sscaf
-                                            && entry.start == *ss
-                                            && entry.end == *se
-                                    } else {
-                                        false
-                                    }
-                                })
+                                && !cluster_intervals
+                                    .get(sscaf.as_str())
+                                    .map_or(false, |s| s.contains(&(*ss, *se)))
                         })
                         .map(|(_, ss, se)| (*ss, *se))
                         .collect();
@@ -1456,9 +1506,16 @@ fn process_gene(
                 }
                 mxe_scanned.insert(scan_key);
 
-                // MSA gap window between the two constitutive flanks
-                let left_cand = cands.iter().find(|c| c.nf == *left_node);
-                let right_cand = cands.iter().find(|c| c.nf == *right_node);
+                // MSA gap window between the two constitutive flanks. Use
+                // the prebuilt index instead of two linear scans of `cands`.
+                let left_cand = cands_by_nf
+                    .get(left_node.as_str())
+                    .and_then(|v| v.first())
+                    .map(|&i| &cands[i]);
+                let right_cand = cands_by_nf
+                    .get(right_node.as_str())
+                    .and_then(|v| v.first())
+                    .map(|&i| &cands[i]);
                 let (gap_start, gap_end) = match (left_cand, right_cand) {
                     (Some(lc), Some(rc)) => {
                         if strand == "-" { (rc.end, lc.start) } else { (lc.end, rc.start) }

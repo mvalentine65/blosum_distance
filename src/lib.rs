@@ -7,6 +7,7 @@ mod flexcull;
 mod identity;
 mod interval_tree;
 mod overlap;
+mod pssm;
 mod translate;
 
 use bio::alignment::distance::simd::hamming;
@@ -539,6 +540,7 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aligner::hmm_align, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::cull_columns, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::apply_gff_culls, m)?)?;
+    m.add_function(wrap_pyfunction!(pssm::compute_pssm_for_window, m)?)?;
 
     m.add_class::<interval_tree::OverlapTree>()?;
 

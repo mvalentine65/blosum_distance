@@ -347,12 +347,12 @@ fn normalize_records(records: Vec<(String, String)>) -> (Vec<String>, Vec<Vec<u8
     (headers, seqs)
 }
 
-/// Apply a boolean column mask in-place: set masked positions to b'-'.
+/// Apply a boolean column mask in-place: set masked positions to `b'-'`.
+/// Branchless conditional write over a zipped pair lets the compiler emit a
+/// `cmov` and SIMD-vectorise the loop.
 fn mask_columns_bool(seq: &mut [u8], mask: &[bool]) {
-    for (i, m) in mask.iter().enumerate() {
-        if *m && i < seq.len() {
-            seq[i] = b'-';
-        }
+    for (s, &m) in seq.iter_mut().zip(mask.iter()) {
+        *s = if m { b'-' } else { *s };
     }
 }
 
@@ -578,11 +578,11 @@ fn mask_retained_introns(
     (result, intron_columns)
 }
 
-fn scan_gap_run(seq: &[u8], ref_has_data: &[bool], start: usize) -> (usize, usize) {
+fn scan_gap_run(seq: &[u8], mask: &[bool], ref_has_data: &[bool], start: usize) -> (usize, usize) {
     let n = seq.len();
     let mut j = start;
     let mut ref_supported = 0usize;
-    while j < n && seq[j] == b'-' {
+    while j < n && (seq[j] == b'-' || mask[j]) {
         if ref_has_data[j] {
             ref_supported += 1;
         }
@@ -602,6 +602,7 @@ fn block_is_real(
 
 fn pick_final_block_start(
     seq: &[u8],
+    mask: &[bool],
     ref_has_data: &[bool],
     min_ref_supported_gap: usize,
     anchor_run: usize,
@@ -618,9 +619,9 @@ fn pick_final_block_start(
 
     let mut i = 0usize;
     while i < n {
-        if seq[i] == b'-' {
+        if seq[i] == b'-' || mask[i] {
             contig = 0;
-            let (j, ref_supported) = scan_gap_run(seq, ref_has_data, i);
+            let (j, ref_supported) = scan_gap_run(seq, mask, ref_has_data, i);
 
             if ref_supported >= min_ref_supported_gap {
                 if total_res > 0 {
@@ -663,6 +664,7 @@ fn pick_final_block_start(
 
 fn trim_sparse_tail_end(
     seq: &[u8],
+    mask: &[bool],
     ref_has_data: &[bool],
     start: usize,
     min_ref_supported_gap: usize,
@@ -688,11 +690,11 @@ fn trim_sparse_tail_end(
             break;
         }
 
-        if seq[i] == b'-' {
+        if seq[i] == b'-' || mask[i] {
             contig = 0;
             let mut j = i;
             let mut ref_supported = 0usize;
-            while j >= start && seq[j] == b'-' {
+            while j >= start && (seq[j] == b'-' || mask[j]) {
                 if ref_has_data[j] {
                     ref_supported += 1;
                 }
@@ -701,8 +703,8 @@ fn trim_sparse_tail_end(
                 }
                 j -= 1;
             }
-            // Handle the boundary: if seq[j] != '-' or j < start
-            let gap_start = if seq[j] == b'-' { j } else { j + 1 };
+            // Handle the boundary: if seq[j] is residue (and not masked) or j < start
+            let gap_start = if seq[j] == b'-' || mask[j] { j } else { j + 1 };
 
             if ref_supported >= min_ref_supported_gap {
                 if total_res <= tail_max_data {
@@ -719,7 +721,7 @@ fn trim_sparse_tail_end(
                 break;
             }
 
-            if j < start || (j == 0 && seq[0] == b'-') {
+            if j < start || (j == 0 && (seq[0] == b'-' || mask[0])) {
                 break;
             }
             i = j;
@@ -941,11 +943,9 @@ pub fn cull_columns(
 
     let mut gap_cull_log: Vec<(String, usize, usize)> = Vec::new();
 
-    // Headers and sequences are kept in parallel Vecs through the pipeline.
-    // The previous `Vec<(String, Vec<u8>)>` representation forced a
-    // header.clone() at every stage transition (~5 redundant clones per
-    // record); splitting them lets each stage produce only the masked
-    // bytes and reuse the single owned headers Vec at the end.
+    // Headers and sequences are kept as parallel Vecs through the pipeline so
+    // each stage only produces masked bytes; the single owned headers Vec is
+    // reused at the end.
     let (norm_headers, norm_seqs) = normalize_records(records);
     let orig_seq_map: HashMap<&str, &[u8]> = norm_headers
         .iter()
@@ -963,7 +963,6 @@ pub fn cull_columns(
             ));
         }
     }
-
 
     // ---------------------------------------------------------------
     // Cumulative removal tracker: one Vec<bool> per non-ref record,
@@ -1061,18 +1060,29 @@ pub fn cull_columns(
         vec![false; aln_len]
     };
 
-    // Per-sequence: edge mask + data boundary + sparse tail.
-    let mut structural_masks: Vec<Vec<bool>> = Vec::new();
+    // Per-sequence: edge mask + data boundary + sparse tail.  Refs and the
+    // no-refs case need no per-record customisation — their effective mask
+    // is just `edge_mask`.  Tracking that as `None` lets `apply_structural`
+    // borrow `edge_mask` directly and skips an O(aln_len) clone per ref.
+    let mut structural_masks: Vec<Option<Vec<bool>>> = Vec::with_capacity(norm_headers.len());
     for (header, seq) in norm_headers.iter().zip(norm_seqs.iter()) {
-        let mut combined_mask = edge_mask.clone();
-
         if !header.ends_with(ref_suffix) && !ref_seqs_pre.is_empty() {
-            let first_data = seq.iter().enumerate().position(|(i, &c)| c != b'-' && !edge_mask[i]);
-            let (start, end_data) = if let Some(fd) = first_data {
-                let last_data = seq.iter().enumerate().rposition(|(i, &c)| c != b'-' && !edge_mask[i]).unwrap();
-                (fd, last_data + 1)
-            } else {
-                (0usize, 0usize)
+            let mut combined_mask = edge_mask.clone();
+
+            // Single-pass scan finds both first_data and last_data.
+            let mut first_data: Option<usize> = None;
+            let mut last_data: usize = 0;
+            for (i, &c) in seq.iter().enumerate() {
+                if c != b'-' && !edge_mask[i] {
+                    if first_data.is_none() {
+                        first_data = Some(i);
+                    }
+                    last_data = i;
+                }
+            }
+            let (start, end_data) = match first_data {
+                Some(fd) => (fd, last_data + 1),
+                None => (0usize, 0usize),
             };
 
             for i in 0..start {
@@ -1082,19 +1092,22 @@ pub fn cull_columns(
                 combined_mask[i] = true;
             }
 
-            let eb: Vec<u8> = seq.iter().enumerate().map(|(i, &c)| {
-                if combined_mask[i] { b'-' } else { c }
-            }).collect();
-
+            // Helpers take `seq + mask` directly and treat
+            // `seq[i] == b'-' || mask[i]` as a gap, so we don't materialise
+            // a per-record masked byte buffer.
             let left_trim_point = pick_final_block_start(
-                &eb, &ref_has_data, min_ref_supported_gap, anchor_run, tail_max_data,
+                seq, &combined_mask, &ref_has_data, min_ref_supported_gap, anchor_run, tail_max_data,
             );
             let right_trim_point = trim_sparse_tail_end(
-                &eb, &ref_has_data, left_trim_point, min_ref_supported_gap, anchor_run, tail_max_data,
+                seq, &combined_mask, &ref_has_data, left_trim_point, min_ref_supported_gap, anchor_run, tail_max_data,
             );
 
-            let left_aa_trimmed = (start..left_trim_point).filter(|&i| eb[i] != b'-').count();
-            let right_aa_trimmed = (right_trim_point..end_data).filter(|&i| eb[i] != b'-').count();
+            let left_aa_trimmed = (start..left_trim_point)
+                .filter(|&i| seq[i] != b'-' && !combined_mask[i])
+                .count();
+            let right_aa_trimmed = (right_trim_point..end_data)
+                .filter(|&i| seq[i] != b'-' && !combined_mask[i])
+                .count();
             if left_aa_trimmed > 0 || right_aa_trimmed > 0 {
                 gap_cull_log.push((header.clone(), left_aa_trimmed, right_aa_trimmed));
             }
@@ -1106,24 +1119,30 @@ pub fn cull_columns(
                 combined_mask[i] = true;
             }
 
-            // Record into removed_columns.
+            // Branchless OR over a zipped pair auto-vectorises; the prior
+            // `if combined_mask[i]` shape defeated SIMD on this hot loop.
             if let Some(rv) = removed_columns.get_mut(header) {
-                for i in 0..orig_aln_len {
-                    if combined_mask[i] { rv[i] = true; }
+                for (r, &m) in rv.iter_mut().zip(combined_mask.iter()) {
+                    *r |= m;
                 }
             }
-        }
 
-        structural_masks.push(combined_mask);
+            structural_masks.push(Some(combined_mask));
+        } else {
+            // Ref record (or no refs available): downstream consumer uses
+            // `edge_mask` directly.
+            structural_masks.push(None);
+        }
     }
 
     // Apply structural masks.  Sequence-only intermediate; headers stay
-    // owned in `norm_headers` and are not recloned per stage.
+    // owned in `norm_headers`.  `None` entries borrow `edge_mask` directly.
     let after_structural: Vec<Vec<u8>> = norm_seqs
         .iter()
         .zip(structural_masks.iter())
-        .map(|(seq, mask)| {
+        .map(|(seq, mask_opt)| {
             let mut masked = seq.clone();
+            let mask = mask_opt.as_ref().unwrap_or(&edge_mask);
             mask_columns_bool(&mut masked, mask);
             masked
         })

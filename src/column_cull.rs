@@ -2,7 +2,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -1391,20 +1391,27 @@ pub fn cull_columns(
         let exons = classify_intron_splits(orig_seq, orig_cols);
         if exons.len() > 1 { exon_split_map.insert(header.clone(), exons); }
     }
+
+    // gap_cull_debug.csv: BufWriter is load-bearing — without it, every
+    // writeln! becomes a separate syscall, which on WSL is ~1ms each. For
+    // wide genes with thousands of cull-log rows this added ~10s of pure
+    // syscall overhead per call, dominating cull_columns runtime.
     if !gap_cull_log.is_empty() && debug >= 1 {
         if let Some(ld) = &log_dir {
             let log_path = Path::new(ld).join("gap_cull_debug.csv");
-            if let Ok(mut f) = File::create(&log_path)
+            if let Ok(f) = File::create(&log_path)
             {
-                let _ = writeln!(f, "header,left_aa_trimmed,right_aa_trimmed");
+                let mut w = BufWriter::new(f);
+                let _ = writeln!(w, "header,left_aa_trimmed,right_aa_trimmed");
                 for (h, left, right) in &gap_cull_log {
                     let safe = if h.contains(',') {
                         format!("\"{}\"", h)
                     } else {
                         h.clone()
                     };
-                    let _ = writeln!(f, "{},{},{}", safe, left, right);
+                    let _ = writeln!(w, "{},{},{}", safe, left, right);
                 }
+                let _ = w.flush();
             }
         }
     }

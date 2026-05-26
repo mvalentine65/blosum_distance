@@ -2791,8 +2791,8 @@ pub fn exonfinder_process_gene(
         }
     }
     cands_final.sort_by(|a, b| {
-        let ka = genomic_sort_key(&a.0, &gff_nodes);
-        let kb = genomic_sort_key(&b.0, &gff_nodes);
+        let ka = genomic_sort_key(&a.0, &gff_nodes_extended);
+        let kb = genomic_sort_key(&b.0, &gff_nodes_extended);
         ka.cmp(&kb)
     });
     let mut final_records: Vec<(String, String)> = Vec::with_capacity(refs_final.len() + cands_final.len());

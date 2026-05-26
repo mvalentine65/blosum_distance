@@ -3,6 +3,7 @@ mod column_cull;
 mod consensus;
 mod dedupe;
 mod exon_dp;
+mod exonfinder_post;
 mod flexcull;
 mod identity;
 mod interval_tree;
@@ -223,7 +224,7 @@ fn delete_empty_columns_pairs(records: Vec<(String, String)>) -> Vec<(String, St
     min_failing_bp = 100,
     min_total_windows = 4,
 ))]
-fn is_low_complexity_nt(
+pub fn is_low_complexity_nt(
     seq: &str,
     window_size: usize,
     step: usize,
@@ -541,6 +542,7 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(column_cull::cull_columns, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::apply_gff_culls, m)?)?;
     m.add_function(wrap_pyfunction!(pssm::compute_pssm_for_window, m)?)?;
+    m.add_function(wrap_pyfunction!(exonfinder_post::exonfinder_process_gene, m)?)?;
 
     m.add_class::<interval_tree::OverlapTree>()?;
 

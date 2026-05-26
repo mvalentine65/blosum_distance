@@ -1,6 +1,6 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::Builder;
@@ -150,16 +150,14 @@ fn hmm_align_inner(
     // Mask stop codons (`*` -> `X`) in references only; the HMM model is
     // built from these and HMMER won't accept `*`.  Candidate `*`s are
     // preserved so downstream stages still see the stop signal.
-    {
-        let mut w = BufWriter::with_capacity(1 << 20, temp_aln.as_file_mut());
-        write_fasta_to_writer(&mut w, &references, true).map_err(|e| e.to_string())?;
-        w.flush().map_err(|e| e.to_string())?;
-    }
-    {
-        let mut w = BufWriter::with_capacity(1 << 20, temp_cand.as_file_mut());
-        write_fasta_to_writer(&mut w, &candidates, false).map_err(|e| e.to_string())?;
-        w.flush().map_err(|e| e.to_string())?;
-    }
+    //
+    // write_fasta_to_writer builds the complete Vec<u8> internally and emits
+    // it in a single write_all, so wrapping the file in a BufWriter would
+    // just add another copy-and-flush layer for no benefit.
+    write_fasta_to_writer(temp_aln.as_file_mut(), &references, true)
+        .map_err(|e| e.to_string())?;
+    write_fasta_to_writer(temp_cand.as_file_mut(), &candidates, false)
+        .map_err(|e| e.to_string())?;
 
     let aln_path = temp_aln.path().to_str().unwrap().to_string();
     let hmm_path = temp_hmm.path().to_str().unwrap().to_string();

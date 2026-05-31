@@ -22,9 +22,6 @@ use crate::column_cull::cull_columns;
 // Constants -- mirror sapphyre/outlier/exonfinder/core.py
 // ===========================================================================
 
-const GAP_ISOFORM_UNFILLED_THRESHOLD: f64 = 0.55;
-const SLOT_AUTHORITATIVE_THRESHOLD: f64 = 1.0 - GAP_ISOFORM_UNFILLED_THRESHOLD;
-
 const DEDUP_MAX_OVERLAP: usize = 8;
 const MIN_CASSETTE_SIZE_RATIO: f64 = 0.75;
 const MIN_CASSETTE_COL_OVERLAP: f64 = 0.80;
@@ -41,15 +38,11 @@ const MIN_AA_AFTER_SPLIT: usize = 15;
 const CASSETTE_OVERLAP_FRAC: f64 = 0.5;
 const CASSETTE_SCORE_RATIO: f64 = 0.85;
 
-const REF_COL_THRESHOLD: f64 = 0.33;
-
 const CASSETTE_MIN_SIZE_RATIO_SPLIT: f64 = 0.75;
 const CASSETTE_MIN_INTRON_BP_SPLIT: usize = 15;
 const CASSETTE_MIN_OVERLAP_SPLIT: f64 = 0.80;
 
 const CROSS_CLUSTER_OVERLAP_FRAC: f64 = 0.5;
-
-const PARTIAL_SLOT_POLICY_ACCEPT: bool = true;
 
 // PairKind tags returned by classify_pair.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -59,28 +52,6 @@ enum PairKind {
     GenomicOverlap,
     Cassette,
     SlotDuplicate,
-}
-
-// SlotKind tags returned by slot_state.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum SlotKind {
-    Empty,
-    OutOfScanScope,
-    AuthoritativeFill,
-    Partial,
-    CassettePartner,
-}
-
-impl SlotKind {
-    fn upper(self) -> &'static str {
-        match self {
-            SlotKind::Empty => "EMPTY",
-            SlotKind::OutOfScanScope => "OUT_OF_SCAN_SCOPE",
-            SlotKind::AuthoritativeFill => "AUTHORITATIVE_FILL",
-            SlotKind::Partial => "PARTIAL",
-            SlotKind::CassettePartner => "CASSETTE_PARTNER",
-        }
-    }
 }
 
 // ===========================================================================
@@ -254,16 +225,6 @@ fn is_gap(c: u8) -> bool {
 
 fn count_residues(seq: &str) -> usize {
     seq.bytes().filter(|&c| !is_gap(c)).count()
-}
-
-fn ungap(seq: &str) -> String {
-    let mut out = String::with_capacity(seq.len());
-    for c in seq.chars() {
-        if c != '-' && c != '.' {
-            out.push(c);
-        }
-    }
-    out
 }
 
 fn data_cols_set(seq: &str) -> BTreeSet<usize> {
@@ -1209,9 +1170,6 @@ impl RefColumn {
     fn get(&self, b: u8) -> i32 {
         *self.counts.get(&b).unwrap_or(&0)
     }
-    fn total(&self) -> i32 {
-        self.counts.values().sum()
-    }
     fn contains(&self, b: u8) -> bool {
         self.counts.contains_key(&b)
     }
@@ -1399,22 +1357,6 @@ fn detect_cassette_groups(
         out.push(sorted);
     }
     out
-}
-
-fn conserved_ref_columns(ref_columns: &[RefColumn]) -> BTreeSet<usize> {
-    let mut conserved: BTreeSet<usize> = BTreeSet::new();
-    for (col, rc) in ref_columns.iter().enumerate() {
-        let total = rc.total();
-        if total <= 0 {
-            continue;
-        }
-        let gaps = rc.get(b'-');
-        let occupied = total - gaps;
-        if (occupied as f64) / (total as f64) >= REF_COL_THRESHOLD {
-            conserved.insert(col);
-        }
-    }
-    conserved
 }
 
 // is_same_kmer: hamming distance over equal-length slices.
@@ -1985,7 +1927,7 @@ pub fn exonfinder_process_gene(
     }
 
     let t_cull = Instant::now();
-    let (mut culled_records, mut nt_cull_map) = if disable_column_cull {
+    let (mut culled_records, nt_cull_map) = if disable_column_cull {
         (aligned, HashMap::new())
     } else {
         let (cr, nc, _gff_cull, _gff_intron, _exon_split) = cull_columns(

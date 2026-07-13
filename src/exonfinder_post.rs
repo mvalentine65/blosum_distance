@@ -2,9 +2,9 @@
 //! `recovery.py` it depends on.  The single PyO3 entry point
 //! [`exonfinder_process_gene`] runs the entire per-gene worker without
 //! returning to Python in between -- hmm_align, column cull, low-complexity
-//! filter, PSSM scoring, dedup, cross-cluster genomic dedup, MXE late kick,
+//! filter, PSSM scoring, dedup, cross-cluster genomic dedup, IMX late kick,
 //! native supersession, tag assignment, and the final per-cluster overlap +
-//! cassette split all happen inside this call.
+//! module split all happen inside this call.
 //!
 //! Logging and rejection strings are emitted byte-for-byte identical to the
 //! Python implementation so existing log parsers and audit pipelines keep
@@ -23,9 +23,9 @@ use crate::column_cull::cull_columns;
 // ===========================================================================
 
 const DEDUP_MAX_OVERLAP: usize = 8;
-const MIN_CASSETTE_SIZE_RATIO: f64 = 0.75;
-const MIN_CASSETTE_COL_OVERLAP: f64 = 0.80;
-const MIN_CASSETTE_COL_OVERLAP_LARGER: f64 = 0.75;
+const MIN_MODULE_SIZE_RATIO: f64 = 0.75;
+const MIN_MODULE_COL_OVERLAP: f64 = 0.80;
+const MIN_MODULE_COL_OVERLAP_LARGER: f64 = 0.75;
 const MIN_INTRON_BP: usize = 30;
 
 const NATIVE_OVERLAP_FRAC: f64 = 0.80;
@@ -35,12 +35,12 @@ const MIN_COVERED_PCT: f64 = 20.0;
 
 const MIN_AA_AFTER_SPLIT: usize = 15;
 
-const CASSETTE_OVERLAP_FRAC: f64 = 0.5;
-const CASSETTE_SCORE_RATIO: f64 = 0.85;
+const MODULE_OVERLAP_FRAC: f64 = 0.5;
+const MODULE_SCORE_RATIO: f64 = 0.85;
 
-const CASSETTE_MIN_SIZE_RATIO_SPLIT: f64 = 0.75;
-const CASSETTE_MIN_INTRON_BP_SPLIT: usize = 15;
-const CASSETTE_MIN_OVERLAP_SPLIT: f64 = 0.80;
+const MODULE_MIN_SIZE_RATIO_SPLIT: f64 = 0.75;
+const MODULE_MIN_INTRON_BP_SPLIT: usize = 15;
+const MODULE_MIN_OVERLAP_SPLIT: f64 = 0.80;
 
 const CROSS_CLUSTER_OVERLAP_FRAC: f64 = 0.5;
 
@@ -50,7 +50,7 @@ enum PairKind {
     Independent,
     MonotonicityBreak,
     GenomicOverlap,
-    Cassette,
+    Module,
     SlotDuplicate,
 }
 
@@ -95,7 +95,7 @@ pub struct GapInput {
     pub gap_end: usize,
     pub node_a_name: String,
     pub node_b_name: String,
-    pub mxe_slot_node: String,
+    pub imx_slot_node: String,
     pub cluster_key: String,
 }
 
@@ -161,7 +161,7 @@ struct GapAnchor {
 }
 
 #[derive(Clone, Debug)]
-struct MxeAnchor {
+struct ImxAnchor {
     slot_node: String,
     base_cluster_key: String,
     left_flank: String,
@@ -169,9 +169,9 @@ struct MxeAnchor {
 }
 
 #[derive(Clone, Debug)]
-struct CassetteRel {
+struct ModuleRel {
     partner_tag: String,
-    cassette_type: String,
+    module_type: String,
     slot_cols: BTreeSet<usize>,
 }
 
@@ -203,8 +203,8 @@ struct Recovery {
     gene_key: String,
     flank_anchor: Option<FlankAnchor>,
     gap_anchor: Option<GapAnchor>,
-    mxe_anchor: Option<MxeAnchor>,
-    cassette: Option<CassetteRel>,
+    imx_anchor: Option<ImxAnchor>,
+    module: Option<ModuleRel>,
     final_tag: Option<String>,
 }
 
@@ -564,7 +564,7 @@ struct PairRelation {
 fn classify_pair(
     cand: &Recovery,
     acc: &Recovery,
-    cand_is_mxe_scan: bool,
+    cand_is_imx_scan: bool,
 ) -> PairRelation {
     let cand_cols = &cand.locus.msa_cols;
     let acc_cols = &acc.locus.msa_cols;
@@ -618,24 +618,24 @@ fn classify_pair(
         0.0
     };
     let score_ratio_ok = acc.score.covered_blosum <= 0.0
-        || cand.score.covered_blosum >= acc.score.covered_blosum * CASSETTE_SCORE_RATIO;
+        || cand.score.covered_blosum >= acc.score.covered_blosum * MODULE_SCORE_RATIO;
 
-    let msa_cassette_skip =
-        shorter_span > 0 && msa_overlap_frac >= CASSETTE_OVERLAP_FRAC;
+    let msa_module_skip =
+        shorter_span > 0 && msa_overlap_frac >= MODULE_OVERLAP_FRAC;
 
     if col_overlap > DEDUP_MAX_OVERLAP {
         if genomic_overlap {
             return PairRelation { kind: PairKind::SlotDuplicate, genomic_dist };
         }
-        let cassette_geometry = same_locus
+        let module_geometry = same_locus
             && larger > 0
-            && size_ratio >= MIN_CASSETTE_SIZE_RATIO
-            && col_overlap_frac_smaller >= MIN_CASSETTE_COL_OVERLAP
-            && col_overlap_frac_larger >= MIN_CASSETTE_COL_OVERLAP_LARGER
+            && size_ratio >= MIN_MODULE_SIZE_RATIO
+            && col_overlap_frac_smaller >= MIN_MODULE_COL_OVERLAP
+            && col_overlap_frac_larger >= MIN_MODULE_COL_OVERLAP_LARGER
             && genomic_dist >= MIN_INTRON_BP
             && score_ratio_ok;
-        if cassette_geometry {
-            return PairRelation { kind: PairKind::Cassette, genomic_dist };
+        if module_geometry {
+            return PairRelation { kind: PairKind::Module, genomic_dist };
         }
         return PairRelation { kind: PairKind::SlotDuplicate, genomic_dist };
     }
@@ -644,7 +644,7 @@ fn classify_pair(
         return PairRelation { kind: PairKind::Independent, genomic_dist };
     }
 
-    if !cand_is_mxe_scan && !msa_cassette_skip {
+    if !cand_is_imx_scan && !msa_module_skip {
         let mono_break = if cand.locus.strand == "+" {
             (cand.locus.bp_start > acc.locus.bp_start && cand_msa_min < acc_msa_min)
                 || (cand.locus.bp_start < acc.locus.bp_start && cand_msa_min > acc_msa_min)
@@ -668,20 +668,20 @@ fn classify_pair(
 struct DedupCounts {
     n_in: usize,
     accepted: usize,
-    cassette: usize,
+    module: usize,
     rej_mono: usize,
     rej_genomic: usize,
     rej_overlap: usize,
 }
 
 /// Greedy per-group dedup; mirrors `_dedup_group`.  Mutates incoming
-/// recoveries (sets `cassette` field on cassette partners).  Returns the
+/// recoveries (sets `module` field on module partners).  Returns the
 /// indices of accepted entries plus counts.
 fn dedup_group(
     sorted_cands: &mut [(String, String, Recovery)],
     scope: &str,
     group_label: &str,
-    cassette_type_for: impl Fn(&Recovery) -> &'static str,
+    module_type_for: impl Fn(&Recovery) -> &'static str,
     rejection_log: &mut Vec<String>,
     debug_level: i32,
 ) -> (Vec<usize>, DedupCounts) {
@@ -691,13 +691,13 @@ fn dedup_group(
     counts.n_in = sorted_cands.len();
 
     for i in 0..sorted_cands.len() {
-        let (tag, region, data_cols, is_mxe_scan, full_blosum, covered_blosum, gap_residues_score) = {
+        let (tag, region, data_cols, is_imx_scan, full_blosum, covered_blosum, gap_residues_score) = {
             let r = &sorted_cands[i].2;
             (
                 r.tag.clone(),
                 fmt_region(&r.locus),
                 r.locus.msa_cols.clone(),
-                r.mxe_anchor.is_some(),
+                r.imx_anchor.is_some(),
                 r.score.full_blosum,
                 r.score.covered_blosum,
                 r.score.gap_residues,
@@ -708,10 +708,10 @@ fn dedup_group(
 
         let mut mono_violator: Option<usize> = None;
         let mut genomic_violator: Option<usize> = None;
-        let mut cassette_partner: Option<(usize, PairRelation)> = None;
+        let mut module_partner: Option<(usize, PairRelation)> = None;
 
         for &acc_i in &accepted_idx {
-            let rel = classify_pair(&sorted_cands[i].2, &sorted_cands[acc_i].2, is_mxe_scan);
+            let rel = classify_pair(&sorted_cands[i].2, &sorted_cands[acc_i].2, is_imx_scan);
             match rel.kind {
                 PairKind::MonotonicityBreak if mono_violator.is_none() => {
                     mono_violator = Some(acc_i);
@@ -719,8 +719,8 @@ fn dedup_group(
                 PairKind::GenomicOverlap if genomic_violator.is_none() => {
                     genomic_violator = Some(acc_i);
                 }
-                PairKind::Cassette if cassette_partner.is_none() => {
-                    cassette_partner = Some((acc_i, rel));
+                PairKind::Module if module_partner.is_none() => {
+                    module_partner = Some((acc_i, rel));
                 }
                 _ => {}
             }
@@ -763,25 +763,25 @@ fn dedup_group(
         }
 
         let mut overlap_rej = false;
-        if let Some((acc_i, rel)) = cassette_partner {
-            let cassette_type = cassette_type_for(&sorted_cands[i].2);
+        if let Some((acc_i, rel)) = module_partner {
+            let module_type = module_type_for(&sorted_cands[i].2);
             let acc_tag = sorted_cands[acc_i].2.tag.clone();
             let acc_cols = sorted_cands[acc_i].2.locus.msa_cols.clone();
-            sorted_cands[i].2.cassette = Some(CassetteRel {
+            sorted_cands[i].2.module = Some(ModuleRel {
                 partner_tag: acc_tag.clone(),
-                cassette_type: cassette_type.to_string(),
+                module_type: module_type.to_string(),
                 slot_cols: data_cols.clone(),
             });
-            sorted_cands[acc_i].2.cassette = Some(CassetteRel {
+            sorted_cands[acc_i].2.module = Some(ModuleRel {
                 partner_tag: tag.clone(),
-                cassette_type: cassette_type.to_string(),
+                module_type: module_type.to_string(),
                 slot_cols: acc_cols,
             });
             rejection_log.push(format!(
-                "CASSETTE_DETECTED {} partner={} type={} dist={}bp scope={} region={}",
-                tag, acc_tag, cassette_type, rel.genomic_dist, scope, region,
+                "MODULE_DETECTED {} partner={} type={} dist={}bp scope={} region={}",
+                tag, acc_tag, module_type, rel.genomic_dist, scope, region,
             ));
-            counts.cassette += 1;
+            counts.module += 1;
         } else if (overlap as f64) > overlap_thr {
             rejection_log.push(format!(
                 "REJECTED {} reason=slot_duplicate overlap={} scope={} region={}",
@@ -811,14 +811,14 @@ fn emit_group_summary(
     counts: &DedupCounts,
 ) {
     if counts.n_in > 1
-        || counts.cassette > 0
+        || counts.module > 0
         || counts.rej_mono > 0
         || counts.rej_genomic > 0
         || counts.rej_overlap > 0
     {
         rejection_log.push(format!(
-            "GROUP_SUMMARY in={} accepted={} cassette={} rej_mono={} rej_genomic={} rej_overlap={} scope={} {}",
-            counts.n_in, counts.accepted, counts.cassette,
+            "GROUP_SUMMARY in={} accepted={} module={} rej_mono={} rej_genomic={} rej_overlap={} scope={} {}",
+            counts.n_in, counts.accepted, counts.module,
             counts.rej_mono, counts.rej_genomic, counts.rej_overlap,
             scope, group_label,
         ));
@@ -915,15 +915,15 @@ fn cross_cluster_genomic_dedup(
 }
 
 // ===========================================================================
-// MXE late kick + slot-sibling enumeration -- mirrors _mxe_late_kick /
-// _collect_mxe_slot_siblings
+// IMX late kick + slot-sibling enumeration -- mirrors _imx_late_kick /
+// _collect_imx_slot_siblings
 // ===========================================================================
 
-fn collect_mxe_slot_siblings(
+fn collect_imx_slot_siblings(
     candidate_cluster_key: &str,
     left_flank: &str,
     right_flank: &str,
-    mxe_slot_node: &str,
+    imx_slot_node: &str,
     clusters: &HashMap<String, Vec<String>>,
 ) -> HashSet<String> {
     let mut siblings: HashSet<String> = HashSet::new();
@@ -947,7 +947,7 @@ fn collect_mxe_slot_siblings(
         if let (Some(lp), Some(rp)) = (lp, rp) {
             let (lo, hi) = if lp < rp { (lp, rp) } else { (rp, lp) };
             for t in &tokens[lo + 1..hi] {
-                if t != mxe_slot_node {
+                if t != imx_slot_node {
                     siblings.insert(t.clone());
                 }
             }
@@ -956,7 +956,7 @@ fn collect_mxe_slot_siblings(
     siblings
 }
 
-fn mxe_late_kick(
+fn imx_late_kick(
     surviving_gaps: Vec<Recovery>,
     seq_by_token: &HashMap<String, String>,
     clusters: &HashMap<String, Vec<String>>,
@@ -968,19 +968,19 @@ fn mxe_late_kick(
     let mut kept: Vec<Recovery> = Vec::with_capacity(surviving_gaps.len());
 
     for rec in surviving_gaps {
-        let Some(mxe) = rec.mxe_anchor.clone() else {
+        let Some(imx) = rec.imx_anchor.clone() else {
             kept.push(rec);
             continue;
         };
-        if rec.cassette.is_some() {
+        if rec.module.is_some() {
             kept.push(rec);
             continue;
         }
-        let sibs = collect_mxe_slot_siblings(
+        let sibs = collect_imx_slot_siblings(
             &rec.cluster_key,
-            &mxe.left_flank,
-            &mxe.right_flank,
-            &mxe.slot_node,
+            &imx.left_flank,
+            &imx.right_flank,
+            &imx.slot_node,
             clusters,
         );
         let sib_seqs: Vec<(String, String)> = sibs
@@ -998,12 +998,12 @@ fn mxe_late_kick(
         let region = fmt_region(&rec.locus);
 
         if (r_len as f64) < (min_len as f64) * 0.8 || (r_len as f64) > (max_len as f64) * 1.2 {
-            *gap_counts.entry("kick_mxe_length").or_default() += 1;
+            *gap_counts.entry("kick_imx_length").or_default() += 1;
             kicked_tags.insert(rec.current_tag().to_string());
             kicked_headers.insert(rec.header.clone());
             rejection_log.push(format!(
-                "REJECTED {} reason=mxe_length cand_len={} range=[{},{}] slot={} cluster={} region={}",
-                rec.tag, r_len, min_len, max_len, mxe.slot_node, rec.cluster_key, region,
+                "REJECTED {} reason=imx_length cand_len={} range=[{},{}] slot={} cluster={} region={}",
+                rec.tag, r_len, min_len, max_len, imx.slot_node, rec.cluster_key, region,
             ));
             continue;
         }
@@ -1018,15 +1018,15 @@ fn mxe_late_kick(
             }
         }
         if best_sim < 0.25 {
-            *gap_counts.entry("kick_mxe_similarity").or_default() += 1;
+            *gap_counts.entry("kick_imx_similarity").or_default() += 1;
             kicked_tags.insert(rec.current_tag().to_string());
             kicked_headers.insert(rec.header.clone());
             rejection_log.push(format!(
-                "REJECTED {} reason=mxe_similarity best_sim={:.1}% thr=25.0% against={} slot={} cluster={} region={}",
+                "REJECTED {} reason=imx_similarity best_sim={:.1}% thr=25.0% against={} slot={} cluster={} region={}",
                 rec.tag,
                 best_sim * 100.0,
                 best_sib,
-                mxe.slot_node,
+                imx.slot_node,
                 rec.cluster_key,
                 region,
             ));
@@ -1064,9 +1064,9 @@ fn supersede_natives(
         }
     }
 
-    let mxe_loci: Vec<(String, usize, usize, String, String)> = surviving_gaps
+    let imx_loci: Vec<(String, usize, usize, String, String)> = surviving_gaps
         .iter()
-        .filter(|r| r.mxe_anchor.is_some())
+        .filter(|r| r.imx_anchor.is_some())
         .map(|r| {
             (
                 r.locus.scaffold.clone(),
@@ -1078,7 +1078,7 @@ fn supersede_natives(
         .collect();
     let plain_loci: Vec<(String, usize, usize, String, String)> = surviving_gaps
         .iter()
-        .filter(|r| r.mxe_anchor.is_none() && r.current_tag().starts_with("GAP_"))
+        .filter(|r| r.imx_anchor.is_none() && r.current_tag().starts_with("GAP_"))
         .map(|r| {
             (
                 r.locus.scaffold.clone(),
@@ -1116,8 +1116,8 @@ fn supersede_natives(
         if n_len == 0 {
             continue;
         }
-        // MXE supersession: stop on first hit.
-        for g in &mxe_loci {
+        // IMX supersession: stop on first hit.
+        for g in &imx_loci {
             if let Some((contained, overlap)) =
                 covers(&g.0, g.1, g.2, &g.3, &n_entry.scaffold, n_entry.start, n_entry.end, &n_entry.strand, n_len)
             {
@@ -1154,8 +1154,8 @@ fn supersede_natives(
 }
 
 // ===========================================================================
-// split_calc ports: build_ref_columns, calculate_split, is_cassette_pair,
-// detect_cassette_groups
+// split_calc ports: build_ref_columns, calculate_split, is_module_pair,
+// detect_module_groups
 // ===========================================================================
 
 #[derive(Default, Clone, Debug)]
@@ -1254,7 +1254,7 @@ fn calculate_split(
     highest_pos
 }
 
-fn is_cassette_pair_aligned(
+fn is_module_pair_aligned(
     seq_a: &str,
     seq_b: &str,
     parent_a: &str,
@@ -1266,7 +1266,7 @@ fn is_cassette_pair_aligned(
         return false;
     }
     let dist = (gpos_a as i64 - gpos_b as i64).unsigned_abs() as usize;
-    if dist < CASSETTE_MIN_INTRON_BP_SPLIT {
+    if dist < MODULE_MIN_INTRON_BP_SPLIT {
         return false;
     }
     let a_bytes = seq_a.as_bytes();
@@ -1284,14 +1284,14 @@ fn is_cassette_pair_aligned(
     }
     let smaller = coords_a.len().min(coords_b.len());
     let larger = coords_a.len().max(coords_b.len());
-    if (smaller as f64) / (larger as f64) < CASSETTE_MIN_SIZE_RATIO_SPLIT {
+    if (smaller as f64) / (larger as f64) < MODULE_MIN_SIZE_RATIO_SPLIT {
         return false;
     }
     let overlap = coords_a.intersection(&coords_b).count();
-    (overlap as f64) / (smaller as f64) >= CASSETTE_MIN_OVERLAP_SPLIT
+    (overlap as f64) / (smaller as f64) >= MODULE_MIN_OVERLAP_SPLIT
 }
 
-fn detect_cassette_groups(
+fn detect_module_groups(
     members: &[String],
     records_map: &HashMap<String, String>,
     header_to_gff: &dyn Fn(&str) -> Option<(String, usize, String)>,
@@ -1329,7 +1329,7 @@ fn detect_cassette_groups(
             let hj = &members[j];
             let Some(gj) = header_to_gff(hj) else { continue };
             let Some(seq_j) = records_map.get(hj) else { continue };
-            if is_cassette_pair_aligned(seq_i, seq_j, &gi.0, gi.1, &gj.0, gj.1) {
+            if is_module_pair_aligned(seq_i, seq_j, &gi.0, gi.1, &gj.0, gj.1) {
                 union(&mut parent, hi, hj);
             }
         }
@@ -1540,18 +1540,18 @@ fn run_final_split(
     cluster_keys.sort();
     for ck in cluster_keys {
         let cluster_all = cluster_members.get(ck).cloned().unwrap_or_default();
-        let groups = detect_cassette_groups(&cluster_all, &records_map, &header_to_gff);
+        let groups = detect_module_groups(&cluster_all, &records_map, &header_to_gff);
 
-        let mut cassette_non_reps: HashSet<String> = HashSet::new();
+        let mut module_non_reps: HashSet<String> = HashSet::new();
         for group in &groups {
             for sib in group.iter().skip(1) {
-                cassette_non_reps.insert(sib.clone());
+                module_non_reps.insert(sib.clone());
             }
         }
 
         let mut members: Vec<String> = cluster_all
             .iter()
-            .filter(|m| !cassette_non_reps.contains(*m))
+            .filter(|m| !module_non_reps.contains(*m))
             .cloned()
             .collect();
         if members.len() < 2 && groups.is_empty() {
@@ -1605,10 +1605,10 @@ fn run_final_split(
                 let gff_a = header_to_gff(&a_hdr);
                 let gff_b = header_to_gff(&b_hdr);
                 if let (Some(ga), Some(gb)) = (gff_a, gff_b) {
-                    if is_cassette_pair_aligned(&seq_a, &seq_b, &ga.0, ga.1, &gb.0, gb.1) {
+                    if is_module_pair_aligned(&seq_a, &seq_b, &ga.0, ga.1, &gb.0, gb.1) {
                         if debug {
                             cluster_block.push(format!(
-                                "gene={} cluster={} CASSETTE_SKIP {} vs {}",
+                                "gene={} cluster={} MODULE_SKIP {} vs {}",
                                 gene_tag, ck, a_tag, b_tag,
                             ));
                         }
@@ -1698,7 +1698,7 @@ fn run_final_split(
             i += 1;
         }
 
-        // Cassette sibling trim against the rep.
+        // Module sibling trim against the rep.
         for group in &groups {
             let Some(rep_hdr) = group.first() else { continue };
             if !records_map.contains_key(rep_hdr) {
@@ -1759,7 +1759,7 @@ fn run_final_split(
                 if debug {
                     let rep_kick_note = if rep_kicked { " rep_kicked=True" } else { "" };
                     cluster_block.push(format!(
-                        "gene={} cluster={} CASSETTE_TRIM rep={} sib={} dropped={} left={} right={} window=[{},{}) remaining={}{}",
+                        "gene={} cluster={} MODULE_TRIM rep={} sib={} dropped={} left={} right={} window=[{},{}) remaining={}{}",
                         gene_tag, ck, rep_tag, tag, dropped, left_trim, right_trim,
                         rep_start, rep_end, remaining, rep_kick_note,
                     ));
@@ -1768,7 +1768,7 @@ fn run_final_split(
                     split_kicked.insert(sib_hdr.clone());
                     if debug {
                         cluster_block.push(format!(
-                            "gene={} cluster={} KICK {} reason=<{}_aa_after_cassette_trim remaining={}",
+                            "gene={} cluster={} KICK {} reason=<{}_aa_after_module_trim remaining={}",
                             gene_tag, ck, tag, MIN_AA_AFTER_SPLIT, remaining,
                         ));
                     }
@@ -2022,8 +2022,8 @@ pub fn exonfinder_process_gene(
                 is_leading: fi.is_leading,
             }),
             gap_anchor: None,
-            mxe_anchor: None,
-            cassette: None,
+            imx_anchor: None,
+            module: None,
             final_tag: None,
         };
         flank_rec_by_header.insert(fi.header.clone(), rec);
@@ -2200,11 +2200,11 @@ pub fn exonfinder_process_gene(
     let t_flank = t_flank_total.elapsed().as_secs_f64();
 
     // -------------------------------------------------------------------
-    // 7. Gap scoring + per-cluster dedup + cross-cluster dedup + MXE late kick.
+    // 7. Gap scoring + per-cluster dedup + cross-cluster dedup + IMX late kick.
     // -------------------------------------------------------------------
     let t_gap_total = Instant::now();
     let mut surviving_gaps: Vec<Recovery> = Vec::new();
-    let mut mxe_late_kicks: HashSet<String> = HashSet::new();
+    let mut imx_late_kicks: HashSet<String> = HashSet::new();
 
     let mut gap_recoveries_by_header: HashMap<String, Vec<Recovery>> = HashMap::new();
     if !gap_inputs_by_header.is_empty() {
@@ -2216,9 +2216,9 @@ pub fn exonfinder_process_gene(
         for header in culled_header_set.iter() {
             let Some(raw_entries) = gap_inputs_by_header.get(header) else { continue };
             for gi in raw_entries {
-                let mxe_anchor = if !gi.mxe_slot_node.is_empty() {
-                    Some(MxeAnchor {
-                        slot_node: gi.mxe_slot_node.clone(),
+                let imx_anchor = if !gi.imx_slot_node.is_empty() {
+                    Some(ImxAnchor {
+                        slot_node: gi.imx_slot_node.clone(),
                         base_cluster_key: gi.cluster_key.clone(),
                         left_flank: gi.node_a_name.clone(),
                         right_flank: gi.node_b_name.clone(),
@@ -2254,8 +2254,8 @@ pub fn exonfinder_process_gene(
                         node_a: gi.node_a_name.clone(),
                         node_b: gi.node_b_name.clone(),
                     }),
-                    mxe_anchor,
-                    cassette: None,
+                    imx_anchor,
+                    module: None,
                     final_tag: None,
                 };
                 if let Some(drops) = nt_cull_map.get(header) {
@@ -2410,7 +2410,7 @@ pub fn exonfinder_process_gene(
                 &mut cands,
                 "gap",
                 &group_label,
-                |_r| "MXE",
+                |_r| "IMX",
                 &mut rejection_log,
                 debug_level,
             );
@@ -2423,7 +2423,7 @@ pub fn exonfinder_process_gene(
         }
         culled_records = filtered_culled;
 
-        // MXE late kick.
+        // IMX late kick.
         let seq_by_token: HashMap<String, String> = culled_records
             .iter()
             .filter(|(h, _)| !h.ends_with('.'))
@@ -2432,7 +2432,7 @@ pub fn exonfinder_process_gene(
                 if t != h { Some((t.to_string(), s.clone())) } else { None }
             })
             .collect();
-        let (kept, kicked_headers_mxe, new_kicks) = mxe_late_kick(
+        let (kept, kicked_headers_imx, new_kicks) = imx_late_kick(
             surviving_gaps,
             &seq_by_token,
             &clusters_for_gene,
@@ -2440,9 +2440,9 @@ pub fn exonfinder_process_gene(
             &mut gap_counts,
         );
         surviving_gaps = kept;
-        mxe_late_kicks.extend(new_kicks);
-        if !kicked_headers_mxe.is_empty() {
-            culled_records.retain(|(h, _)| !kicked_headers_mxe.contains(h));
+        imx_late_kicks.extend(new_kicks);
+        if !kicked_headers_imx.is_empty() {
+            culled_records.retain(|(h, _)| !kicked_headers_imx.contains(h));
         }
     }
     let t_gap = t_gap_total.elapsed().as_secs_f64();
@@ -2476,7 +2476,7 @@ pub fn exonfinder_process_gene(
 
     let mut kicked_headers: HashSet<String> = HashSet::new();
     let mut kicked_nodes: HashSet<String> = HashSet::new();
-    kicked_nodes.extend(mxe_late_kicks.iter().cloned());
+    kicked_nodes.extend(imx_late_kicks.iter().cloned());
 
     let culled_header_set: HashSet<String> = culled_records.iter().map(|(h, _)| h.clone()).collect();
     // Natives + flanks/gaps that disappeared during cull/scoring.
@@ -2572,7 +2572,7 @@ pub fn exonfinder_process_gene(
             .collect();
     }
 
-    // Supersession (pre-split, MXE only) + plain-gap refind rejection.
+    // Supersession (pre-split, IMX only) + plain-gap refind rejection.
     let (
         superseded_names,
         supersession_pairs,
@@ -2888,14 +2888,14 @@ fn assign_tags(
         ));
 
         let region = fmt_region(&r.locus);
-        let cassette_label = match r.cassette.as_ref() {
-            Some(c) => format!(" CASSETTE={}", c.cassette_type),
+        let module_label = match r.module.as_ref() {
+            Some(c) => format!(" MODULE={}", c.module_type),
             None => String::new(),
         };
         recovered_log.push(format!(
             "RECOVERED {}{} gene={} cluster={} win_cols={}-{} frame={}{}\n  region={}\n{}\n  full_blosum={:.1}% covered_blosum={:.1}% gap_residues={}\n  aa={}\n  nt={}",
             final_tag, header_suffix, gene_key, r.cluster_key,
-            r.score.win_start, r.score.win_end, r.locus.frame, cassette_label,
+            r.score.win_start, r.score.win_end, r.locus.frame, module_label,
             region, anchor_line,
             r.score.full_blosum, r.score.covered_blosum, r.score.gap_residues,
             r.aa_seq, r.nt_seq,
@@ -2984,25 +2984,25 @@ fn recovery_to_dict(py: Python<'_>, r: &Recovery) -> PyResult<Py<PyDict>> {
     } else {
         d.set_item("gap_anchor", py.None())?;
     }
-    if let Some(mx) = &r.mxe_anchor {
+    if let Some(mx) = &r.imx_anchor {
         let md = PyDict::new(py);
         md.set_item("slot_node", &mx.slot_node)?;
         md.set_item("base_cluster_key", &mx.base_cluster_key)?;
         md.set_item("left_flank", &mx.left_flank)?;
         md.set_item("right_flank", &mx.right_flank)?;
-        d.set_item("mxe_anchor", md)?;
+        d.set_item("imx_anchor", md)?;
     } else {
-        d.set_item("mxe_anchor", py.None())?;
+        d.set_item("imx_anchor", py.None())?;
     }
-    if let Some(c) = &r.cassette {
+    if let Some(c) = &r.module {
         let cd = PyDict::new(py);
         cd.set_item("partner_tag", &c.partner_tag)?;
-        cd.set_item("cassette_type", &c.cassette_type)?;
+        cd.set_item("module_type", &c.module_type)?;
         let cols = PyList::new(py, c.slot_cols.iter().copied())?;
         cd.set_item("slot_cols", cols)?;
-        d.set_item("cassette", cd)?;
+        d.set_item("module", cd)?;
     } else {
-        d.set_item("cassette", py.None())?;
+        d.set_item("module", py.None())?;
     }
     match &r.final_tag {
         Some(ft) => d.set_item("final_tag", ft)?,

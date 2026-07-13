@@ -962,9 +962,9 @@ struct GapCandidate {
     cluster_key: String,
     node_a_name: String,
     node_b_name: String,
-    /// For MXE region scan candidates: the base cluster's modular node
+    /// For IMX region scan candidates: the base cluster's modular node
     /// at this slot.  Empty for normal gap candidates.
-    mxe_slot_node: String,
+    imx_slot_node: String,
 }
 
 struct GeneResult {
@@ -1051,7 +1051,7 @@ fn process_gene(
         };
     }
 
-    // Index candidates by `nf` once. The MXE region scan and the per-cluster
+    // Index candidates by `nf` once. The IMX region scan and the per-cluster
     // filter both lookup candidates by node field — without this index they
     // each ran O(N) linear scans for every cluster / slot.
     let mut cands_by_nf: HashMap<&str, Vec<usize>> = HashMap::with_capacity(cands.len());
@@ -1066,39 +1066,39 @@ fn process_gene(
         gene, rcount, cands.len()
     ));
 
-    // Separate clusters into base and MXE, skip N-terminal
+    // Separate clusters into base and IMX, skip N-terminal
     let mut base_clusters: Vec<(&String, &Vec<String>, &String)> = Vec::new();
-    let mut mxe_clusters: Vec<(&String, &Vec<String>, &String)> = Vec::new();
+    let mut imx_clusters: Vec<(&String, &Vec<String>, &String)> = Vec::new();
     for (ck, (node_tokens, iso_type)) in clusters.iter() {
         if iso_type == "N-terminal" {
             continue;
         }
-        if iso_type == "MXE" {
-            mxe_clusters.push((ck, node_tokens, iso_type));
+        if iso_type == "IMX" {
+            imx_clusters.push((ck, node_tokens, iso_type));
         } else {
             base_clusters.push((ck, node_tokens, iso_type));
         }
     }
     base_clusters.sort_by_key(|(ck, _, _)| *ck);
-    mxe_clusters.sort_by_key(|(ck, _, _)| *ck);
+    imx_clusters.sort_by_key(|(ck, _, _)| *ck);
 
     let all_clusters: Vec<_> = base_clusters
         .iter()
-        .chain(mxe_clusters.iter())
+        .chain(imx_clusters.iter())
         .cloned()
         .collect();
 
-    // Build a map of known GFF intervals for each MXE cluster group.
+    // Build a map of known GFF intervals for each IMX cluster group.
     // Key = base cluster key (e.g. "86"), Value = vec of (scaffold, start, end)
     // for every node across all sibling isoforms (including the base).
-    // Used to narrow MXE gap search regions so the DP does not scan
-    // genomic intervals already occupied by known cassette variants
+    // Used to narrow IMX gap search regions so the DP does not scan
+    // genomic intervals already occupied by known module variants
     // from other isoforms.
-    let mxe_sibling_gff: HashMap<String, Vec<(String, usize, usize)>> = {
-        // Collect all MXE cluster keys grouped by base key
+    let imx_sibling_gff: HashMap<String, Vec<(String, usize, usize)>> = {
+        // Collect all IMX cluster keys grouped by base key
         let mut groups: HashMap<String, Vec<&Vec<String>>> = HashMap::new();
         for (ck, node_tokens, iso_type) in &all_clusters {
-            if *iso_type != "MXE" {
+            if *iso_type != "IMX" {
                 continue;
             }
             let base_key = ck
@@ -1122,7 +1122,7 @@ fn process_gene(
                 }
             }
             // Also include nodes from the base cluster itself, which
-            // may not be typed MXE (e.g. "C-terminal" with MXE children).
+            // may not be typed IMX (e.g. "C-terminal" with IMX children).
             if let Some((base_tokens, _)) = clusters.get(base_key.as_str()) {
                 for token in base_tokens {
                     if let Some(entry) = gff.get(token.as_str()) {
@@ -1139,22 +1139,22 @@ fn process_gene(
         result
     };
 
-    // For each MXE base cluster key, compute which of its nodes are
+    // For each IMX base cluster key, compute which of its nodes are
     // modular (i.e. get swapped out in at least one isoform).
     // A base node is modular if any isoform child does NOT contain it.
-    // Note: the base cluster itself may not be typed "MXE" (e.g. it
-    // could be "C-terminal" if the cluster has both MXE and C-terminal
+    // Note: the base cluster itself may not be typed "IMX" (e.g. it
+    // could be "C-terminal" if the cluster has both IMX and C-terminal
     // splicing).  We identify base clusters by checking whether any
-    // child key (with '_') is typed MXE.
+    // child key (with '_') is typed IMX.
     // BTreeMap: sorted iteration order is free and stable across runs.
     // Downstream loops push to `gap_candidates` in this order; a HashMap
     // here would randomize that and break downstream tie-breaking.
-    let mxe_base_modular: BTreeMap<String, HashSet<String>> = {
+    let imx_base_modular: BTreeMap<String, HashSet<String>> = {
         let mut result: BTreeMap<String, HashSet<String>> = BTreeMap::new();
-        // Group MXE isoform node-sets by base key
+        // Group IMX isoform node-sets by base key
         let mut iso_sets: HashMap<String, Vec<HashSet<String>>> = HashMap::new();
         for (ck, (node_tokens, iso_type)) in clusters.iter() {
-            if iso_type != "MXE" {
+            if iso_type != "IMX" {
                 continue;
             }
             let fields: HashSet<String> = node_tokens.iter().cloned().collect();
@@ -1162,7 +1162,7 @@ fn process_gene(
                 iso_sets.entry(bk).or_default().push(fields);
             }
         }
-        // For each base key that has MXE children, look up the base
+        // For each base key that has IMX children, look up the base
         // cluster's node list (regardless of its own iso_type) and
         // find which nodes are swapped out in at least one child.
         for (bk, children) in &iso_sets {
@@ -1185,7 +1185,7 @@ fn process_gene(
         let cluster_node_fields: HashSet<String> = node_tokens.iter().cloned().collect();
 
         // Pre-resolve this cluster's GFF intervals once, grouped by scaffold.
-        // The MXE sibling-narrowing filter inside the per-gap loop previously
+        // The IMX sibling-narrowing filter inside the per-gap loop previously
         // did a linear `cluster_node_fields.iter().any(|nf| gff.get(nf)...)`
         // per sibling interval per gap; with this index the check is an
         // O(1) HashSet lookup with no String allocation.
@@ -1199,11 +1199,11 @@ fn process_gene(
             }
         }
 
-        // For MXE clusters, identify modular nodes.
+        // For IMX clusters, identify modular nodes.
         // Isoform clusters: nodes present in the isoform but not the base.
         // Base clusters: nodes in the base that are replaced in at
         //   least one isoform child.
-        let modular_node_fields: HashSet<String> = if *iso_type == "MXE" {
+        let modular_node_fields: HashSet<String> = if *iso_type == "IMX" {
             if let Some(base_key) = ck.rsplit_once('_').map(|(k, _)| k.to_string()) {
                 if let Some((base_tokens, _)) = clusters.get(&base_key) {
                     let base_fields: HashSet<String> = base_tokens.iter().cloned().collect();
@@ -1216,7 +1216,7 @@ fn process_gene(
                 }
             } else {
                 // Base cluster: use precomputed modular set
-                mxe_base_modular
+                imx_base_modular
                     .get(*ck)
                     .cloned()
                     .unwrap_or_default()
@@ -1285,13 +1285,13 @@ fn process_gene(
             let node_a_name = na.nf.clone();
             let node_b_name = nb.nf.clone();
 
-            // MXE isoforms: skip gaps between two shared (non-modular)
+            // IMX isoforms: skip gaps between two shared (non-modular)
             // nodes.  These gaps duplicate work done by the base
             // cluster.  Only gaps touching a modular node may contain
-            // undiscovered cassette variants in the flanking intron.
+            // undiscovered module variants in the flanking intron.
             // The base cluster itself must process shared-shared gaps
             // because no other cluster will.
-            if *iso_type == "MXE" && ck.contains('_') && !modular_node_fields.is_empty() {
+            if *iso_type == "IMX" && ck.contains('_') && !modular_node_fields.is_empty() {
                 let a_mod = modular_node_fields.contains(&na.nf);
                 let b_mod = modular_node_fields.contains(&nb.nf);
                 if !a_mod && !b_mod {
@@ -1313,26 +1313,26 @@ fn process_gene(
                 (gb.end + 1, if ga.start > 0 { ga.start - 1 } else { 0 })
             };
 
-            // MXE gap narrowing.  Two complementary mechanisms:
+            // IMX gap narrowing.  Two complementary mechanisms:
             //
-            // (A) All MXE clusters: narrow around pre-existing GFF
+            // (A) All IMX clusters: narrow around pre-existing GFF
             //     nodes from sibling isoforms so the DP does not
-            //     scan over known cassette exons and produce
+            //     scan over known module exons and produce
             //     overlapping hits.
             //
             // (B) Isoform clusters only: further narrow around
             //     DP-recovered exons from the base cluster (which
             //     runs first) so each isoform searches only the
-            //     sub-region belonging to its own cassette module.
+            //     sub-region belonging to its own module module.
             let (mut rs, mut re) = (region_start, region_end);
-            if *iso_type == "MXE" {
+            if *iso_type == "IMX" {
                 let base_key = ck
                     .rsplit_once('_')
                     .map(|(k, _)| k.to_string())
                     .unwrap_or_else(|| (*ck).clone());
 
                 // (A) Narrow around sibling GFF nodes
-                if let Some(sibling_intervals) = mxe_sibling_gff.get(&base_key) {
+                if let Some(sibling_intervals) = imx_sibling_gff.get(&base_key) {
                     let foreign: Vec<(usize, usize)> = sibling_intervals
                         .iter()
                         .filter(|(sscaf, ss, se)| {
@@ -1450,19 +1450,19 @@ fn process_gene(
                     cluster_key: ck.to_string(),
                     node_a_name: node_a_name.clone(),
                     node_b_name: node_b_name.clone(),
-                    mxe_slot_node: String::new(),
+                    imx_slot_node: String::new(),
                 });
             }
         }
     }
 
-    // MXE region scan: for each modular slot, simulate a gap between
+    // IMX region scan: for each modular slot, simulate a gap between
     // the two constitutive flanking nodes and extract ORFs from the
     // full intervening genomic region.
     {
-        let mut mxe_scanned: HashSet<(String, String, String)> = HashSet::new();
+        let mut imx_scanned: HashSet<(String, String, String)> = HashSet::new();
 
-        for (base_key, modular_set) in &mxe_base_modular {
+        for (base_key, modular_set) in &imx_base_modular {
             let Some((base_tokens, _)) = clusters.get(base_key.as_str()) else {
                 continue;
             };
@@ -1470,10 +1470,10 @@ fn process_gene(
                 continue;
             }
 
-            // Known sibling cassette intervals for this MXE group.
-            // Used to trim (not reject) overlapping ORFs so novel cassettes
+            // Known sibling module intervals for this IMX group.
+            // Used to trim (not reject) overlapping ORFs so novel modules
             // flanking or between known siblings can still surface.
-            let known_intervals: Vec<(String, usize, usize)> = mxe_sibling_gff
+            let known_intervals: Vec<(String, usize, usize)> = imx_sibling_gff
                 .get(base_key)
                 .cloned()
                 .unwrap_or_default();
@@ -1501,10 +1501,10 @@ fn process_gene(
                 let strand = &left_gff.strand;
 
                 let scan_key = (scaffold.clone(), left_node.clone(), right_node.clone());
-                if mxe_scanned.contains(&scan_key) {
+                if imx_scanned.contains(&scan_key) {
                     continue;
                 }
-                mxe_scanned.insert(scan_key);
+                imx_scanned.insert(scan_key);
 
                 // MSA gap window between the two constitutive flanks. Use
                 // the prebuilt index instead of two linear scans of `cands`.
@@ -1547,7 +1547,7 @@ fn process_gene(
 
                 let total_gap_cols = gap_end - gap_start;
                 flog.push(format!(
-                    "  MXE_SCAN slot={} flanks={}..{} region={}:{}-{}({}) gap_cols={}-{} eff={}/{} min_aa={}",
+                    "  IMX_SCAN slot={} flanks={}..{} region={}:{}-{}({}) gap_cols={}-{} eff={}/{} min_aa={}",
                     token, left_node, right_node, scaffold,
                     rs, re, strand, gap_start, gap_end, effective_gap, total_gap_cols, gap_min_aa,
                 ));
@@ -1562,7 +1562,7 @@ fn process_gene(
                 }
 
                 flog.push(format!(
-                    "  >mxe_region {}:{}-{}({}) len={}",
+                    "  >imx_region {}:{}-{}({}) len={}",
                     scaffold, rs, re, strand, sr.len()
                 ));
                 flog.push(format!("  {}", String::from_utf8_lossy(&sr)));
@@ -1671,7 +1671,7 @@ fn process_gene(
                         let nt_str = String::from_utf8_lossy(nt_slice).to_string();
 
                         flog.push(format!(
-                            "    MXE_ORF: frame={} aa_len={} genomic={}:{}-{}({})\n      aa={}",
+                            "    IMX_ORF: frame={} aa_len={} genomic={}:{}-{}({})\n      aa={}",
                             fv, frag_len, scaffold, hss, hse, strand, aa_str,
                         ));
 
@@ -1688,14 +1688,14 @@ fn process_gene(
                             cluster_key: base_key.clone(),
                             node_a_name: left_node.clone(),
                             node_b_name: right_node.clone(),
-                            mxe_slot_node: token.clone(),
+                            imx_slot_node: token.clone(),
                         });
                         kept += 1;
                     }
                 }
 
                 flog.push(format!(
-                    "  MXE_SCAN_RESULT: {} ORFs extracted, {} new candidates",
+                    "  IMX_SCAN_RESULT: {} ORFs extracted, {} new candidates",
                     orfs.len(), kept,
                 ));
             }
@@ -1952,8 +1952,8 @@ pub fn exon_dp(
             gcd.set_item("cluster_key", &gc.cluster_key)?;
             gcd.set_item("node_a_name", &gc.node_a_name)?;
             gcd.set_item("node_b_name", &gc.node_b_name)?;
-            if !gc.mxe_slot_node.is_empty() {
-                gcd.set_item("mxe_slot_node", &gc.mxe_slot_node)?;
+            if !gc.imx_slot_node.is_empty() {
+                gcd.set_item("imx_slot_node", &gc.imx_slot_node)?;
             }
             py_gap_cands.append(gcd)?;
         }

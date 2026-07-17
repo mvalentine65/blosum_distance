@@ -739,7 +739,50 @@ fn load_genome_from_rocksdb(
         }
     };
 
-    // Try indexed lookups first (new format: scaffold_index key)
+    // chunk-v1: scaffolds stored as "pseq:{sid}:{blk}"; scaffold_index columns
+    // are name, sid, unused, length. Read chunks until `length` bytes.
+    let seq_format = db.get(b"get:seq_format").ok().flatten();
+    if seq_format.as_deref() == Some(&b"chunk-v1"[..]) {
+        let idx_raw = match db.get(b"scaffold_index") {
+            Ok(Some(v)) => v,
+            _ => {
+                eprintln!("chunk-v1 nt_db has no scaffold_index");
+                return HashMap::new();
+            }
+        };
+        let idx_str = String::from_utf8_lossy(&idx_raw);
+        let mut scaffolds = HashMap::with_capacity(needed.len());
+        for line in idx_str.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 4 {
+                continue;
+            }
+            let name = parts[0];
+            if !needed.contains(name) {
+                continue;
+            }
+            let sid: usize = match parts[1].parse() {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            let length: usize = parts[3].parse().unwrap_or(0);
+            let mut seq: Vec<u8> = Vec::with_capacity(length);
+            let mut blk = 0usize;
+            while seq.len() < length {
+                let key = format!("pseq:{}:{}", sid, blk);
+                match db.get(key.as_bytes()) {
+                    Ok(Some(chunk)) => seq.extend_from_slice(&chunk),
+                    _ => break,
+                }
+                blk += 1;
+            }
+            seq.truncate(length);
+            scaffolds.insert(name.to_string(), seq);
+        }
+        return scaffolds;
+    }
+
+    // Legacy indexed lookups (older DBs: scaffold_index + parentbatch:N blobs)
     if let Ok(Some(idx_raw)) = db.get(b"scaffold_index") {
         let idx_str = String::from_utf8_lossy(&idx_raw);
         // Parse index: each line is "name\tbatch_index\tbyte_offset\tseq_length"

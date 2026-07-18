@@ -15,6 +15,12 @@ const MINIMUM_GAP_AA: usize = 10;
 const MAX_GAP_AA: usize = 250;
 /// Genomic search region cap for flank scans (bp).
 const FLANK_BP: usize = 15000;
+/// Parent-scaffold chunk size used by the `chunk-v1` nt store. Must match
+/// `PARENT_CHUNK_SIZE` on the prepare/write side (sapphyre/utils/common.py):
+/// the store tags itself `chunk-v1` but does not record the chunk size, so the
+/// reader carries the same constant. Used to derive each scaffold's chunk count
+/// so all `pseq:{sid}:{blk}` reads can be batched through MultiGet.
+const PARENT_CHUNK_SIZE: usize = 65536;
 
 fn codon_to_aa(c1: u8, c2: u8, c3: u8) -> u8 {
     match (c1, c2, c3) {
@@ -708,26 +714,101 @@ struct GffEntry {
     strand: String,
 }
 
-fn collect_needed_scaffolds(
+/// Expand a cluster node token into the set of GFF keys a flank read might
+/// resolve it to. `flank_extract_orfs` looks a node up as the raw node field
+/// first, then falls back to a name derived by splitting on "&&" then "_"
+/// (choosing the leading or trailing "&&" segment). We can't know leading vs
+/// trailing here, so we emit both derived forms plus the raw token; haloing
+/// every form that resolves guarantees no flank read lands on an unfetched
+/// chunk.
+fn read_node_keys(token: &str, out: &mut HashSet<String>) {
+    out.insert(token.to_string());
+    if token.contains("&&") {
+        if let Some(seg) = token.split("&&").next() {
+            out.insert(seg.split('_').next().unwrap_or(seg).to_string());
+        }
+        if let Some(seg) = token.split("&&").last() {
+            out.insert(seg.split('_').next().unwrap_or(seg).to_string());
+        }
+    } else {
+        out.insert(token.split('_').next().unwrap_or(token).to_string());
+    }
+}
+
+/// Compute, per scaffold, a superset of the 0-based byte intervals `exon_dp`
+/// will slice out of that scaffold, so the loader can fetch only the covering
+/// chunks instead of whole (up to chromosome-scale) scaffolds. Two read
+/// families cover every access site in this module:
+///
+///   * inter-node **gap** and **IMX** reads (process_gene) slice the genomic
+///     span *between* two nodes of one cluster on one scaffold, so a cluster's
+///     [min_start, max_end] node span on that scaffold bounds them;
+///   * **flank** reads (flank_scan) slice at most FLANK_BP either side of a
+///     cluster edge node, so a ±FLANK_BP halo around each resolvable node
+///     covers them (find_left_bound/find_right_bound only narrow that window).
+///
+/// The union is a provable superset: over-approximating fetches a few spare
+/// chunks, whereas under-approximating would slice unfetched placeholder bytes
+/// and silently corrupt recovered ORFs. A scaffold appears here iff a cluster
+/// token resolves to it via `gff.get(token)` — exactly the membership the old
+/// `collect_needed_scaffolds` used — so the sparse path never loads a scaffold
+/// the whole-scaffold path would not have, and the flank halo (Pass 2) is
+/// applied only to already-needed scaffolds to match that behavior.
+fn compute_needed_ranges(
     gene_clusters: &HashMap<String, HashMap<String, (Vec<String>, String)>>,
     gff: &HashMap<String, GffEntry>,
-) -> HashSet<String> {
-    let mut needed = HashSet::new();
-    for (_gene, clusters) in gene_clusters {
+) -> HashMap<String, Vec<(usize, usize)>> {
+    let mut ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut needed: HashSet<String> = HashSet::new();
+    let mut read_nodes: HashSet<String> = HashSet::new();
+
+    // Pass 1: bridge each cluster's node span per scaffold (covers gap + IMX).
+    for clusters in gene_clusters.values() {
         for (_ck, (node_tokens, _iso_type)) in clusters {
+            let mut by_scaf: HashMap<&str, (usize, usize)> = HashMap::new();
             for token in node_tokens {
+                read_node_keys(token, &mut read_nodes);
                 if let Some(entry) = gff.get(token.as_str()) {
                     needed.insert(entry.scaffold.clone());
+                    let span = by_scaf
+                        .entry(entry.scaffold.as_str())
+                        .or_insert((usize::MAX, 0));
+                    span.0 = span.0.min(entry.start);
+                    span.1 = span.1.max(entry.end);
                 }
+            }
+            for (scaf, (mn, mx)) in by_scaf {
+                // GFF coords are 1-based; treat them as 0-based and pad a few
+                // bytes — harmless over-approximation that also absorbs the
+                // 1-based/0-based off-by-one at chunk edges.
+                ranges
+                    .entry(scaf.to_string())
+                    .or_default()
+                    .push((mn.saturating_sub(8), mx + 8));
             }
         }
     }
-    needed
+
+    // Pass 2: ±FLANK_BP halo around every resolvable flank read node, but only
+    // on scaffolds Pass 1 already marked needed — the original skips a flank
+    // read whose scaffold was never loaded, so we must not load one either.
+    for name in &read_nodes {
+        if let Some(entry) = gff.get(name) {
+            if needed.contains(&entry.scaffold) {
+                ranges
+                    .entry(entry.scaffold.clone())
+                    .or_default()
+                    .push((entry.start.saturating_sub(FLANK_BP + 8), entry.end + FLANK_BP + 8));
+            }
+        }
+    }
+
+    ranges
 }
 
 fn load_genome_from_rocksdb(
     rocksdb_path: &str,
-    needed: &HashSet<String>,
+    needed_ranges: &HashMap<String, Vec<(usize, usize)>>,
 ) -> HashMap<String, Vec<u8>> {
     let mut opts = Options::default();
     opts.set_error_if_exists(false);
@@ -739,8 +820,15 @@ fn load_genome_from_rocksdb(
         }
     };
 
-    // chunk-v1: scaffolds stored as "pseq:{sid}:{blk}"; scaffold_index columns
-    // are name, sid, unused, length. Read chunks until `length` bytes.
+    // chunk-v1: scaffolds stored uppercased as fixed PARENT_CHUNK_SIZE chunks
+    // keyed "pseq:{sid}:{blk}"; scaffold_index columns are name, sid, unused,
+    // length. exon_dp only slices narrow windows out of each scaffold, so we
+    // fetch just the chunks covering `needed_ranges` (a superset of every slice
+    // site) via batched MultiGet instead of loading whole scaffolds one point
+    // `get()` at a time. This mirrors the reporter's chunked/multi_get_bytes
+    // speedup over the same store: reads drop from ~100% of the genome to the
+    // <1% actually consumed, and thousands of sequential gets collapse into a
+    // handful of MultiGet calls.
     let seq_format = db.get(b"get:seq_format").ok().flatten();
     if seq_format.as_deref() == Some(&b"chunk-v1"[..]) {
         let idx_raw = match db.get(b"scaffold_index") {
@@ -751,14 +839,21 @@ fn load_genome_from_rocksdb(
             }
         };
         let idx_str = String::from_utf8_lossy(&idx_raw);
-        let mut scaffolds = HashMap::with_capacity(needed.len());
+
+        // `needed_ranges` keys ARE the needed scaffold set (compute_needed_ranges).
+        struct ScafMeta {
+            name: String,
+            sid: usize,
+            length: usize,
+        }
+        let mut metas: Vec<ScafMeta> = Vec::with_capacity(needed_ranges.len());
         for line in idx_str.lines() {
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() < 4 {
                 continue;
             }
             let name = parts[0];
-            if !needed.contains(name) {
+            if !needed_ranges.contains_key(name) {
                 continue;
             }
             let sid: usize = match parts[1].parse() {
@@ -766,21 +861,100 @@ fn load_genome_from_rocksdb(
                 Err(_) => continue,
             };
             let length: usize = parts[3].parse().unwrap_or(0);
-            let mut seq: Vec<u8> = Vec::with_capacity(length);
-            let mut blk = 0usize;
-            while seq.len() < length {
-                let key = format!("pseq:{}:{}", sid, blk);
-                match db.get(key.as_bytes()) {
-                    Ok(Some(chunk)) => seq.extend_from_slice(&chunk),
-                    _ => break,
-                }
-                blk += 1;
+            metas.push(ScafMeta {
+                name: name.to_string(),
+                sid,
+                length,
+            });
+        }
+
+        // Full-length, placeholder-filled buffers. Downstream code slices with
+        // absolute genomic coordinates and reads scaffold_seq.len(), so each
+        // buffer MUST keep the scaffold's true length; only the chunks covering
+        // a needed interval are fetched and written in, the rest stay as the 0
+        // placeholder and are never sliced (needed_ranges is a superset of every
+        // slice site).
+        let mut seqs: Vec<Vec<u8>> = metas.iter().map(|m| vec![0u8; m.length]).collect();
+
+        // Per scaffold, turn needed byte intervals into the set of covering
+        // 64 KB chunk indices, then build one flat, per-scaffold-deduplicated
+        // key list with a back-reference to (scaffold slot, block) for placement.
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut owners: Vec<(usize, usize)> = Vec::new();
+        for (mi, m) in metas.iter().enumerate() {
+            if m.length == 0 {
+                continue;
             }
-            seq.truncate(length);
-            scaffolds.insert(name.to_string(), seq);
+            let n_chunks = (m.length + PARENT_CHUNK_SIZE - 1) / PARENT_CHUNK_SIZE;
+            let last_chunk = n_chunks - 1;
+            let mut want = vec![false; n_chunks];
+            let mut any = false;
+            if let Some(ivs) = needed_ranges.get(&m.name) {
+                for &(lo, hi) in ivs {
+                    let lo = lo.min(m.length);
+                    let hi = hi.min(m.length);
+                    if hi <= lo {
+                        continue;
+                    }
+                    let first = lo / PARENT_CHUNK_SIZE;
+                    let last = (hi - 1) / PARENT_CHUNK_SIZE;
+                    for blk in first..=last.min(last_chunk) {
+                        if !want[blk] {
+                            want[blk] = true;
+                            any = true;
+                        }
+                    }
+                }
+            }
+            // Defensive: a needed scaffold with no usable interval loads every
+            // chunk rather than being left as empty placeholder sequence.
+            if !any {
+                for w in want.iter_mut() {
+                    *w = true;
+                }
+            }
+            for (blk, &w) in want.iter().enumerate() {
+                if w {
+                    keys.push(format!("pseq:{}:{}", m.sid, blk).into_bytes());
+                    owners.push((mi, blk));
+                }
+            }
+        }
+
+        // Batched MultiGet in bounded waves (peak memory ~ one wave of chunks on
+        // top of the full-length buffers). Results are positionally aligned to
+        // the input key slice; write each returned chunk at its byte offset. A
+        // missing/errored chunk is left as placeholder (a store bug shows up as
+        // that region's translated ORFs, not a crash — same failure surface the
+        // old per-chunk loop had).
+        const MULTI_GET_BATCH: usize = 4096;
+        let mut i = 0usize;
+        while i < keys.len() {
+            let end = (i + MULTI_GET_BATCH).min(keys.len());
+            let results = db.multi_get(&keys[i..end]);
+            for (j, res) in results.into_iter().enumerate() {
+                let (mi, blk) = owners[i + j];
+                if let Ok(Some(chunk)) = res {
+                    let off = blk * PARENT_CHUNK_SIZE;
+                    let buf = &mut seqs[mi];
+                    if off < buf.len() {
+                        let end_off = (off + chunk.len()).min(buf.len());
+                        buf[off..end_off].copy_from_slice(&chunk[..end_off - off]);
+                    }
+                }
+            }
+            i = end;
+        }
+
+        let mut scaffolds = HashMap::with_capacity(metas.len());
+        for (m, seq) in metas.into_iter().zip(seqs) {
+            scaffolds.insert(m.name, seq);
         }
         return scaffolds;
     }
+
+    // Legacy formats below fetch whole scaffolds and only need name membership.
+    let needed: HashSet<String> = needed_ranges.keys().cloned().collect();
 
     // Legacy indexed lookups (older DBs: scaffold_index + parentbatch:N blobs)
     if let Ok(Some(idx_raw)) = db.get(b"scaffold_index") {
@@ -1834,11 +2008,13 @@ pub fn exon_dp(
         HashMap::new()
     };
 
-    // Determine which scaffolds are actually needed before hitting RocksDB.
-    // If no cluster nodes map to any GFF entry we have nothing to process.
-    let needed_scaffolds = collect_needed_scaffolds(&gene_clusters, &gff_nodes);
+    // Determine which scaffolds are needed and the byte windows we'll slice out
+    // of them before hitting RocksDB, so the chunk-v1 loader can fetch only the
+    // covering chunks. If no cluster nodes map to any GFF entry there is nothing
+    // to process. Keys of `needed_ranges` are the needed scaffold set.
+    let needed_ranges = compute_needed_ranges(&gene_clusters, &gff_nodes);
 
-    if needed_scaffolds.is_empty() {
+    if needed_ranges.is_empty() {
         let output = PyDict::new(py);
         output.set_item("results", PyList::empty(py))?;
         output.set_item("gff_nodes", PyDict::new(py))?;
@@ -1848,7 +2024,7 @@ pub fn exon_dp(
     }
 
     let rocksdb_path = taxa_path_p.join("sequences").join("nt");
-    let genome = load_genome_from_rocksdb(&rocksdb_path.to_string_lossy(), &needed_scaffolds);
+    let genome = load_genome_from_rocksdb(&rocksdb_path.to_string_lossy(), &needed_ranges);
 
     if genome.is_empty() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1900,7 +2076,18 @@ pub fn exon_dp(
     // -----------------------------------------------------------------------
     // Flank scan: update GFF with recovered exons, then scan flanks
     // -----------------------------------------------------------------------
-    // Register recovered DP nodes into gff_nodes so flank scan can see them
+    // Register recovered DP nodes into gff_nodes so flank scan can see them.
+    //
+    // INVARIANT (sparse genome load): `genome` only holds the chunks covering
+    // `compute_needed_ranges(&gene_clusters, &gff_nodes)`, computed above from
+    // the ORIGINAL gff_nodes. `recovered` is currently always empty (process_gene
+    // never pushes to it), so this loop is a no-op and every gff node the flank
+    // scan reads was already haloed. If a future change ever populates
+    // `recovered`, these newly-inserted entries are NOT in needed_ranges, so a
+    // flank read around one could slice unfetched placeholder (0) bytes and
+    // silently emit a wrong ORF. Before enabling recovered-node insertion, either
+    // recompute needed_ranges and reload the covering chunks here, or fall back to
+    // whole-scaffold loading for the flank pass.
     for result in &results_list {
         for rec in &result.recovered {
             let dp_name = parse_node_field(&rec.header).to_string();

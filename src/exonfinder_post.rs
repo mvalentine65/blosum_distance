@@ -845,6 +845,17 @@ fn cross_cluster_genomic_dedup(
         (r.score.full_blosum, count_residues(&r.aa_seq))
     }
 
+    // Cluster keys are "N" (base row) or "N_M" (isoform M of base N).
+    fn base_of(ck: &str) -> &str {
+        match ck.rsplit_once('_') {
+            Some((b, _)) => b,
+            None => ck,
+        }
+    }
+    fn is_base_key(ck: &str) -> bool {
+        !ck.contains('_')
+    }
+
     let mut losers: HashSet<(String, usize)> = HashSet::new();
     let mut loser_winner: HashMap<(String, usize), Recovery> = HashMap::new();
     let n = all.len();
@@ -875,7 +886,19 @@ fn cross_cluster_genomic_dedup(
             if (overlap as f64) < CROSS_CLUSTER_OVERLAP_FRAC * (min_len as f64) {
                 continue;
             }
-            let (winner_i, loser_i) = if rank(&all[i].2) >= rank(&all[j].2) {
+            let ck_i = all[i].2.cluster_key.as_str();
+            let ck_j = all[j].2.cluster_key.as_str();
+            // Same locus claimed by a base row and one of its own isoform
+            // rows: always keep the base copy. A base-keyed gap is fanned out
+            // to the cluster's isoforms by propagate_iso_gaps (which sources
+            // only from base keys), whereas an isoform-keyed gap is stranded
+            // in that one row and can never reach the base or its siblings.
+            // The base therefore strictly dominates, so this outranks score.
+            let (winner_i, loser_i) = if base_of(ck_i) == base_of(ck_j)
+                && is_base_key(ck_i) != is_base_key(ck_j)
+            {
+                if is_base_key(ck_i) { (i, j) } else { (j, i) }
+            } else if rank(&all[i].2) >= rank(&all[j].2) {
                 (i, j)
             } else {
                 (j, i)

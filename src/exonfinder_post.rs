@@ -1847,6 +1847,61 @@ fn genomic_sort_key(
     (parent, start, end, node_int, node_field.to_string())
 }
 
+/// Restore `*` (stop codons) on the native rows of the freshly hmm_aligned
+/// records.
+///
+/// Natives are folded into the hmm_align reference template, which
+/// `aligner.rs` masks `*`->`X` so hmmbuild will accept them.  `--mapali` then
+/// copies those rows into the output verbatim (only re-gapping to absorb
+/// candidate insert columns), so the emitted native rows carry `X` where they
+/// had a stop.  `--mapali` preserves residue identity and order, so we walk
+/// each native's original stop offsets and flip just those positions back.
+///
+/// Must run *before* cull, while each native row's non-gap count still equals
+/// its ungapped source length.  Only original `*` positions are touched, so
+/// genuine `X` residues are left as-is.
+fn restore_native_stops(
+    aligned: &mut [(String, String)],
+    natives_aa: &[(String, String)],
+) {
+    // header -> residue indices (in ungapped order) that were stop codons.
+    let stop_positions: HashMap<&str, Vec<usize>> = natives_aa
+        .iter()
+        .filter_map(|(h, s)| {
+            let stops: Vec<usize> = s
+                .bytes()
+                .filter(|&b| b != b'-' && b != b'.')
+                .enumerate()
+                .filter_map(|(i, b)| (b == b'*').then_some(i))
+                .collect();
+            (!stops.is_empty()).then(|| (h.as_str(), stops))
+        })
+        .collect();
+
+    if stop_positions.is_empty() {
+        return;
+    }
+
+    for (header, seq) in aligned.iter_mut() {
+        let Some(stops) = stop_positions.get(header.as_str()) else { continue };
+        let mut stop_iter = stops.iter().copied().peekable();
+        let mut residue_idx = 0usize;
+        // SAFETY: we only overwrite individual ASCII `X` bytes with ASCII `*`,
+        // which keeps the string valid UTF-8 (protein rows are ASCII).
+        let bytes = unsafe { seq.as_mut_vec() };
+        for b in bytes.iter_mut() {
+            if *b == b'-' {
+                continue;
+            }
+            if stop_iter.peek() == Some(&residue_idx) {
+                *b = b'*';
+                stop_iter.next();
+            }
+            residue_idx += 1;
+        }
+    }
+}
+
 // ===========================================================================
 // Top-level: exonfinder_process_gene
 // ===========================================================================
@@ -1895,14 +1950,32 @@ pub fn exonfinder_process_gene(
     let gene_name = aa_file.split('.').next().unwrap_or(&aa_file).to_string();
 
     // -------------------------------------------------------------------
-    // 1. Build candidates list for hmm_align.
+    // 1. Reference template + candidate list for hmm_align.
+    //
+    // The template (hmmbuild input *and* --mapali) is the resolve output
+    // MSA: the orthoset refs plus the already-aligned natives.  --mapali maps
+    // an existing alignment onto the model *without* realigning it, so the
+    // natives come back frozen in their resolve columns and only the new
+    // flank/gap stubs are aligned fresh.  Building the profile from
+    // refs+natives also gives those stubs a data-informed model for free.
+    //
+    // aligner.rs masks `*`->`X` on the template so hmmbuild accepts it; the
+    // native stops are restored right after the align call (see
+    // restore_native_stops) so the emitted AA matches the resolve input.
     // -------------------------------------------------------------------
-    let mut cands_aa: Vec<(String, String)> = Vec::with_capacity(
-        natives_aa.len() + flank_inputs.len() + gap_inputs.len(),
-    );
-    for (h, s) in &natives_aa {
-        cands_aa.push((h.clone(), s.clone()));
+    if flank_inputs.is_empty() && gap_inputs.is_empty() {
+        // No candidates: short-circuit, return the input fasta unchanged
+        // (refs + already-aligned natives).
+        return empty_result(py, &gene_key, &refs_aa, &natives_aa);
     }
+
+    let mut mapali: Vec<(String, String)> =
+        Vec::with_capacity(refs_aa.len() + natives_aa.len());
+    mapali.extend(refs_aa.iter().cloned());
+    mapali.extend(natives_aa.iter().cloned());
+
+    let mut cands_aa: Vec<(String, String)> =
+        Vec::with_capacity(flank_inputs.len() + gap_inputs.len());
     // Flank stubs: one per flank input.
     for fi in &flank_inputs {
         cands_aa.push((fi.header.clone(), fi.aa_seq.clone()));
@@ -1915,24 +1988,21 @@ pub fn exonfinder_process_gene(
         }
     }
 
-    if flank_inputs.is_empty() && gap_inputs.is_empty() {
-        // No candidates: short-circuit, return empty result and let caller
-        // just copy the input fasta.
-        return empty_result(py, &gene_key, &refs_aa, &natives_aa);
-    }
-
     // -------------------------------------------------------------------
     // 2. hmm_align (re-uses existing pyfunction; pass our py token).
     // -------------------------------------------------------------------
     let t_hmm = Instant::now();
-    let aligned = hmm_align(
+    let mut aligned = hmm_align(
         py,
         cands_aa,
-        refs_aa.clone(),
+        mapali,
         tmpdir.clone(),
         Some(gene_name.clone()),
         taxa.clone(),
     )?;
+    // Natives were `*`->`X` masked for hmmbuild; put their stop codons back
+    // before cull so the emitted AA matches the resolve input residues.
+    restore_native_stops(&mut aligned, &natives_aa);
     let t_hmm = t_hmm.elapsed().as_secs_f64();
 
     // -------------------------------------------------------------------

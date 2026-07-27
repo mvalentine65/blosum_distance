@@ -2199,7 +2199,11 @@ pub fn exonfinder_process_gene(
                 win_start, win_end,
                 &mut window_cache,
             );
-            if score.gap_residues < MIN_GAP_RESIDUES {
+            // Cap the residue floor by the window's effective size: a gap
+            // narrower than MIN_GAP_RESIDUES data columns can never hold that
+            // many residues, so require min(MIN_GAP_RESIDUES, effective cols).
+            let min_residues = MIN_GAP_RESIDUES.min(score.pssm_total_cols);
+            if score.gap_residues < min_residues {
                 continue;
             }
 
@@ -2434,7 +2438,10 @@ pub fn exonfinder_process_gene(
                     win_start, win_end,
                     &mut window_cache,
                 );
-                if score.gap_residues < MIN_GAP_RESIDUES {
+                // Cap the residue floor by the window's effective size (see
+                // the flank gate): min(MIN_GAP_RESIDUES, effective data cols).
+                let min_residues = MIN_GAP_RESIDUES.min(score.pssm_total_cols);
+                if score.gap_residues < min_residues {
                     *gap_counts.entry("kick_gap_residues").or_default() += 1;
                     continue;
                 }

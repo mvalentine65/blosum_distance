@@ -2020,10 +2020,19 @@ pub fn exonfinder_process_gene(
     }
 
     let t_cull = Instant::now();
-    let (mut culled_records, nt_cull_map) = if disable_column_cull {
-        (aligned, HashMap::new())
+    // Keep the edge-trim and intron-split maps cull_columns produces so the
+    // native column-cull trims can be propagated to the exonfinder GFF
+    // (mirrors aligner.py, which feeds these into apply_gff_culls). exon_split
+    // (record splitting) is still out of scope here.
+    let (mut culled_records, nt_cull_map, gff_cull_map, gff_intron_map): (
+        Vec<(String, String)>,
+        HashMap<String, HashSet<usize>>,
+        HashMap<String, (usize, usize)>,
+        HashMap<String, Vec<(usize, usize)>>,
+    ) = if disable_column_cull {
+        (aligned, HashMap::new(), HashMap::new(), HashMap::new())
     } else {
-        let (cr, nc, _gff_cull, _gff_intron, _exon_split) = cull_columns(
+        let (cr, nc, gc, gi, _exon_split) = cull_columns(
             aligned,
             ".",
             0.33,
@@ -2038,7 +2047,7 @@ pub fn exonfinder_process_gene(
             debug_level,
             log_dir.clone(),
         )?;
-        (cr, nc)
+        (cr, nc, gc, gi)
     };
     let t_cull = t_cull.elapsed().as_secs_f64();
 
@@ -2894,7 +2903,7 @@ pub fn exonfinder_process_gene(
     // -------------------------------------------------------------------
     // 14. Build Python return dict.
     // -------------------------------------------------------------------
-    build_result_dict(
+    let out = build_result_dict(
         py,
         &gene_key,
         kicked_headers,
@@ -2913,7 +2922,26 @@ pub fn exonfinder_process_gene(
         supersession_audit,
         final_records,
         nt_records,
-    )
+    )?;
+    // Attach the column-cull GFF-propagation maps (keyed by record header).
+    {
+        let b = out.bind(py);
+        let gc = PyDict::new(py);
+        for (k, (l, r_)) in &gff_cull_map {
+            gc.set_item(k, (*l, *r_))?;
+        }
+        b.set_item("gff_cull", gc)?;
+        let gi = PyDict::new(py);
+        for (k, spans) in &gff_intron_map {
+            let lst = PyList::empty(py);
+            for (a, c) in spans {
+                lst.append((*a, *c))?;
+            }
+            gi.set_item(k, lst)?;
+        }
+        b.set_item("gff_intron", gi)?;
+    }
+    Ok(out)
 }
 
 fn assign_tags(

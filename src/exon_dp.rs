@@ -580,12 +580,13 @@ fn flank_scan_gene(
         .collect();
     cluster_sets.sort_unstable_by_key(|(ck, _, _)| *ck);
 
-    for (cluster_key, cluster_set, iso_type) in &cluster_sets {
-        // Only search flanks for base clusters, not isoforms (e.g. "6" not "6_1", "6_2").
-        // Isoforms share edge nodes with the base cluster so the flank search is identical.
-        if cluster_key.contains('_') {
-            continue;
-        }
+    // Dedup search targets by (anchor node field, is_leading): a terminus
+    // shared across clusters/isoforms is scanned once, while an isoform's
+    // divergent terminus (a different edge node than its base) still gets its
+    // own probe. Result dedup happens downstream; this dedups the work.
+    let mut searched_flanks: HashSet<(String, bool)> = HashSet::new();
+
+    for (cluster_key, cluster_set, _iso_type) in &cluster_sets {
         // Gather matching nodes via the prebuilt index instead of scanning
         // all aa_nodes and re-splitting `header` per node per cluster.
         let mut subset_idx: Vec<usize> = Vec::new();
@@ -660,13 +661,7 @@ fn flank_scan_gene(
             has_trailing,
         ));
 
-        // N-terminal isoforms: skip leading (left) flank scan.
-        // C-terminal isoforms: skip trailing (right) flank scan.
-        // Base clusters and other types: scan both.
-        let skip_leading = *iso_type == "N-terminal";
-        let skip_trailing = *iso_type == "C-terminal";
-
-        if has_leading && !skip_leading {
+        if has_leading && searched_flanks.insert((first_node.nf.clone(), true)) {
             flank_extract_orfs(
                 ref_median_start,
                 first_node.start,
@@ -683,7 +678,7 @@ fn flank_scan_gene(
         }
 
         // Trailing gap: from last_node.end to ref_median_end
-        if has_trailing && !skip_trailing {
+        if has_trailing && searched_flanks.insert((last_node.nf.clone(), false)) {
             flank_extract_orfs(
                 last_node.end,
                 ref_median_end,

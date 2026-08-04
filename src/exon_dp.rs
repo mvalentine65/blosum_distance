@@ -1088,18 +1088,18 @@ fn read_clusters(path: &str) -> HashMap<String, HashMap<String, (Vec<String>, St
             continue;
         }
         let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() < 7 {
+        if fields.len() < 6 {
             continue;
         }
         let gene = fields[0].trim_end_matches(".gz").to_string();
         let cluster_key = fields[1].to_string();
-        let nodes: Vec<String> = fields[6]
+        let nodes: Vec<String> = fields[5]
             .split(';')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let isoform_type = if fields.len() > 8 {
-            fields[8].trim().to_string()
+        let isoform_type = if fields.len() > 7 {
+            fields[7].trim().to_string()
         } else {
             String::new()
         };

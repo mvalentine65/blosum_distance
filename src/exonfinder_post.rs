@@ -33,8 +33,15 @@ const NATIVE_OVERLAP_FRAC: f64 = 0.80;
 const MIN_GAP_RESIDUES: usize = 15;
 const MIN_COVERED_PCT: f64 = 20.0;
 const MIN_KEEP_BLOSUM_PCT: f64 = -1.0;
+// Min fraction of the window's reference columns the accepted tiling flanks
+// must together cover; rejects hits filling only a sliver of the gap.
+const MIN_GAP_COVERAGE_FRAC: f64 = 0.40;
 
 const MIN_AA_AFTER_SPLIT: usize = 15;
+
+// Pre-split: drop a gap's residues aligned this many cols or more past its
+// window, so a scattered ORF doesn't feed the split the wrong fragment.
+const GAP_WINDOW_TRIM_MARGIN: usize = 40;
 
 const MODULE_OVERLAP_FRAC: f64 = 0.5;
 const MODULE_SCORE_RATIO: f64 = 0.85;
@@ -491,6 +498,9 @@ struct WindowScore {
     pssm_total_cols: usize,
     win_start: usize,
     win_end: usize,
+    /// Reference columns this candidate covers; unioned across tiling flanks
+    /// for the combined window-coverage check.
+    covered_cols: BTreeSet<usize>,
 }
 
 /// Score one candidate sequence against a cached window PSSM.
@@ -514,6 +524,7 @@ fn score_window(
     let mut max_total = 0f64;
     let mut scored_cols = 0usize;
     let mut pssm_total_cols = 0usize;
+    let mut covered_cols: BTreeSet<usize> = BTreeSet::new();
     for (col, entry) in pssm.iter().enumerate() {
         let Some((scores, col_max)) = entry else { continue };
         pssm_total_cols += 1;
@@ -529,6 +540,7 @@ fn score_window(
         cand_total += v;
         max_total += *col_max;
         scored_cols += 1;
+        covered_cols.insert(col);
     }
     let blosum_pct = if *full_max > 0.0 {
         (cand_total / *full_max) * 100.0
@@ -549,6 +561,7 @@ fn score_window(
         pssm_total_cols,
         win_start,
         win_end,
+        covered_cols,
     }
 }
 
@@ -2167,6 +2180,9 @@ pub fn exonfinder_process_gene(
 
         let mut filtered_culled: Vec<(String, String)> = Vec::with_capacity(culled_records.len());
         let mut pending_flanks: Vec<(String, String, Recovery)> = Vec::new();
+        // header -> (covered cols, window pssm total) for the combined
+        // post-dedup window-coverage check.
+        let mut flank_cover: HashMap<String, (BTreeSet<usize>, usize)> = HashMap::new();
         let mut window_cache = WindowCache::new(aln_len);
 
         for (header, seq) in &culled_records {
@@ -2224,6 +2240,8 @@ pub fn exonfinder_process_gene(
                 ));
             }
 
+            // Multi mode: skip the covered_pct floor, keep only the negative
+            // backstop so anti-homologous flanks are still cut.
             let (reject, thr) = if relax_low_blosum {
                 (score.blosum_pct <= MIN_KEEP_BLOSUM_PCT, MIN_KEEP_BLOSUM_PCT)
             } else {
@@ -2243,6 +2261,8 @@ pub fn exonfinder_process_gene(
                 continue;
             }
 
+            // Window coverage is checked on the combined tiling set after dedup
+            // (see the group loop), not per-piece.
             rec.locus.msa_cols = data_cols_set(seq);
             rec.score = ScoreInfo {
                 full_blosum: score.blosum_pct,
@@ -2251,6 +2271,7 @@ pub fn exonfinder_process_gene(
                 win_start: score.win_start,
                 win_end: score.win_end,
             };
+            flank_cover.insert(header.clone(), (score.covered_cols, score.pssm_total_cols));
             pending_flanks.push((header.clone(), seq.clone(), rec));
         }
 
@@ -2292,10 +2313,34 @@ pub fn exonfinder_process_gene(
                 &mut rejection_log,
                 debug_level,
             );
+            // Combined window coverage: union the accepted tiling flanks' covered
+            // cols and gate the total, so pieces below the floor still pass when
+            // together they clear it.
+            let mut union_cols: BTreeSet<usize> = BTreeSet::new();
+            let mut pssm_total = 0usize;
             for i in &accepted_idx {
-                let (h, s, r) = &cands[*i];
-                filtered_culled.push((h.clone(), s.clone()));
-                surviving_flanks.push(r.clone());
+                if let Some((cols, ptot)) = flank_cover.get(&cands[*i].0) {
+                    union_cols.extend(cols.iter().copied());
+                    pssm_total = pssm_total.max(*ptot);
+                }
+            }
+            let underfilled = !accepted_idx.is_empty()
+                && (union_cols.len() as f64) < MIN_GAP_COVERAGE_FRAC * (pssm_total as f64);
+            if underfilled {
+                rejection_log.push(format!(
+                    "REJECTED_GROUP {} reason=low_gap_coverage cover={}/{} ({:.0}%) thr={:.0}% pieces={}",
+                    group_label,
+                    union_cols.len(), pssm_total,
+                    100.0 * union_cols.len() as f64 / pssm_total.max(1) as f64,
+                    100.0 * MIN_GAP_COVERAGE_FRAC,
+                    accepted_idx.len(),
+                ));
+            } else {
+                for i in &accepted_idx {
+                    let (h, s, r) = &cands[*i];
+                    filtered_culled.push((h.clone(), s.clone()));
+                    surviving_flanks.push(r.clone());
+                }
             }
             emit_group_summary(&mut rejection_log, "flank", &group_label, &counts);
         }
@@ -2419,7 +2464,7 @@ pub fn exonfinder_process_gene(
                 let gap_start = rec.score.win_start;
                 let gap_end = rec.score.win_end;
 
-                let (win_start, win_end) = match (seq_a, seq_b) {
+                let (win_start, win_end, win_src, anchor_dbg) = match (seq_a, seq_b) {
                     (Some(sa), Some(sb)) => {
                         let a_bounds = *bounds_cache
                             .entry(node_a_name.clone())
@@ -2429,15 +2474,24 @@ pub fn exonfinder_process_gene(
                             .or_insert_with(|| seq_residue_bounds(&sb));
                         let (a_first, a_last) = a_bounds;
                         let (b_first, b_last) = b_bounds;
+                        let dbg = format!(
+                            "a={}[{}..{}] b={}[{}..{}]",
+                            node_a_name, a_first, a_last, node_b_name, b_first, b_last
+                        );
                         if a_first == -1 || b_first == -1 {
-                            (gap_start, gap_end.min(aln_len))
+                            (gap_start, gap_end.min(aln_len), "fallback_noresidues", dbg)
                         } else if strand == "-" {
-                            ((b_last as usize) + 1, a_first as usize)
+                            ((b_last as usize) + 1, a_first as usize, "nodebound", dbg)
                         } else {
-                            ((a_last as usize) + 1, b_first as usize)
+                            ((a_last as usize) + 1, b_first as usize, "nodebound", dbg)
                         }
                     }
-                    _ => (gap_start, gap_end.min(aln_len)),
+                    _ => (
+                        gap_start,
+                        gap_end.min(aln_len),
+                        "fallback_noanchor",
+                        format!("a={}(?) b={}(?)", node_a_name, node_b_name),
+                    ),
                 };
 
                 let score = score_window(
@@ -2446,6 +2500,46 @@ pub fn exonfinder_process_gene(
                     win_start, win_end,
                     &mut window_cache,
                 );
+                // DEBUG: where the gap's residues land (before/in/after window)
+                // vs. where they were scored.
+                let (gspan_first, gspan_last) = seq_residue_bounds(seq);
+                let mut before = 0usize;
+                let mut inwin = 0usize;
+                let mut after = 0usize;
+                for (i, &c) in seq.as_bytes().iter().enumerate() {
+                    if c == b'-' || c == b'.' {
+                        continue;
+                    }
+                    if i < win_start {
+                        before += 1;
+                    } else if i < win_end {
+                        inwin += 1;
+                    } else {
+                        after += 1;
+                    }
+                }
+                {
+                    let b = seq.as_bytes();
+                    // Coarse 64-col histogram of where residues actually land.
+                    let mut hist: Vec<String> = Vec::new();
+                    let binw = 64usize;
+                    let nbins = if aln_len == 0 { 0 } else { aln_len / binw + 1 };
+                    for bi in 0..nbins {
+                        let lo = bi * binw;
+                        let hi = ((bi + 1) * binw).min(aln_len);
+                        let n = b.iter().enumerate()
+                            .filter(|&(i, &c)| c != b'-' && c != b'.' && i >= lo && i < hi)
+                            .count();
+                        if n > 0 { hist.push(format!("{}:{}", lo, n)); }
+                    }
+                    rejection_log.push(format!(
+                        "DEBUG_GAP {} win={}..{} src={} aln_len={} gap_span={}..{} residues(before/in/after)={}/{}/{} score.gap_residues={} full={:.1}% cov={:.1}% hist=[{}] {}",
+                        rec.tag, win_start, win_end, win_src, aln_len,
+                        gspan_first, gspan_last, before, inwin, after,
+                        score.gap_residues, score.blosum_pct, score.covered_pct,
+                        hist.join(" "), anchor_dbg,
+                    ));
+                }
                 // Cap the residue floor by the window's effective size (see
                 // the flank gate): min(MIN_GAP_RESIDUES, effective data cols).
                 let min_residues = MIN_GAP_RESIDUES.min(score.pssm_total_cols);
@@ -2758,6 +2852,78 @@ pub fn exonfinder_process_gene(
     }
 
     // -------------------------------------------------------------------
+    // 10b. Pre-split window trim. Drop a gap ORF's residues far outside its
+    //      window before the split. apply_drop blanks AA + syncs NT; trim_aa
+    //      keeps the recovery coords consistent.
+    // -------------------------------------------------------------------
+    {
+        let mut gap_idx: HashMap<String, usize> = HashMap::new();
+        for (i, r) in surviving_gaps.iter().enumerate() {
+            gap_idx.insert(r.current_tag().to_string(), i);
+        }
+        if !gap_idx.is_empty() {
+            let mut records_map: HashMap<String, String> =
+                renamed_records.iter().cloned().collect();
+            for (h, _) in renamed_records.iter() {
+                let tag = tag_from_header(h);
+                let Some(&gi) = gap_idx.get(tag) else { continue };
+                let ws = surviving_gaps[gi].score.win_start;
+                let we = surviving_gaps[gi].score.win_end;
+                let lo = ws.saturating_sub(GAP_WINDOW_TRIM_MARGIN);
+                let hi = we.saturating_add(GAP_WINDOW_TRIM_MARGIN);
+                let seq = match records_map.get(h) {
+                    Some(s) => s.clone(),
+                    None => continue,
+                };
+                let mut drop_cols: BTreeSet<usize> = BTreeSet::new();
+                let mut left = 0usize;
+                let mut right = 0usize;
+                for (i, &c) in seq.as_bytes().iter().enumerate() {
+                    if is_gap(c) {
+                        continue;
+                    }
+                    if i < lo {
+                        drop_cols.insert(i);
+                        left += 1;
+                    } else if i >= hi {
+                        drop_cols.insert(i);
+                        right += 1;
+                    }
+                }
+                if drop_cols.is_empty() {
+                    continue;
+                }
+                match apply_drop(
+                    h,
+                    &drop_cols,
+                    &mut records_map,
+                    &mut renamed_nt_cull_map,
+                    &renamed_orig_aa_len,
+                ) {
+                    Ok(_) => {
+                        surviving_gaps[gi].locus =
+                            surviving_gaps[gi].locus.trim_aa(left, right);
+                        rejection_log.push(format!(
+                            "DEBUG_WINTRIM {} trimmed left={} right={} win={}..{} margin={}",
+                            tag, left, right, ws, we, GAP_WINDOW_TRIM_MARGIN,
+                        ));
+                    }
+                    Err(e) => {
+                        rejection_log.push(format!("DEBUG_WINTRIM {} apply_drop_err={}", tag, e));
+                    }
+                }
+            }
+            for (h, s) in renamed_records.iter_mut() {
+                if let Some(ns) = records_map.get(h) {
+                    if ns != s {
+                        *s = ns.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
     // 11. Extend gff_nodes with final-tag entries so run_final_split's
     //     header_to_gff lookup resolves renamed recovery headers.
     // -------------------------------------------------------------------
@@ -2779,7 +2945,25 @@ pub fn exonfinder_process_gene(
     // -------------------------------------------------------------------
     // 12. run_final_split.
     // -------------------------------------------------------------------
-    let (post_split_records, split_kicked_headers, gene_split_trim, gene_split_calc_log) =
+    // DEBUG: capture each gap's span before the split (records is moved in) to
+    // see whether the split relocates/fragments it.
+    let dbg_gap_tags: HashSet<String> = surviving_gaps
+        .iter()
+        .map(|r| r.current_tag().to_string())
+        .collect();
+    let mut dbg_pre_split: HashMap<String, (i64, i64, usize)> = HashMap::new();
+    if debug_level > 0 {
+        for (h, s) in &renamed_records {
+            let tag = tag_from_header(h);
+            if dbg_gap_tags.contains(tag) {
+                let (f, l) = seq_residue_bounds(s);
+                let n = s.bytes().filter(|&c| c != b'-' && c != b'.').count();
+                dbg_pre_split.insert(tag.to_string(), (f, l, n));
+            }
+        }
+    }
+
+    let (mut post_split_records, split_kicked_headers, gene_split_trim, gene_split_calc_log) =
         run_final_split(
             &gene_key,
             renamed_records,
@@ -2791,6 +2975,23 @@ pub fn exonfinder_process_gene(
             &native_cluster_members,
             debug_level >= 2,
         );
+
+    if debug_level > 0 {
+        for (h, s) in &post_split_records {
+            let tag = tag_from_header(h);
+            if dbg_gap_tags.contains(tag) {
+                let (qf, ql) = seq_residue_bounds(s);
+                let qn = s.bytes().filter(|&c| c != b'-' && c != b'.').count();
+                let (pf, pl, pn) =
+                    dbg_pre_split.get(tag).copied().unwrap_or((-1, -1, 0));
+                let (tl, tr) = gene_split_trim.get(tag).copied().unwrap_or((0, 0));
+                rejection_log.push(format!(
+                    "DEBUG_SPLIT {} pre_span={}..{}(n={}) post_span={}..{}(n={}) split_trim=(l{},r{})",
+                    tag, pf, pl, pn, qf, ql, qn, tl, tr,
+                ));
+            }
+        }
+    }
 
     // Apply split trims to Recovery loci.  Build an index map up-front, then
     // mutate by index so we never need raw pointers or unsafe aliasing.
@@ -2815,6 +3016,51 @@ pub fn exonfinder_process_gene(
                     rec.locus = rec.locus.trim_aa(*l, *r_);
                 }
             }
+        }
+    }
+
+    // Post-split placement gate: the split can trim a gap down to a fragment
+    // outside its scored window (the in-window residues that made it pass get
+    // trimmed away). Kick a gap whose final residues no longer fall in its window.
+    {
+        let mut gap_win: HashMap<String, (usize, usize)> = HashMap::new();
+        let mut gap_region: HashMap<String, String> = HashMap::new();
+        for r in &surviving_gaps {
+            let t = r.current_tag().to_string();
+            gap_win.insert(t.clone(), (r.score.win_start, r.score.win_end));
+            gap_region.insert(t, fmt_region(&r.locus));
+        }
+        let mut placement_kicked: HashSet<String> = HashSet::new();
+        for (h, s) in &post_split_records {
+            let tag = tag_from_header(h);
+            let Some(&(ws, we)) = gap_win.get(tag) else { continue };
+            let in_win = s
+                .as_bytes()
+                .iter()
+                .enumerate()
+                .filter(|&(i, &c)| c != b'-' && c != b'.' && i >= ws && i < we)
+                .count();
+            if in_win == 0 {
+                let (pf, pl) = seq_residue_bounds(s);
+                rejection_log.push(format!(
+                    "REJECTED {} reason=gap_outside_window win={}..{} post_span={}..{} region={}",
+                    tag, ws, we, pf, pl,
+                    gap_region.get(tag).cloned().unwrap_or_default(),
+                ));
+                placement_kicked.insert(tag.to_string());
+            }
+        }
+        if !placement_kicked.is_empty() {
+            for (h, _) in &post_split_records {
+                if placement_kicked.contains(tag_from_header(h)) {
+                    kicked_headers.insert(h.clone());
+                }
+            }
+            for t in &placement_kicked {
+                kicked_nodes.insert(t.clone());
+            }
+            post_split_records.retain(|(h, _)| !placement_kicked.contains(tag_from_header(h)));
+            surviving_gaps.retain(|r| !placement_kicked.contains(r.current_tag()));
         }
     }
 

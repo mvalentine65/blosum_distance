@@ -222,16 +222,12 @@ fn trim_to_codon(seq: &[u8]) -> &[u8] {
 
 /// Extract ORFs from a nucleotide sequence across all 3 reading frames.
 /// Returns (aa_seq, nt_start, nt_end, frame) for each ORF >= min_aa residues.
-/// ORFs are delimited by stop codons or sequence boundaries.
-///
-/// Leading flanks (require_start=true):
-///   - Trim 5' to first M (ATG). No M = discard.
-///
-/// Results are deduplicated by AA containment (shorter contained in longer removed).
+/// ORFs are delimited by stop codons or sequence boundaries. Leading and
+/// trailing flanks are treated identically -- no start-codon requirement, so a
+/// 5' exon that isn't the protein start (e.g. a second upstream exon) is kept.
 fn extract_flank_orfs(
     seq: &[u8],
     min_aa: usize,
-    require_start: bool,
 ) -> Vec<(Vec<u8>, usize, usize, usize)> {
     let mut raw: Vec<(Vec<u8>, usize, usize, usize)> = Vec::new();
     let seq_len = seq.len();
@@ -259,18 +255,8 @@ fn extract_flank_orfs(
         }
 
         for (seg_start_aa, seg_end_aa) in segments {
-            let mut aa_from = seg_start_aa;
+            let aa_from = seg_start_aa;
             let aa_to = seg_end_aa;
-
-            // --- Leading flank: trim 5' to first M ---
-            if require_start {
-                let slice = &protein[aa_from..aa_to];
-                if let Some(m_pos) = slice.iter().position(|&a| a == b'M') {
-                    aa_from += m_pos;
-                } else {
-                    continue;
-                }
-            }
 
             if aa_to > aa_from && aa_to - aa_from >= min_aa {
                 let nt_start = frame + aa_from * 3;
@@ -400,7 +386,7 @@ fn flank_extract_orfs(
     ));
 
     // Extract ORFs from all 3 frames
-    let orfs = extract_flank_orfs(&seq, scaled_min_aa, is_leading);
+    let orfs = extract_flank_orfs(&seq, scaled_min_aa);
     if orfs.is_empty() {
         log.push(format!(
             "No ORFs >= {} AA found in flank region\n",
@@ -1615,7 +1601,7 @@ fn process_gene(
 
             // Extract ORFs from the gap region.  No M requirement for
             // internal exons. min_aa scaled by effective gap (ref-presence cols).
-            let orfs = extract_flank_orfs(&sr, gap_min_aa, false);
+            let orfs = extract_flank_orfs(&sr, gap_min_aa);
 
             flog.push(format!(
                 "  {} candidate ORFs (min_aa={}, gap={}/{} eff/total cols)",
@@ -1779,7 +1765,7 @@ fn process_gene(
                 ));
                 flog.push(format!("  {}", String::from_utf8_lossy(&sr)));
 
-                let orfs = extract_flank_orfs(&sr, gap_min_aa, false);
+                let orfs = extract_flank_orfs(&sr, gap_min_aa);
                 let mut kept = 0usize;
 
                 flog.push(format!(

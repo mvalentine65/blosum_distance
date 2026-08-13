@@ -32,6 +32,7 @@ const NATIVE_OVERLAP_FRAC: f64 = 0.80;
 
 const MIN_GAP_RESIDUES: usize = 15;
 const MIN_COVERED_PCT: f64 = 20.0;
+const MIN_KEEP_BLOSUM_PCT: f64 = -1.0;
 
 const MIN_AA_AFTER_SPLIT: usize = 15;
 
@@ -1923,6 +1924,7 @@ fn restore_native_stops(
     skip_exon_split = false,
     disable_column_cull = false,
     log_dir = None,
+    relax_low_blosum = false,
 ))]
 pub fn exonfinder_process_gene(
     py: Python<'_>,
@@ -1941,6 +1943,7 @@ pub fn exonfinder_process_gene(
     skip_exon_split: bool,
     disable_column_cull: bool,
     log_dir: Option<String>,
+    relax_low_blosum: bool,
 ) -> PyResult<Py<PyDict>> {
     let t_total = Instant::now();
     let mut rejection_log: Vec<String> = Vec::new();
@@ -2221,12 +2224,17 @@ pub fn exonfinder_process_gene(
                 ));
             }
 
-            if score.covered_pct < MIN_COVERED_PCT {
+            let (reject, thr) = if relax_low_blosum {
+                (score.blosum_pct <= MIN_KEEP_BLOSUM_PCT, MIN_KEEP_BLOSUM_PCT)
+            } else {
+                (score.covered_pct < MIN_COVERED_PCT, MIN_COVERED_PCT)
+            };
+            if reject {
                 rejection_log.push(format!(
                     "REJECTED {} reason=low_blosum blosum={:.1}%/{:.1}% thr={}% scored={}/{} gap_residues={} aa_len={} {} region={}",
                     rec.tag,
                     score.blosum_pct, score.covered_pct,
-                    MIN_COVERED_PCT,
+                    thr,
                     score.scored_cols, score.pssm_total_cols,
                     score.gap_residues,
                     count_residues(seq),
@@ -2397,7 +2405,7 @@ pub fn exonfinder_process_gene(
                 continue;
             };
             let mut best_rec: Option<Recovery> = None;
-            let mut best_blosum: f64 = -1.0;
+            let mut best_blosum: f64 = MIN_KEEP_BLOSUM_PCT;
             let mut all_rejected: Vec<String> = Vec::new();
 
             for mut rec in recs {
@@ -2456,7 +2464,7 @@ pub fn exonfinder_process_gene(
                         score.gap_residues, suffix, region,
                     ));
                 }
-                if score.covered_pct < MIN_COVERED_PCT {
+                if !relax_low_blosum && score.covered_pct < MIN_COVERED_PCT {
                     *gap_counts.entry("kick_low_blosum").or_default() += 1;
                     all_rejected.push(format!(
                         "REJECTED {} reason=low_blosum blosum={:.1}%/{:.1}% thr={}% scored={}/{} gap_residues={} aa_len={} {} region={}",

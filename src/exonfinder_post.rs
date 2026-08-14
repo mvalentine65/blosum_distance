@@ -33,9 +33,15 @@ const NATIVE_OVERLAP_FRAC: f64 = 0.80;
 const MIN_GAP_RESIDUES: usize = 15;
 const MIN_COVERED_PCT: f64 = 20.0;
 const MIN_KEEP_BLOSUM_PCT: f64 = -1.0;
-// Min fraction of the window's reference columns the accepted tiling flanks
-// must together cover; rejects hits filling only a sliver of the gap.
-const MIN_GAP_COVERAGE_FRAC: f64 = 0.40;
+// Flank length rescue (multi mode only). The relaxed flank floor is graduated by
+// exon length rather than flat: a flank <= SHORT_AA residues faces the full
+// MIN_COVERED_PCT covered floor; one >= LONG_AA relaxes to MIN_KEEP_BLOSUM_PCT;
+// linear between. Keeps long divergent exons, cuts short low-scoring ones.
+const FLANK_RESCUE_SHORT_AA: f64 = 30.0;
+const FLANK_RESCUE_LONG_AA: f64 = 100.0;
+// Min fraction of a group's window (reference columns) its accepted pieces must
+// together cover; rejects a group filling only a sliver. Flank and gap paths.
+const MIN_WINDOW_COVERAGE_FRAC: f64 = 0.50;
 
 const MIN_AA_AFTER_SPLIT: usize = 15;
 
@@ -2232,24 +2238,31 @@ pub fn exonfinder_process_gene(
 
             if debug_level > 0 {
                 rejection_log.push(format!(
-                    "DEBUG_SCORE {} blosum={:.1}%/{:.1}% scored={}/{} gap_residues={} {} region={}",
+                    "DEBUG_SCORE {} blosum={:.1}%/{:.1}% scored={}/{} gap_residues={} aa_len={} {} region={}",
                     rec.tag,
                     score.blosum_pct, score.covered_pct,
                     score.scored_cols, score.pssm_total_cols,
-                    score.gap_residues, suffix, region,
+                    score.gap_residues, count_residues(seq), suffix, region,
                 ));
             }
 
-            // Multi mode: skip the covered_pct floor, keep only the negative
-            // backstop so anti-homologous flanks are still cut.
+            // Multi mode: length-graduated covered floor. A short flank still
+            // faces MIN_COVERED_PCT; a long one relaxes toward MIN_KEEP_BLOSUM_PCT,
+            // so long divergent exons survive while short low-scoring ones are cut.
             let (reject, thr) = if relax_low_blosum {
-                (score.blosum_pct <= MIN_KEEP_BLOSUM_PCT, MIN_KEEP_BLOSUM_PCT)
+                let aa = count_residues(seq) as f64;
+                let t = ((aa - FLANK_RESCUE_SHORT_AA)
+                    / (FLANK_RESCUE_LONG_AA - FLANK_RESCUE_SHORT_AA))
+                    .clamp(0.0, 1.0);
+                let floor = MIN_COVERED_PCT
+                    + t * (MIN_KEEP_BLOSUM_PCT - MIN_COVERED_PCT);
+                (score.covered_pct < floor, floor)
             } else {
                 (score.covered_pct < MIN_COVERED_PCT, MIN_COVERED_PCT)
             };
             if reject {
                 rejection_log.push(format!(
-                    "REJECTED {} reason=low_blosum blosum={:.1}%/{:.1}% thr={}% scored={}/{} gap_residues={} aa_len={} {} region={}",
+                    "REJECTED {} reason=low_blosum blosum={:.1}%/{:.1}% thr={:.1}% scored={}/{} gap_residues={} aa_len={} {} region={}",
                     rec.tag,
                     score.blosum_pct, score.covered_pct,
                     thr,
@@ -2313,8 +2326,8 @@ pub fn exonfinder_process_gene(
                 &mut rejection_log,
                 debug_level,
             );
-            // Combined window coverage: union the accepted tiling flanks' covered
-            // cols and gate the total, so pieces below the floor still pass when
+            // Combined window coverage: union the accepted flanks' covered cols
+            // and gate the total, so pieces below the floor still pass when
             // together they clear it.
             let mut union_cols: BTreeSet<usize> = BTreeSet::new();
             let mut pssm_total = 0usize;
@@ -2325,14 +2338,14 @@ pub fn exonfinder_process_gene(
                 }
             }
             let underfilled = !accepted_idx.is_empty()
-                && (union_cols.len() as f64) < MIN_GAP_COVERAGE_FRAC * (pssm_total as f64);
+                && (union_cols.len() as f64) < MIN_WINDOW_COVERAGE_FRAC * (pssm_total as f64);
             if underfilled {
                 rejection_log.push(format!(
-                    "REJECTED_GROUP {} reason=low_gap_coverage cover={}/{} ({:.0}%) thr={:.0}% pieces={}",
+                    "REJECTED_GROUP {} reason=low_window_coverage cover={}/{} ({:.0}%) thr={:.0}% pieces={}",
                     group_label,
                     union_cols.len(), pssm_total,
                     100.0 * union_cols.len() as f64 / pssm_total.max(1) as f64,
-                    100.0 * MIN_GAP_COVERAGE_FRAC,
+                    100.0 * MIN_WINDOW_COVERAGE_FRAC,
                     accepted_idx.len(),
                 ));
             } else {
@@ -2443,6 +2456,9 @@ pub fn exonfinder_process_gene(
         let mut window_cache = WindowCache::new(aln_len);
         let mut bounds_cache: HashMap<String, (i64, i64)> = HashMap::new();
         let mut gap_counts: HashMap<&'static str, usize> = HashMap::new();
+        // header -> (covered cols, window pssm total) for the combined post-dedup
+        // window-coverage check (mirrors the flank path).
+        let mut gap_cover: HashMap<String, (BTreeSet<usize>, usize)> = HashMap::new();
 
         for (header, seq) in &culled_records {
             let Some(recs) = gap_recoveries_by_header.remove(header) else {
@@ -2450,6 +2466,7 @@ pub fn exonfinder_process_gene(
                 continue;
             };
             let mut best_rec: Option<Recovery> = None;
+            let mut best_cover: Option<(BTreeSet<usize>, usize)> = None;
             let mut best_blosum: f64 = MIN_KEEP_BLOSUM_PCT;
             let mut all_rejected: Vec<String> = Vec::new();
 
@@ -2583,11 +2600,15 @@ pub fn exonfinder_process_gene(
                         win_start: score.win_start,
                         win_end: score.win_end,
                     };
+                    best_cover = Some((score.covered_cols.clone(), score.pssm_total_cols));
                     best_rec = Some(rec);
                 }
             }
 
             if let Some(br) = best_rec {
+                if let Some(cover) = best_cover {
+                    gap_cover.insert(header.clone(), cover);
+                }
                 pending_by_cluster.entry(br.cluster_key.clone()).or_default().push(
                     (header.clone(), seq.clone(), br),
                 );
@@ -2616,10 +2637,33 @@ pub fn exonfinder_process_gene(
                 &mut rejection_log,
                 debug_level,
             );
+            // Combined window coverage: union the accepted gaps' covered cols and
+            // gate the total (mirrors the flank path).
+            let mut union_cols: BTreeSet<usize> = BTreeSet::new();
+            let mut pssm_total = 0usize;
             for i in &accepted_idx {
-                let (h, s, r) = &cands[*i];
-                filtered_culled.push((h.clone(), s.clone()));
-                surviving_gaps.push(r.clone());
+                if let Some((cols, ptot)) = gap_cover.get(&cands[*i].0) {
+                    union_cols.extend(cols.iter().copied());
+                    pssm_total = pssm_total.max(*ptot);
+                }
+            }
+            let underfilled = !accepted_idx.is_empty()
+                && (union_cols.len() as f64) < MIN_WINDOW_COVERAGE_FRAC * (pssm_total as f64);
+            if underfilled {
+                rejection_log.push(format!(
+                    "REJECTED_GROUP {} reason=low_window_coverage cover={}/{} ({:.0}%) thr={:.0}% pieces={}",
+                    group_label,
+                    union_cols.len(), pssm_total,
+                    100.0 * union_cols.len() as f64 / pssm_total.max(1) as f64,
+                    100.0 * MIN_WINDOW_COVERAGE_FRAC,
+                    accepted_idx.len(),
+                ));
+            } else {
+                for i in &accepted_idx {
+                    let (h, s, r) = &cands[*i];
+                    filtered_culled.push((h.clone(), s.clone()));
+                    surviving_gaps.push(r.clone());
+                }
             }
             emit_group_summary(&mut rejection_log, "gap", &group_label, &counts);
         }

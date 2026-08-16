@@ -31,14 +31,23 @@ const MIN_INTRON_BP: usize = 30;
 const NATIVE_OVERLAP_FRAC: f64 = 0.80;
 
 const MIN_GAP_RESIDUES: usize = 15;
-const MIN_COVERED_PCT: f64 = 20.0;
-const MIN_KEEP_BLOSUM_PCT: f64 = -1.0;
-// Flank length rescue (multi mode only). The relaxed flank floor is graduated by
-// exon length rather than flat: a flank <= SHORT_AA residues faces the full
-// MIN_COVERED_PCT covered floor; one >= LONG_AA relaxes to MIN_KEEP_BLOSUM_PCT;
-// linear between. Keeps long divergent exons, cuts short low-scoring ones.
-const FLANK_RESCUE_SHORT_AA: f64 = 30.0;
-const FLANK_RESCUE_LONG_AA: f64 = 100.0;
+// Nearest-common-residue scoring (subfamily-robust). A column's "common"
+// residues are those present in >= COMMON_FREQ of its non-gap refs; a candidate
+// residue counts as positive when BLOSUM>0 against any of them. Replaces the old
+// averaged-profile covered_pct, which scored real exons of multi-subfamily
+// families (6TM/GRs) near zero and kicked ~70% of them (a real exon matches its
+// subfamily, not the blended consensus). Mode-independent (multi == normal); the
+// keep/kick decision is the significance gate below.
+const COMMON_FREQ: f64 = 0.15;
+// Significance gate. positive_cols is a binomial count over scored_cols with
+// null rate JUNK_POS_RATE (the measured rate at which a non-homologous fragment
+// lands BLOSUM-positive against a column's common residues). Keep a piece when
+// the z-score of its positive excess clears MIN_POS_ZSCORE. This grades with
+// length automatically -- a short exon needs a high positive fraction to be
+// significant, a long one passes on a slim margin -- so SIZE is treated as
+// homology confidence without a hard length cliff or a separate evidence floor.
+const JUNK_POS_RATE: f64 = 0.30;
+const MIN_POS_ZSCORE: f64 = 2.4;
 // Min fraction of a group's window (reference columns) its accepted pieces must
 // together cover; rejects a group filling only a sliver. Flank and gap paths.
 const MIN_WINDOW_COVERAGE_FRAC: f64 = 0.50;
@@ -379,8 +388,10 @@ fn fmt_region(loc: &Locus) -> String {
 // loop runs in tight bytes.
 // ===========================================================================
 
-/// Per-column PSSM entry: ([score per AA index], col_max).
-type PssmCol = ([f64; 20], f64);
+/// Per-column PSSM entry: ([avg score per AA index], col_max, common_mask).
+/// `common_mask` bit i is set when AA index i is present in >= COMMON_FREQ of
+/// the column's non-gap refs (used by the nearest-common-residue rescue).
+type PssmCol = ([f64; 20], f64, u32);
 
 /// Window-keyed cache: (win_start, win_end) -> (data_cols, per-column pssm, full_max).
 struct WindowCache {
@@ -486,7 +497,24 @@ fn build_pssm_for_window(
             }
         }
         if col_max > 0.0 {
-            pssm[col] = Some((scores, col_max));
+            // Common residues: present in >= COMMON_FREQ of the column's refs.
+            // Fall back to the plurality residue if none clears the threshold.
+            let mut common_mask = 0u32;
+            for i in 0..20usize {
+                if (counts[i] as f64) / total_f >= COMMON_FREQ {
+                    common_mask |= 1 << i;
+                }
+            }
+            if common_mask == 0 {
+                let mut best_i = 0usize;
+                for i in 1..20usize {
+                    if counts[i] > counts[best_i] {
+                        best_i = i;
+                    }
+                }
+                common_mask = 1 << best_i;
+            }
+            pssm[col] = Some((scores, col_max, common_mask));
             full_max += col_max;
         }
     }
@@ -500,6 +528,15 @@ struct WindowScore {
     gap_residues: usize,
     blosum_pct: f64,
     covered_pct: f64,
+    /// % of scored columns whose residue is BLOSUM-positive against the
+    /// column's common residues (human-readable; the gate uses pos_zscore).
+    positive_frac: f64,
+    /// Count of scored columns that are BLOSUM-positive against the common
+    /// residues (absolute evidence).
+    positive_cols: usize,
+    /// Binomial z-score of positive_cols vs the JUNK_POS_RATE null over
+    /// scored_cols; the significance gate keeps pieces with z >= MIN_POS_ZSCORE.
+    pos_zscore: f64,
     scored_cols: usize,
     pssm_total_cols: usize,
     win_start: usize,
@@ -529,10 +566,11 @@ fn score_window(
     let mut cand_total = 0f64;
     let mut max_total = 0f64;
     let mut scored_cols = 0usize;
+    let mut positive_cols = 0usize;
     let mut pssm_total_cols = 0usize;
     let mut covered_cols: BTreeSet<usize> = BTreeSet::new();
     for (col, entry) in pssm.iter().enumerate() {
-        let Some((scores, col_max)) = entry else { continue };
+        let Some((scores, col_max, common_mask)) = entry else { continue };
         pssm_total_cols += 1;
         if col >= cand_seq.len() {
             continue;
@@ -547,7 +585,41 @@ fn score_window(
         max_total += *col_max;
         scored_cols += 1;
         covered_cols.insert(col);
+        // Nearest-common-residue: is the candidate BLOSUM-positive against any
+        // of this column's common residues? (subfamily-robust rescue signal)
+        if ai < 20 {
+            let mut best = i32::MIN;
+            let mut m = *common_mask;
+            while m != 0 {
+                let r = m.trailing_zeros() as usize;
+                let s = BLOSUM62[ai][r] as i32;
+                if s > best {
+                    best = s;
+                }
+                m &= m - 1;
+            }
+            if best > 0 {
+                positive_cols += 1;
+            }
+        }
     }
+    let positive_frac = if scored_cols > 0 {
+        (positive_cols as f64 / scored_cols as f64) * 100.0
+    } else {
+        0.0
+    };
+    // Binomial z-score of positive_cols vs the JUNK_POS_RATE null over
+    // scored_cols. sd == 0 (no scored columns) yields z = 0, which fails the
+    // gate -- a piece with no evidence is not significant.
+    let pos_zscore = {
+        let n = scored_cols as f64;
+        let sd = (n * JUNK_POS_RATE * (1.0 - JUNK_POS_RATE)).sqrt();
+        if sd > 0.0 {
+            (positive_cols as f64 - n * JUNK_POS_RATE) / sd
+        } else {
+            0.0
+        }
+    };
     let blosum_pct = if *full_max > 0.0 {
         (cand_total / *full_max) * 100.0
     } else {
@@ -563,6 +635,9 @@ fn score_window(
         gap_residues,
         blosum_pct,
         covered_pct,
+        positive_frac,
+        positive_cols,
+        pos_zscore,
         scored_cols,
         pssm_total_cols,
         win_start,
@@ -1943,7 +2018,7 @@ fn restore_native_stops(
     skip_exon_split = false,
     disable_column_cull = false,
     log_dir = None,
-    relax_low_blosum = false,
+    disable_score_filter = false,
 ))]
 pub fn exonfinder_process_gene(
     py: Python<'_>,
@@ -1962,7 +2037,9 @@ pub fn exonfinder_process_gene(
     skip_exon_split: bool,
     disable_column_cull: bool,
     log_dir: Option<String>,
-    relax_low_blosum: bool,
+    // Skip the flank/gap significance gate entirely (keeps every scored piece
+    // regardless of its z-score); window-coverage checks still apply.
+    disable_score_filter: bool,
 ) -> PyResult<Py<PyDict>> {
     let t_total = Instant::now();
     let mut rejection_log: Vec<String> = Vec::new();
@@ -2246,28 +2323,18 @@ pub fn exonfinder_process_gene(
                 ));
             }
 
-            // Multi mode: length-graduated covered floor. A short flank still
-            // faces MIN_COVERED_PCT; a long one relaxes toward MIN_KEEP_BLOSUM_PCT,
-            // so long divergent exons survive while short low-scoring ones are cut.
-            let (reject, thr) = if relax_low_blosum {
-                let aa = count_residues(seq) as f64;
-                let t = ((aa - FLANK_RESCUE_SHORT_AA)
-                    / (FLANK_RESCUE_LONG_AA - FLANK_RESCUE_SHORT_AA))
-                    .clamp(0.0, 1.0);
-                let floor = MIN_COVERED_PCT
-                    + t * (MIN_KEEP_BLOSUM_PCT - MIN_COVERED_PCT);
-                (score.covered_pct < floor, floor)
-            } else {
-                (score.covered_pct < MIN_COVERED_PCT, MIN_COVERED_PCT)
-            };
-            if reject {
+            // Significance gate: keep a piece whose count of BLOSUM-positive
+            // columns is significantly above the junk null over its scored
+            // columns (length-graded via the z-score; short exons need a high
+            // positive fraction, long ones a slim margin). Replaces the flat
+            // positive_frac floor + size-aware evidence floor. -dbf bypasses.
+            if !disable_score_filter && score.pos_zscore < MIN_POS_ZSCORE {
                 rejection_log.push(format!(
-                    "REJECTED {} reason=low_blosum blosum={:.1}%/{:.1}% thr={:.1}% scored={}/{} gap_residues={} aa_len={} {} region={}",
+                    "REJECTED {} reason=low_significance z={:.2} thr={:.1} pos_cols={}/{} pos_frac={:.1}% blosum={:.1}%/{:.1}% aa_len={} {} region={}",
                     rec.tag,
+                    score.pos_zscore, MIN_POS_ZSCORE,
+                    score.positive_cols, score.scored_cols, score.positive_frac,
                     score.blosum_pct, score.covered_pct,
-                    thr,
-                    score.scored_cols, score.pssm_total_cols,
-                    score.gap_residues,
                     count_residues(seq),
                     suffix, region,
                 ));
@@ -2467,7 +2534,12 @@ pub fn exonfinder_process_gene(
             };
             let mut best_rec: Option<Recovery> = None;
             let mut best_cover: Option<(BTreeSet<usize>, usize)> = None;
-            let mut best_blosum: f64 = MIN_KEEP_BLOSUM_PCT;
+            // Pick the highest-blosum window; the gap gate below (positive_frac)
+            // is what decides keep/kick, so this selector must not double as a
+            // floor. Seed below any real score -- a window kept for its
+            // positive_frac can have a low blosum_pct yet still be the one we
+            // want. (Also fixes a silent drop when every window scored negative.)
+            let mut best_blosum: f64 = f64::NEG_INFINITY;
             let mut all_rejected: Vec<String> = Vec::new();
 
             for mut rec in recs {
@@ -2575,15 +2647,16 @@ pub fn exonfinder_process_gene(
                         score.gap_residues, suffix, region,
                     ));
                 }
-                if !relax_low_blosum && score.covered_pct < MIN_COVERED_PCT {
-                    *gap_counts.entry("kick_low_blosum").or_default() += 1;
+                // Significance gate (mirrors the flank path): length-graded
+                // z-score of positive_cols vs the junk null.
+                if !disable_score_filter && score.pos_zscore < MIN_POS_ZSCORE {
+                    *gap_counts.entry("kick_low_significance").or_default() += 1;
                     all_rejected.push(format!(
-                        "REJECTED {} reason=low_blosum blosum={:.1}%/{:.1}% thr={}% scored={}/{} gap_residues={} aa_len={} {} region={}",
+                        "REJECTED {} reason=low_significance z={:.2} thr={:.1} pos_cols={}/{} pos_frac={:.1}% blosum={:.1}%/{:.1}% aa_len={} {} region={}",
                         rec.tag,
+                        score.pos_zscore, MIN_POS_ZSCORE,
+                        score.positive_cols, score.scored_cols, score.positive_frac,
                         score.blosum_pct, score.covered_pct,
-                        MIN_COVERED_PCT,
-                        score.scored_cols, score.pssm_total_cols,
-                        score.gap_residues,
                         count_residues(seq),
                         suffix, region,
                     ));

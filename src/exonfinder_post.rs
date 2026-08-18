@@ -375,9 +375,12 @@ fn blosum_identity(seq_a: &str, seq_b: &str) -> f64 {
 }
 
 fn fmt_region(loc: &Locus) -> String {
+    // Stable per-recovery key printed on every exonfinder log line:
+    // scaffold:gstart-gend(strand):frame.  Frame disambiguates two windows that
+    // share the same genomic span but differ in reading frame.
     format!(
-        "{}:{}-{}({})",
-        loc.scaffold, loc.bp_start, loc.bp_end, loc.strand
+        "{}:{}-{}({}):{}",
+        loc.scaffold, loc.bp_start, loc.bp_end, loc.strand, loc.frame
     )
 }
 
@@ -1652,6 +1655,26 @@ fn run_final_split(
         Some((entry.scaffold.clone(), entry.start, entry.strand.clone()))
     };
 
+    // Stable per-record region key (scaffold:gstart-gend(strand):frame) for the
+    // split-log lines, so they correlate with the DEBUG_SCORE / RECOVERED lines.
+    // gff_nodes here is the caller's gff_nodes_extended, which already carries
+    // every recovery under its final tag; frame comes from the header's frame
+    // field (taxon|..|..|NODE|frame|copy). "NA" if the node is not in the map.
+    let region_of = |hdr: &str| -> String {
+        let tag = tag_from_header(hdr);
+        match gff_nodes.get(tag) {
+            Some(g) => {
+                let frame = hdr
+                    .split('|')
+                    .nth(4)
+                    .and_then(|f| f.parse::<i32>().ok())
+                    .unwrap_or(0);
+                format!("{}:{}-{}({}):{}", g.scaffold, g.start, g.end, g.strand, frame)
+            }
+            None => "NA".to_string(),
+        }
+    };
+
     let mut gene_cluster_sections: Vec<String> = Vec::new();
 
     let mut cluster_keys: Vec<&String> = cluster_members.keys().collect();
@@ -1726,8 +1749,9 @@ fn run_final_split(
                     if is_module_pair_aligned(&seq_a, &seq_b, &ga.0, ga.1, &gb.0, gb.1) {
                         if debug {
                             cluster_block.push(format!(
-                                "gene={} cluster={} MODULE_SKIP {} vs {}",
+                                "gene={} cluster={} MODULE_SKIP {} vs {} a_region={} b_region={}",
                                 gene_tag, ck, a_tag, b_tag,
+                                region_of(&a_hdr), region_of(&b_hdr),
                             ));
                         }
                         continue;
@@ -1782,9 +1806,10 @@ fn run_final_split(
 
                 if debug {
                     cluster_block.push(format!(
-                        "gene={} cluster={} PAIR {} vs {} split_at={} trimmed={}/{} remaining={}/{}",
+                        "gene={} cluster={} PAIR {} vs {} split_at={} trimmed={}/{} remaining={}/{} a_region={} b_region={}",
                         gene_tag, ck, a_tag, b_tag, split_k, a_dropped, b_dropped,
                         a_remaining, b_remaining,
+                        region_of(&a_hdr), region_of(&b_hdr),
                     ));
                 }
 
@@ -1794,8 +1819,9 @@ fn run_final_split(
                     a_kicked = true;
                     if debug {
                         cluster_block.push(format!(
-                            "gene={} cluster={} KICK {} reason=<{}_aa_after_split remaining={}",
+                            "gene={} cluster={} KICK {} reason=<{}_aa_after_split remaining={} region={}",
                             gene_tag, ck, a_tag, MIN_AA_AFTER_SPLIT, a_remaining,
+                            region_of(&a_hdr),
                         ));
                     }
                 }
@@ -1803,8 +1829,9 @@ fn run_final_split(
                     split_kicked.insert(b_hdr.clone());
                     if debug {
                         cluster_block.push(format!(
-                            "gene={} cluster={} KICK {} reason=<{}_aa_after_split remaining={}",
+                            "gene={} cluster={} KICK {} reason=<{}_aa_after_split remaining={} region={}",
                             gene_tag, ck, b_tag, MIN_AA_AFTER_SPLIT, b_remaining,
+                            region_of(&b_hdr),
                         ));
                     }
                 }
@@ -1877,17 +1904,19 @@ fn run_final_split(
                 if debug {
                     let rep_kick_note = if rep_kicked { " rep_kicked=True" } else { "" };
                     cluster_block.push(format!(
-                        "gene={} cluster={} MODULE_TRIM rep={} sib={} dropped={} left={} right={} window=[{},{}) remaining={}{}",
+                        "gene={} cluster={} MODULE_TRIM rep={} sib={} dropped={} left={} right={} window=[{},{}) remaining={}{} rep_region={} sib_region={}",
                         gene_tag, ck, rep_tag, tag, dropped, left_trim, right_trim,
                         rep_start, rep_end, remaining, rep_kick_note,
+                        region_of(rep_hdr), region_of(sib_hdr),
                     ));
                 }
                 if remaining < MIN_AA_AFTER_SPLIT {
                     split_kicked.insert(sib_hdr.clone());
                     if debug {
                         cluster_block.push(format!(
-                            "gene={} cluster={} KICK {} reason=<{}_aa_after_module_trim remaining={}",
+                            "gene={} cluster={} KICK {} reason=<{}_aa_after_module_trim remaining={} region={}",
                             gene_tag, ck, tag, MIN_AA_AFTER_SPLIT, remaining,
+                            region_of(sib_hdr),
                         ));
                     }
                 }
@@ -3021,12 +3050,16 @@ pub fn exonfinder_process_gene(
                         surviving_gaps[gi].locus =
                             surviving_gaps[gi].locus.trim_aa(left, right);
                         rejection_log.push(format!(
-                            "DEBUG_WINTRIM {} trimmed left={} right={} win={}..{} margin={}",
+                            "DEBUG_WINTRIM {} trimmed left={} right={} win={}..{} margin={} region={}",
                             tag, left, right, ws, we, GAP_WINDOW_TRIM_MARGIN,
+                            fmt_region(&surviving_gaps[gi].locus),
                         ));
                     }
                     Err(e) => {
-                        rejection_log.push(format!("DEBUG_WINTRIM {} apply_drop_err={}", tag, e));
+                        rejection_log.push(format!(
+                            "DEBUG_WINTRIM {} apply_drop_err={} region={}",
+                            tag, e, fmt_region(&surviving_gaps[gi].locus),
+                        ));
                     }
                 }
             }
@@ -3102,9 +3135,20 @@ pub fn exonfinder_process_gene(
                 let (pf, pl, pn) =
                     dbg_pre_split.get(tag).copied().unwrap_or((-1, -1, 0));
                 let (tl, tr) = gene_split_trim.get(tag).copied().unwrap_or((0, 0));
+                let region = gff_nodes_extended
+                    .get(tag)
+                    .map(|g| {
+                        let frame = h
+                            .split('|')
+                            .nth(4)
+                            .and_then(|f| f.parse::<i32>().ok())
+                            .unwrap_or(0);
+                        format!("{}:{}-{}({}):{}", g.scaffold, g.start, g.end, g.strand, frame)
+                    })
+                    .unwrap_or_else(|| "NA".to_string());
                 rejection_log.push(format!(
-                    "DEBUG_SPLIT {} pre_span={}..{}(n={}) post_span={}..{}(n={}) split_trim=(l{},r{})",
-                    tag, pf, pl, pn, qf, ql, qn, tl, tr,
+                    "DEBUG_SPLIT {} pre_span={}..{}(n={}) post_span={}..{}(n={}) split_trim=(l{},r{}) region={}",
+                    tag, pf, pl, pn, qf, ql, qn, tl, tr, region,
                 ));
             }
         }

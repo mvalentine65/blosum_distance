@@ -13,6 +13,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::aligner::hmm_align;
@@ -51,6 +52,28 @@ const MIN_POS_ZSCORE: f64 = 2.4;
 // Min fraction of a group's window (reference columns) its accepted pieces must
 // together cover; rejects a group filling only a sliver. Flank and gap paths.
 const MIN_WINDOW_COVERAGE_FRAC: f64 = 0.50;
+// Profile pseudocount weight, in units of "equivalent observations". The window
+// profile is a log-odds score, log2(p_q / b_q), where p_q blends a column's
+// observed frequencies with a BLOSUM-derived prior. The prior is what stops a
+// divergent column punishing a legitimate conservative substitution: on raw
+// frequencies an unobserved-but-similar residue scores about -26 bits, which
+// annihilates a real but diverged exon.
+//
+// The previous scorer was a mean substitution score, sum_r f_r * BLOSUM(q,r).
+// That is not a probability model and has no principled zero -- its magnitude
+// tracks how CONSERVED a column is rather than how well a candidate fits, so a
+// true homolog scored ~71% against a conserved reference set and ~11% against a
+// divergent one. That 6.4x collapse is why no fixed threshold could span
+// arthropodaODB12 / P450_clean / ORGRv3. Log-odds compresses it to ~2.3x and
+// holds the decoy floor near-constant. beta 10-20 is the plateau: below 5
+// conservative substitutions are punished, above 50 columns wash out.
+const PSSM_BETA: f64 = 20.0;
+// Robinson & Robinson background frequencies, in BLOSUM62 order
+// (A R N D C Q E G H I L K M F P S T W Y V).
+const AA_BACKGROUND: [f64; 20] = [
+    0.074, 0.052, 0.045, 0.054, 0.025, 0.034, 0.054, 0.074, 0.026, 0.068,
+    0.099, 0.058, 0.025, 0.047, 0.039, 0.057, 0.051, 0.013, 0.032, 0.073,
+];
 
 const MIN_AA_AFTER_SPLIT: usize = 15;
 
@@ -331,14 +354,29 @@ const BLOSUM62: [[i8; 20]; 20] = [
     [ 0, -3, -3, -3, -1, -2, -2, -3, -3,  3,  1, -2,  1, -1, -2, -2,  0, -3, -1,  4], // V
 ];
 
-fn blosum62_score(a: u8, b: u8) -> i32 {
-    let ai = aa_index(a);
-    let bi = aa_index(b);
-    if ai >= 20 || bi >= 20 {
-        return -4;
-    }
-    BLOSUM62[ai][bi] as i32
+/// P(q | r): BLOSUM62 target frequencies, derived from the half-bit matrix as
+/// b_q * 2^(B(q,r)/2) normalised over q. Used as the pseudocount prior, so an
+/// unobserved residue inherits weight from the observed ones it resembles.
+fn blosum_conditional() -> &'static [[f64; 20]; 20] {
+    static COND: OnceLock<[[f64; 20]; 20]> = OnceLock::new();
+    COND.get_or_init(|| {
+        let mut m = [[0f64; 20]; 20];
+        for r in 0..20usize {
+            let mut col = [0f64; 20];
+            let mut sum = 0f64;
+            for q in 0..20usize {
+                let v = AA_BACKGROUND[q] * ((BLOSUM62[q][r] as f64) / 2.0).exp2();
+                col[q] = v;
+                sum += v;
+            }
+            for q in 0..20usize {
+                m[q][r] = col[q] / sum;
+            }
+        }
+        m
+    })
 }
+
 
 /// Fraction of pairwise BLOSUM-positive aligned residues between two
 /// equal-length aligned sequences; mirrors `core._blosum_identity`.
@@ -391,7 +429,7 @@ fn fmt_region(loc: &Locus) -> String {
 // loop runs in tight bytes.
 // ===========================================================================
 
-/// Per-column PSSM entry: ([avg score per AA index], col_max, common_mask).
+/// Per-column PSSM entry: ([log-odds bits per AA index], col_max, common_mask).
 /// `common_mask` bit i is set when AA index i is present in >= COMMON_FREQ of
 /// the column's non-gap refs (used by the nearest-common-residue rescue).
 type PssmCol = ([f64; 20], f64, u32);
@@ -470,35 +508,40 @@ fn build_pssm_for_window(
             continue;
         }
         let total_f = total as f64;
+        // Log-odds column with BLOSUM pseudocounts (see PSSM_BETA).
+        //   f_q = counts[q] / total          observed frequency
+        //   g_q = sum_r f_r * P(q|r)         BLOSUM prior
+        //   p_q = (alpha*f_q + beta*g_q) / (alpha + beta)
+        //   score_q = log2(p_q / b_q)        bits
+        // alpha is the column's distinct-residue count less one, so a column
+        // carrying little evidence leans on the prior while a well-sampled one
+        // leans on its own frequencies.
+        let cond = blosum_conditional();
+        let distinct = counts.iter().filter(|&&c| c > 0).count();
+        let alpha = distinct.saturating_sub(1) as f64;
+        let denom = alpha + PSSM_BETA;
         let mut scores = [0f64; 20];
         let mut col_max = f64::NEG_INFINITY;
         for q in 0..20usize {
-            let qb = match q {
-                0 => b'A', 1 => b'R', 2 => b'N', 3 => b'D', 4 => b'C',
-                5 => b'Q', 6 => b'E', 7 => b'G', 8 => b'H', 9 => b'I',
-                10 => b'L', 11 => b'K', 12 => b'M', 13 => b'F', 14 => b'P',
-                15 => b'S', 16 => b'T', 17 => b'W', 18 => b'Y', 19 => b'V',
-                _ => unreachable!(),
-            };
-            let mut s = 0f64;
-            for (i, &cnt) in counts.iter().enumerate() {
+            let mut g = 0f64;
+            for r in 0..20usize {
+                let cnt = counts[r];
                 if cnt > 0 {
-                    let rb = match i {
-                        0 => b'A', 1 => b'R', 2 => b'N', 3 => b'D', 4 => b'C',
-                        5 => b'Q', 6 => b'E', 7 => b'G', 8 => b'H', 9 => b'I',
-                        10 => b'L', 11 => b'K', 12 => b'M', 13 => b'F', 14 => b'P',
-                        15 => b'S', 16 => b'T', 17 => b'W', 18 => b'Y', 19 => b'V',
-                        _ => unreachable!(),
-                    };
-                    s += blosum62_score(qb, rb) as f64 * cnt as f64;
+                    g += (cnt as f64 / total_f) * cond[q][r];
                 }
             }
-            let normalized = s / total_f;
-            scores[q] = normalized;
-            if normalized > col_max {
-                col_max = normalized;
+            let f_q = counts[q] as f64 / total_f;
+            let mut p = (alpha * f_q + PSSM_BETA * g) / denom;
+            if p < 1e-9 {
+                p = 1e-9;
+            }
+            let v = (p / AA_BACKGROUND[q]).log2();
+            scores[q] = v;
+            if v > col_max {
+                col_max = v;
             }
         }
+
         if col_max > 0.0 {
             // Common residues: present in >= COMMON_FREQ of the column's refs.
             // Fall back to the plurality residue if none clears the threshold.
@@ -573,7 +616,7 @@ fn score_window(
     let mut pssm_total_cols = 0usize;
     let mut covered_cols: BTreeSet<usize> = BTreeSet::new();
     for (col, entry) in pssm.iter().enumerate() {
-        let Some((scores, col_max, common_mask)) = entry else { continue };
+        let Some((scores, col_max, _common_mask)) = entry else { continue };
         pssm_total_cols += 1;
         if col >= cand_seq.len() {
             continue;
@@ -588,22 +631,24 @@ fn score_window(
         max_total += *col_max;
         scored_cols += 1;
         covered_cols.insert(col);
-        // Nearest-common-residue: is the candidate BLOSUM-positive against any
-        // of this column's common residues? (subfamily-robust rescue signal)
-        if ai < 20 {
-            let mut best = i32::MIN;
-            let mut m = *common_mask;
-            while m != 0 {
-                let r = m.trailing_zeros() as usize;
-                let s = BLOSUM62[ai][r] as i32;
-                if s > best {
-                    best = s;
-                }
-                m &= m - 1;
-            }
-            if best > 0 {
-                positive_cols += 1;
-            }
+        // Does this column favour the candidate's residue over background?
+        // Read straight off the log-odds profile: > 0 bits means the column's
+        // residue distribution (plus its BLOSUM prior) makes this residue more
+        // likely than chance.
+        //
+        // This replaces a nearest-common-residue heuristic -- "is the residue
+        // BLOSUM-positive against any residue present in >= COMMON_FREQ of the
+        // column's refs" -- which existed only because the previous averaged
+        // profile scored real exons of multi-subfamily families near zero. The
+        // pseudocount prior handles subfamily diversity directly, so the
+        // heuristic is no longer needed in front of it.
+        //
+        // Null rate for a non-homologous fragment, measured over
+        // arthropodaODB12 / P450_clean / ORGRv3: 0.264 for this test versus
+        // 0.244 for the heuristic it replaces, so JUNK_POS_RATE = 0.30 remains
+        // conservative for both and the gate does not silently loosen.
+        if ai < 20 && v > 0.0 {
+            positive_cols += 1;
         }
     }
     let positive_frac = if scored_cols > 0 {

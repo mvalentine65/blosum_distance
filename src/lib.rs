@@ -7,6 +7,7 @@ mod exonfinder_post;
 mod flexcull;
 mod identity;
 mod interval_tree;
+mod ntbatch;
 mod overlap;
 mod pssm;
 mod translate;
@@ -545,6 +546,9 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(exonfinder_post::exonfinder_process_gene, m)?)?;
 
     m.add_class::<interval_tree::OverlapTree>()?;
+    m.add_class::<ntbatch::NtBatchScanner>()?;
+    m.add_class::<dedupe::PreparedReads>()?;
+    m.add_function(wrap_pyfunction!(dedupe::dedupe_reads, m)?)?;
 
     Ok(())
 }

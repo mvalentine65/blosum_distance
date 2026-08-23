@@ -1,7 +1,7 @@
 use flate2::read::GzDecoder;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use rocksdb::{Options, DB};
+use rust_rocksdb::{Options, DB};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Read;

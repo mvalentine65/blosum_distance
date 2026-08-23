@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "sapphyre_tools"
-version = "0.11.27"
-requires-python = ">=3.8"
+version = "0.11.28"
+requires-python = ">=3.10"
 authors = [
     {email = "mvalentine65@gmail.com"},
     {name = "Michael Valentine"}
@@ -15,12 +15,11 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Rust",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Software Development :: Libraries",
 ]

@@ -276,7 +276,7 @@ const DUPES_MAGIC: &[u8; 8] = b"SPKD1\0\0\0";
 /// Deduped reads, filtered and chunked, ready for the sequences db.
 ///
 /// Replaces the round trip that wrote a multi-GB temp fasta, re-parsed it in
-/// Python, marshalled every record back through `preprocess_n_chunks`, and
+/// Python, marshalled every record back through Rust to split on N, and
 /// reassembled the batches a record at a time.
 #[pyclass]
 pub struct PreparedReads {
@@ -330,8 +330,8 @@ impl PreparedReads {
 
 /// Dedupe the inputs and return the records the sequences db should hold.
 ///
-/// Applies the same length filter and N-splitting as `preprocess_n_chunks`, and
-/// the same residue validation prepare did per record, so an illegal character
+/// Applies the length filter and N-splitting prepare used to run as its own
+/// pass, plus the residue validation it did per record, so an illegal character
 /// still names the offending read rather than surfacing later as a bathsearch
 /// parse error.
 #[pyfunction]
@@ -364,8 +364,8 @@ pub fn dedupe_reads(
         let off = rec.off as usize;
         let seq = &table.arena[off..off + b.len as usize];
 
-        // Mirrors preprocess_n_chunks: whole read when it holds no N, else the
-        // N-free runs, each kept only at or above the minimum length.
+        // Whole read when it holds no N, else the N-free runs, each kept only
+        // at or above the minimum length.
         let mut emitted = false;
         if !seq.contains(&b'N') && !seq.contains(&b'n') {
             if seq.len() >= min_length {

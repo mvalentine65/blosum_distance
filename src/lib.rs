@@ -454,42 +454,6 @@ fn convert_consensus(sequences: Vec<String>, consensus: &str) -> String {
     String::from_utf8(con_list).unwrap()
 }
 
-#[pyfunction]
-pub fn preprocess_n_chunks(
-    // Accepting String here fixes the "Can't extract str to Vec" error
-    data: Vec<(String, String)>,
-    min_length: usize,
-) -> PyResult<Vec<(String, String)>> {
-    // Pre-allocate for performance
-    let mut results = Vec::with_capacity(data.len());
-
-    for (header, seq) in data {
-        // Fast fail for length
-        if seq.len() < min_length {
-            continue;
-        }
-
-        // Optimization: No 'N' found
-        // seq.as_bytes() allows us to use SIMD scanning on the string data
-        if !seq.as_bytes().contains(&b'N') && !seq.as_bytes().contains(&b'n') {
-            // Move the strings into the results (No new allocation for the data)
-            results.push((header, seq));
-        } else {
-            // Dirty path: Split by 'N' or 'n'
-            // We use .as_bytes().split() because it's faster than string splitting
-            for chunk_bytes in seq.as_bytes().split(|&b| b == b'N' || b == b'n') {
-                if chunk_bytes.len() >= min_length {
-                    // Convert the valid slice back to an owned String
-                    let chunk_str = String::from_utf8_lossy(chunk_bytes).into_owned();
-                    // We must clone the header for each sub-chunk
-                    results.push((header.clone(), chunk_str));
-                }
-            }
-        }
-    }
-
-    Ok(results)
-}
 
 // A Python module implemented in Rust.
 #[pymodule]

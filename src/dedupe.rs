@@ -12,14 +12,27 @@ use flate2::read::MultiGzDecoder;
 
 // --- Optimized DedupTable from main_bestrs.rs ---
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Bucket {
     hash: u64,
-    off: usize, 
-    len: usize,
-    count: u64,
-    id: usize,
-    used: bool,
+    id: u32,
+    len: u32,
+}
+
+/// `id` of an unoccupied slot. Doubles as the occupancy flag.
+const EMPTY: u32 = u32::MAX;
+
+impl Default for Bucket {
+    fn default() -> Self {
+        Bucket { hash: 0, id: EMPTY, len: 0 }
+    }
+}
+
+/// Per-unique data, indexed by id.
+#[derive(Clone, Copy, Default)]
+struct Record {
+    off: u64,
+    count: u32,
 }
 
 struct DedupTable {
@@ -27,6 +40,7 @@ struct DedupTable {
     mask: usize,
     arena: Vec<u8>,
     used: usize,
+    records: Vec<Record>,
     next_id: usize,
     /// Bucket slot holding each id, so the writer can emit in insertion order
     /// without building an inverse index over every bucket afterwards.
@@ -42,6 +56,7 @@ impl DedupTable {
             mask: cap - 1,
             arena: Vec::with_capacity(expected_bytes.max(64 * 1024 * 1024)),
             used: 0,
+            records: Vec::with_capacity(expected_uniques),
             next_id: 0,
             id_to_slot: Vec::with_capacity(expected_uniques),
         }
@@ -59,12 +74,12 @@ impl DedupTable {
         self.buckets = vec![Bucket::default(); new_cap];
         self.mask = new_cap - 1;
         self.used = 0;
-        for b in old.into_iter().filter(|b| b.used) {
+        for b in old.into_iter().filter(|b| b.id != EMPTY) {
             let mut i = (b.hash as usize) & self.mask;
-            while self.buckets[i].used {
+            while self.buckets[i].id != EMPTY {
                 i = (i + 1) & self.mask;
             }
-            self.id_to_slot[b.id] = i as u32;
+            self.id_to_slot[b.id as usize] = i as u32;
             self.buckets[i] = b;
             self.used += 1;
         }
@@ -81,22 +96,27 @@ impl DedupTable {
     fn add(&mut self, seq: &[u8]) {
         self.maybe_grow();
         let h = Self::hash64(seq);
-        let len = seq.len();
+        let len = seq.len() as u32;
         let mut i = (h as usize) & self.mask;
         loop {
-            if !self.buckets[i].used {
-                let off = self.arena.len();
+            let bucket = self.buckets[i];
+            if bucket.id == EMPTY {
+                let off = self.arena.len() as u64;
                 self.arena.extend_from_slice(seq);
-                let id = self.next_id;
+                let id = self.next_id as u32;
                 self.next_id += 1;
                 self.id_to_slot.push(i as u32);
-                self.buckets[i] = Bucket { hash: h, off, len, count: 1, id, used: true };
+                self.records.push(Record { off, count: 1 });
+                self.buckets[i] = Bucket { hash: h, id, len };
                 self.used += 1;
                 return;
             }
-            if self.buckets[i].hash == h && self.buckets[i].len == len {
-                if self.arena_get(self.buckets[i].off, len) == seq {
-                    self.buckets[i].count += 1;
+            // hash and length reject almost every collision without touching
+            // records or the arena.
+            if bucket.hash == h && bucket.len == len {
+                let rec = self.records[bucket.id as usize];
+                if self.arena_get(rec.off as usize, len as usize) == seq {
+                    self.records[bucket.id as usize].count += 1;
                     return;
                 }
             }
@@ -227,11 +247,12 @@ pub fn fast_dedupe(
     let _ = sort_by_size;
     for id in 0..table.next_id {
         let b = table.buckets[table.id_to_slot[id] as usize];
-        if b.count < min_size {
+        let rec = table.records[id];
+        if u64::from(rec.count) < min_size {
             continue;
         }
-        writeln!(writer, ">{}|{}", id + 1, b.count)?;
-        writer.write_all(table.arena_get(b.off, b.len))?;
+        writeln!(writer, ">{}|{}", id + 1, rec.count)?;
+        writer.write_all(table.arena_get(rec.off as usize, b.len as usize))?;
         writeln!(writer)?;
     }
     
@@ -383,8 +404,10 @@ pub fn dedupe_reads(
 
     for id in 0..table.next_id {
         let b = table.buckets[table.id_to_slot[id] as usize];
+        let rec = table.records[id];
         let node_id = (id + 1) as u64;
-        let seq = &table.arena[b.off..b.off + b.len];
+        let off = rec.off as usize;
+        let seq = &table.arena[off..off + b.len as usize];
 
         // Mirrors preprocess_n_chunks: whole read when it holds no N, else the
         // N-free runs, each kept only at or above the minimum length.
@@ -392,7 +415,7 @@ pub fn dedupe_reads(
         if !seq.contains(&b'N') && !seq.contains(&b'n') {
             if seq.len() >= min_length {
                 validate_residues(node_id, seq)?;
-                records.push((node_id, b.off, seq.len() as u32));
+                records.push((node_id, off, seq.len() as u32));
                 emitted = true;
             }
         } else {
@@ -402,9 +425,9 @@ pub fn dedupe_reads(
                 if is_end || seq[i] == b'N' || seq[i] == b'n' {
                     let len = i - chunk_start;
                     if len >= min_length {
-                        let off = b.off + chunk_start;
-                        validate_residues(node_id, &table.arena[off..off + len])?;
-                        records.push((node_id, off, len as u32));
+                        let chunk_off = off + chunk_start;
+                        validate_residues(node_id, &table.arena[chunk_off..chunk_off + len])?;
+                        records.push((node_id, chunk_off, len as u32));
                         emitted = true;
                     }
                     chunk_start = i + 1;
@@ -414,7 +437,7 @@ pub fn dedupe_reads(
 
         // prepare recorded the dupe count once per surviving header.
         if emitted {
-            let dupes = b.count - 1;
+            let dupes = u64::from(rec.count) - 1;
             total_dupes += dupes;
             if dupes != 0 {
                 dupe_keys.push(node_id as i64);

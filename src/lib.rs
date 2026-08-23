@@ -9,17 +9,13 @@ mod identity;
 mod interval_tree;
 mod ntbatch;
 mod overlap;
-mod pssm;
 mod translate;
 
 use bio::alignment::distance::simd::hamming;
-use dedupe::fast_dedupe as rust_fast_dedupe;
 use flexcull::*;
 use overlap::get_overlap;
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 const BLOSUM_ALLOWED: [bool; 256] = {
     let mut t = [false; 256];
@@ -495,30 +491,10 @@ pub fn preprocess_n_chunks(
     Ok(results)
 }
 
-#[pyfunction]
-fn fast_dedupe(
-    inputs: Vec<String>, // Accept a list of strings from Python
-    out: &str,
-    sort_by_size: bool,
-    min_size: u64,
-) -> PyResult<()> {
-    // Convert all input strings into PathBufs
-    let input_paths: Vec<PathBuf> = inputs.into_iter().map(PathBuf::from).collect();
-
-    let out_path = PathBuf::from(out);
-
-    // Call the updated Rust function
-    rust_fast_dedupe(input_paths, out_path, sort_by_size, min_size)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-    Ok(())
-}
 // A Python module implemented in Rust.
 #[pymodule]
 
 fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(preprocess_n_chunks, m)?)?;
-    m.add_function(wrap_pyfunction!(fast_dedupe, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(bio_revcomp, m)?)?;
     m.add_function(wrap_pyfunction!(constrained_distance, m)?)?;
@@ -542,10 +518,8 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aligner::hmm_align, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::cull_columns, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::apply_gff_culls, m)?)?;
-    m.add_function(wrap_pyfunction!(pssm::compute_pssm_for_window, m)?)?;
     m.add_function(wrap_pyfunction!(exonfinder_post::exonfinder_process_gene, m)?)?;
 
-    m.add_class::<interval_tree::OverlapTree>()?;
     m.add_class::<ntbatch::NtBatchScanner>()?;
     m.add_class::<dedupe::PreparedReads>()?;
     m.add_function(wrap_pyfunction!(dedupe::dedupe_reads, m)?)?;

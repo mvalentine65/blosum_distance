@@ -5,9 +5,8 @@ use pyo3::types::PyBytes;
 use seq_io::fastq::{Reader as FastqReader, Record as FastqRecord};
 use seq_io::fasta::{Reader as FastaReader, Record as FastaRecord};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::error::Error;
 use flate2::read::MultiGzDecoder;
 
 // --- Optimized DedupTable from main_bestrs.rs ---
@@ -214,50 +213,6 @@ fn size_hint(paths: &[PathBuf]) -> (usize, usize) {
         records += (bytes / per_record) as usize;
     }
     (records.max(1_000_000), records.saturating_mul(150))
-}
-
-pub fn fast_dedupe(
-    mut input_paths: Vec<PathBuf>, // Changed from r1, r2 to a Vec
-    out: PathBuf,
-    sort_by_size: bool,
-    min_size: u64,
-) -> Result<(), Box<dyn Error>> {
-    // Stabilize input order by file name so IDs are deterministic across runs.
-    input_paths.sort_by(|a, b| {
-        let a_name = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let b_name = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        a_name
-            .cmp(b_name)
-            .then_with(|| a.as_os_str().cmp(b.as_os_str()))
-    });
-
-    let table = build_table(input_paths)?;
-
-    // PHASE 2: WRITING
-    let mut writer: Box<dyn Write> = if out.as_os_str() == "-" {
-        Box::new(BufWriter::with_capacity(8 << 20, io::stdout().lock()))
-    } else {
-        let f = File::create(&out).with_context(|| format!("Failed to create {}", out.display()))?;
-        Box::new(BufWriter::with_capacity(8 << 20, f))
-    };
-
-    // Input order is preserved regardless of sort_by_size, to avoid
-    // nondeterministic ties. id_to_slot already gives insertion order, so no
-    // inverse index over the buckets is built.
-    let _ = sort_by_size;
-    for id in 0..table.next_id {
-        let b = table.buckets[table.id_to_slot[id] as usize];
-        let rec = table.records[id];
-        if u64::from(rec.count) < min_size {
-            continue;
-        }
-        writeln!(writer, ">{}|{}", id + 1, rec.count)?;
-        writer.write_all(table.arena_get(rec.off as usize, b.len as usize))?;
-        writeln!(writer)?;
-    }
-    
-    writer.flush()?;
-    Ok(())
 }
 
 /// Phase 1: read every input and fill the dedup table. Shared so `fast_dedupe`

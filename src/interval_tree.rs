@@ -1,37 +1,5 @@
 use std::collections::HashSet;
-use meminterval::{Interval, IntervalTree};
 use pyo3::prelude::*;
-
-#[pyclass]
-pub struct OverlapTree {
-    pub tree: IntervalTree<i32, ()>,
-}
-
-#[pymethods]
-impl OverlapTree {
-    #[new]
-    fn new() -> Self {
-        OverlapTree {
-            tree: IntervalTree::new()
-        }
-    }
-    
-    fn insert(&mut self, tuple: (i32, i32)) {
-        self.tree.insert(Interval::new(tuple.0, tuple.1), ());
-    }
-    
-    fn insert_vector(&mut self, iterable: Vec<(i32, i32)>) {
-        iterable.iter()
-            .for_each(|tup| self.insert(*tup));
-    }
-    
-    fn query_overlap(&mut self, tuple: (i32, i32)) -> Vec<(i32, i32)>{
-        self.tree
-            .query(Interval::new(tuple.0, tuple.1))
-            .map(|entry| (entry.interval.start, entry.interval.end))
-            .collect()
-    }
-}
 
 #[pyfunction]
 pub fn del_cols(sequence: String, x_positions: HashSet<usize>, is_nt: bool) -> String {

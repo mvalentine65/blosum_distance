@@ -11,6 +11,7 @@ use std::path::Path;
 const REF_GAP_THR: f64 = 0.67;
 /// Minimum effective (masked) gap columns to trigger a scan.
 const MINIMUM_GAP_AA: usize = 10;
+const MINIMUM_ORF_AA: usize = 11;
 /// Maximum effective (masked) gap columns; larger gaps are skipped.
 const MAX_GAP_AA: usize = 250;
 /// Genomic search region cap for flank scans (bp).
@@ -181,7 +182,7 @@ fn qualify_gap(
     if effective_gap < MINIMUM_GAP_AA || effective_gap >= MAX_GAP_AA {
         return None;
     }
-    let scaled_min_aa = MINIMUM_GAP_AA.max(effective_gap / 2);
+    let scaled_min_aa = MINIMUM_ORF_AA.max(effective_gap / 2);
     Some((effective_gap, scaled_min_aa))
 }
 

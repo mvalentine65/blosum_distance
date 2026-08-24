@@ -170,10 +170,17 @@ fn hmm_align_inner(
     // function from a multiprocessing pool, so HMMER's default of 2 pthreads
     // per call would oversubscribe (N_workers x 2 threads).
     let hmm_name = if gene_slug.is_empty() { "hmm" } else { gene_slug.as_str() };
+    //
+    // The E-value calibration fits (200 sampled sequences each by default) are
+    // ~18% of hmmbuild's runtime and only populate the STATS lines. hmmalign
+    // never reads those, and this HMM is consumed by the hmmalign below and
+    // then discarded, so trim the fits. 25 still fits the Gumbel/exponential
+    // tails; 1 fails outright with "failed to determine msv mu".
     let mut hmmbuild = Command::new("hmmbuild");
     hmmbuild
         .args(["-n", hmm_name])
         .args(["--cpu", "1"])
+        .args(["--EmN", "25", "--EvN", "25", "--EfN", "25"])
         .arg(&hmm_path)
         .arg(&aln_path);
     run_command(&mut hmmbuild, "hmmbuild")?;

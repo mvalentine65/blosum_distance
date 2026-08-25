@@ -9,6 +9,7 @@ mod identity;
 mod interval_tree;
 mod ntbatch;
 mod overlap;
+mod blosum_tables;
 mod translate;
 
 use bio::alignment::distance::simd::hamming;
@@ -16,20 +17,6 @@ use flexcull::*;
 use overlap::get_overlap;
 use pyo3::prelude::*;
 use std::collections::HashSet;
-
-const BLOSUM_ALLOWED: [bool; 256] = {
-    let mut t = [false; 256];
-    let chars: &[u8] = &[
-        65, 84, 67, 71, 73, 68, 82, 80, 87, 77, 69, 81, 83, 72, 86, 76, 75, 70, 89, 78, 88, 90, 74,
-        66, 79, 85, 42,
-    ];
-    let mut i = 0;
-    while i < chars.len() {
-        t[chars[i] as usize] = true;
-        i += 1;
-    }
-    t
-};
 
 #[pyfunction]
 fn bio_revcomp(sequence: String) -> String {
@@ -82,6 +69,9 @@ fn blosum62_distance(one: String, two: String) -> f64 {
     let mut max_first = 0;
     let mut max_second = 0;
     let length = first.len();
+    // bio's matrix is a LazyLock and its lookup() is a four-branch chain, both
+    // paid three times per residue. Index a const table instead, and take the
+    // two self-scores off the diagonal, which is a per-character constant.
     for i in 0..length {
         let mut char1 = first[i];
         let mut char2 = second[i];
@@ -91,16 +81,18 @@ fn blosum62_distance(one: String, two: String) -> f64 {
         if second[i] == 45 {
             char2 = b'*';
         }
-        if !BLOSUM_ALLOWED[char1 as usize] {
+        let a = blosum_tables::XLAT[char1 as usize];
+        let b = blosum_tables::XLAT[char2 as usize];
+        if a == blosum_tables::INVALID {
             panic!("first[i]  {} not in allowed\n{}", char1 as char, one);
         }
-        if !BLOSUM_ALLOWED[char2 as usize] {
+        if b == blosum_tables::INVALID {
             panic!("second[i] {} not in allowed\n{}", char2 as char, two);
         }
-        // score += bio::scores::blosum62(char1, char2);
-        score += bio::scores::blosum62(char1, char2);
-        max_first += bio::scores::blosum62(char1, char1);
-        max_second += bio::scores::blosum62(char2, char2);
+        let (ai, bi) = (a as usize, b as usize);
+        score += blosum_tables::BLOSUM[27 * ai + bi];
+        max_first += blosum_tables::DIAG[ai];
+        max_second += blosum_tables::DIAG[bi];
     }
     let maximum_score = std::cmp::max(max_first, max_second);
     1.0_f64 - (score as f64 / maximum_score as f64)
@@ -124,21 +116,24 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
         if ref_bytes[i] == 45 || ref_bytes[i] == b'*' {
             continue;
         }
-        if !BLOSUM_ALLOWED[char1 as usize] {
+        let a = blosum_tables::XLAT[char1 as usize];
+        let b = blosum_tables::XLAT[char2 as usize];
+        if a == blosum_tables::INVALID {
             panic!("first[i]  {} not in allowed\n{}", char1 as char, candidate);
         }
-        if !BLOSUM_ALLOWED[char2 as usize] {
+        if b == blosum_tables::INVALID {
             panic!("second[i] {} not in allowed\n{}", char2 as char, reference);
         }
+        let (ai, bi) = (a as usize, b as usize);
 
         if char1 == b'*' || char1 == b'-' {
             score += -11;
             max_first += -11;
-            max_second += bio::scores::blosum62(char2, char2);
+            max_second += blosum_tables::DIAG[bi];
         } else {
-            score += bio::scores::blosum62(char1, char2);
-            max_first += bio::scores::blosum62(char1, char1);
-            max_second += bio::scores::blosum62(char2, char2);
+            score += blosum_tables::BLOSUM[27 * ai + bi];
+            max_first += blosum_tables::DIAG[ai];
+            max_second += blosum_tables::DIAG[bi];
         }
     }
     let maximum_score = std::cmp::max(max_first, max_second);

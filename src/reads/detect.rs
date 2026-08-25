@@ -1,0 +1,505 @@
+//! Adapter detection from the reads themselves.
+//!
+//! Ported from fastp 1.3.6 `src/evaluator.cpp` and `src/nucleotidetree.cpp`
+//! (MIT, (c) 2016 OpenGene).
+//!
+//! Two strategies, in fastp's order. First look for a known adapter riding on
+//! enough reads to be real. Failing that, find the most over-represented
+//! 10-mer that isn't low-complexity, then grow it outward by following the
+//! dominant path through a prefix tree of what surrounds it — which recovers
+//! an adapter nobody told us about, the case that matters for SRA downloads.
+
+use crate::reads::known_adapters::match_known_adapter;
+
+const KEYLEN: usize = 10;
+
+// ---------------------------------------------------------------------------
+// Nucleotide tree
+// ---------------------------------------------------------------------------
+
+/// A prefix tree over the bases following (or preceding) a seed.
+///
+/// fastp indexes children by `base & 0x07`, which maps A=1, C=3, G=7, T=4 and
+/// gives it 8 slots; we keep the same 8-slot indexing so the traversal order
+/// and therefore the dominant path are identical.
+struct NucleotideNode {
+    count: u32,
+    base: u8,
+    children: [Option<Box<NucleotideNode>>; 8],
+}
+
+impl NucleotideNode {
+    fn new(base: u8) -> Self {
+        NucleotideNode { count: 0, base, children: Default::default() }
+    }
+}
+
+pub struct NucleotideTree {
+    root: Box<NucleotideNode>,
+}
+
+impl Default for NucleotideTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NucleotideTree {
+    pub fn new() -> Self {
+        NucleotideTree { root: Box::new(NucleotideNode::new(b'N')) }
+    }
+
+    pub fn add_seq(&mut self, seq: &[u8]) {
+        let mut cur = &mut self.root;
+        for &b in seq {
+            if b == b'N' {
+                break;
+            }
+            let idx = (b & 0x07) as usize;
+            if cur.children[idx].is_none() {
+                cur.children[idx] = Some(Box::new(NucleotideNode::new(b)));
+            }
+            let child = cur.children[idx].as_mut().unwrap();
+            child.count += 1;
+            cur = child;
+        }
+    }
+
+    /// Walk while one child holds at least 95% of the traffic and the node has
+    /// been visited at least 50 times. `reached_leaf` is false when the walk
+    /// stopped because the path forked rather than because it ran dry.
+    pub fn dominant_path(&self, reached_leaf: &mut bool) -> Vec<u8> {
+        const RATIO_THRESHOLD: f64 = 0.95;
+        const NUM_THRESHOLD: u32 = 50;
+
+        let mut out = Vec::new();
+        let mut cur = &self.root;
+        loop {
+            let total: u32 = cur.children.iter().flatten().map(|c| c.count).sum();
+            if total < NUM_THRESHOLD {
+                break;
+            }
+            let mut next = None;
+            for child in cur.children.iter().flatten() {
+                if f64::from(child.count) / f64::from(total) >= RATIO_THRESHOLD {
+                    out.push(child.base);
+                    next = Some(child);
+                    break;
+                }
+            }
+            match next {
+                Some(child) => cur = child,
+                None => {
+                    *reached_leaf = false;
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// k-mer packing
+// ---------------------------------------------------------------------------
+
+/// fastp's `seq2int`: 2 bits per base, A=0 T=1 C=2 G=3, -1 on anything else.
+/// Pass the previous value to roll the window forward by one base.
+pub fn seq2int(seq: &[u8], pos: usize, keylen: usize, last_val: i32) -> i32 {
+    let code = |b: u8| -> i32 {
+        match b {
+            b'A' => 0,
+            b'T' => 1,
+            b'C' => 2,
+            b'G' => 3,
+            _ => -1,
+        }
+    };
+    if last_val >= 0 {
+        let mask = (1i32 << (keylen * 2)) - 1;
+        let key = (last_val << 2) & mask;
+        let c = code(seq[pos + keylen - 1]);
+        if c < 0 {
+            return -1;
+        }
+        key + c
+    } else {
+        let mut key = 0i32;
+        for i in pos..pos + keylen {
+            let c = code(seq[i]);
+            if c < 0 {
+                return -1;
+            }
+            key = (key << 2) + c;
+        }
+        key
+    }
+}
+
+/// fastp's `int2seq`.
+pub fn int2seq(mut val: u32, seqlen: usize) -> Vec<u8> {
+    const BASES: [u8; 4] = [b'A', b'T', b'C', b'G'];
+    let mut out = vec![b'N'; seqlen];
+    for done in 0..seqlen {
+        out[seqlen - done - 1] = BASES[(val & 0x03) as usize];
+        val >>= 2;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Detection
+// ---------------------------------------------------------------------------
+
+/// Look for a known adapter carried by enough of the sample, fastp's
+/// `checkKnownAdapters`.
+pub fn check_known_adapters(reads: &[&[u8]]) -> Option<(Vec<u8>, String)> {
+    use crate::reads::known_adapters::KNOWN_ADAPTERS;
+
+    const MAX_CHECK_READS: usize = 100_000;
+    const MAX_CHECK_BASES: usize = MAX_CHECK_READS * 1000;
+    const MAX_HIT: usize = 1000;
+    const MATCH_REQ: usize = 8;
+    const ALLOW_ONE_MISMATCH_FOR_EACH: usize = 16;
+
+    let mut counts = vec![0usize; KNOWN_ADAPTERS.len()];
+    let mut mismatches = vec![0usize; KNOWN_ADAPTERS.len()];
+
+    let mut checked_reads = 0usize;
+    let mut checked_bases = 0usize;
+    let mut cur_max = 0usize;
+
+    for r in reads {
+        let rlen = r.len();
+        checked_reads += 1;
+        checked_bases += rlen;
+        if checked_reads > MAX_CHECK_READS || checked_bases > MAX_CHECK_BASES {
+            break;
+        }
+        if cur_max > MAX_HIT {
+            break;
+        }
+        for (ai, &(adapter, _)) in KNOWN_ADAPTERS.iter().enumerate() {
+            let alen = adapter.len();
+            if alen >= rlen {
+                continue;
+            }
+            // Once a front-runner exists, stop scoring the stragglers.
+            if cur_max > 20 && counts[ai] < cur_max / 10 {
+                continue;
+            }
+            for pos in 0..rlen.saturating_sub(MATCH_REQ) {
+                let cmplen = (rlen - pos).min(alen);
+                let allowed = cmplen / ALLOW_ONE_MISMATCH_FOR_EACH;
+                let mut mismatch = 0;
+                let mut matched = true;
+                for i in 0..cmplen {
+                    if adapter[i] != r[i + pos] {
+                        mismatch += 1;
+                        if mismatch > allowed {
+                            matched = false;
+                            break;
+                        }
+                    }
+                }
+                if matched {
+                    counts[ai] += 1;
+                    if cur_max < counts[ai] {
+                        cur_max = counts[ai];
+                    }
+                    mismatches[ai] += mismatch;
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut best = None;
+    let mut max_count = 0usize;
+    for (ai, &c) in counts.iter().enumerate() {
+        if c > max_count {
+            max_count = c;
+            best = Some(ai);
+        }
+    }
+    let ai = best?;
+    // Either carried by 2% of reads, or by 0.5% and cleanly matched.
+    if max_count > checked_reads / 50
+        || (max_count > checked_reads / 200 && mismatches[ai] < checked_reads)
+    {
+        let (seq, name) = KNOWN_ADAPTERS[ai];
+        return Some((seq.to_vec(), name.to_string()));
+    }
+    None
+}
+
+/// Grow a seed k-mer into a full adapter, fastp's `getAdapterWithSeed`.
+fn adapter_with_seed(seed: i32, reads: &[&[u8]], shift_tail: usize) -> Option<Vec<u8>> {
+    const MAX_SEARCH_LENGTH: usize = 500;
+
+    let mut forward = NucleotideTree::new();
+    let mut backward = NucleotideTree::new();
+
+    for r in reads {
+        let rlen = r.len();
+        if rlen < KEYLEN + shift_tail + 20 {
+            continue;
+        }
+        let last = rlen - KEYLEN - shift_tail;
+        let mut key = -1i32;
+        for pos in 20..=last.min(MAX_SEARCH_LENGTH) {
+            key = seq2int(r, pos, KEYLEN, key);
+            if key == seed {
+                forward.add_seq(&r[pos + KEYLEN..rlen - shift_tail]);
+                let mut rev: Vec<u8> = r[..pos].to_vec();
+                rev.reverse();
+                backward.add_seq(&rev);
+            }
+        }
+    }
+
+    let mut reached_leaf = true;
+    let forward_path = forward.dominant_path(&mut reached_leaf);
+    let backward_path = backward.dominant_path(&mut reached_leaf);
+
+    let mut adapter: Vec<u8> = backward_path.into_iter().rev().collect();
+    adapter.extend_from_slice(&int2seq(seed as u32, KEYLEN));
+    adapter.extend_from_slice(&forward_path);
+    if adapter.len() > 60 {
+        adapter.truncate(60);
+    }
+
+    if let Some((known, _)) = match_known_adapter(&adapter) {
+        return Some(known.to_vec());
+    }
+    if reached_leaf {
+        Some(adapter)
+    } else {
+        None
+    }
+}
+
+/// What detection concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Detected {
+    /// Matched an entry in the known table.
+    Known { seq: Vec<u8>, name: String },
+    /// Assembled from the reads, matching nothing known.
+    Novel { seq: Vec<u8> },
+    /// Nothing convincing — the library looks clean, or the sample is too small.
+    None,
+}
+
+impl Detected {
+    /// The sequence, whichever way it was found.
+    #[allow(dead_code)]
+    pub fn seq(&self) -> Option<&[u8]> {
+        match self {
+            Detected::Known { seq, .. } | Detected::Novel { seq } => Some(seq),
+            Detected::None => None,
+        }
+    }
+}
+
+/// Detect the adapter carried by a sample of reads, fastp's
+/// `evalAdapterAndReadNum` minus its read-count estimation.
+///
+/// `shift_tail` drops the last cycle from consideration, which fastp does
+/// because it is reliably the noisiest.
+pub fn detect_adapter(reads: &[&[u8]], shift_tail: usize) -> Detected {
+    // fastp refuses to guess from a small sample, and so do we: below this the
+    // over-representation test has no power and would invent an adapter.
+    if reads.len() < 10_000 {
+        return Detected::None;
+    }
+
+    if let Some((seq, name)) = check_known_adapters(reads) {
+        if seq.len() > 8 {
+            return Detected::Known { seq, name };
+        }
+    }
+
+    let shift_tail = shift_tail.max(1);
+    let size = 1usize << (KEYLEN * 2);
+    let mut counts = vec![0u32; size];
+    for r in reads {
+        let rlen = r.len();
+        if rlen < KEYLEN + shift_tail + 20 {
+            continue;
+        }
+        let last = rlen - KEYLEN - shift_tail;
+        let mut key = -1i32;
+        for pos in 20..=last {
+            key = seq2int(r, pos, KEYLEN, key);
+            if key >= 0 {
+                counts[key as usize] += 1;
+            }
+        }
+    }
+    counts[0] = 0; // AAAAAAAAAA
+
+    // Rank candidate keys, skipping the ones that are structurally junk.
+    const TOPNUM: usize = 10;
+    let mut topkeys = [0usize; TOPNUM];
+    let mut total: u64 = 0;
+    for k in 0..size {
+        let mut atcg = [0usize; 4];
+        for i in 0..KEYLEN {
+            atcg[(k >> (i * 2)) & 0x03] += 1;
+        }
+        if atcg.iter().any(|&n| n >= KEYLEN - 4) {
+            continue; // low complexity
+        }
+        if atcg[2] + atcg[3] >= KEYLEN - 2 {
+            continue; // GC heavy
+        }
+        if k >> 12 == 0xff {
+            continue; // starts with GGGG
+        }
+        let val = counts[k];
+        total += u64::from(val);
+        for t in (0..TOPNUM).rev() {
+            if val < counts[topkeys[t]] {
+                if t < TOPNUM - 1 {
+                    for m in (t + 2..TOPNUM).rev() {
+                        topkeys[m] = topkeys[m - 1];
+                    }
+                    topkeys[t + 1] = k;
+                }
+                break;
+            } else if t == 0 {
+                for m in (1..TOPNUM).rev() {
+                    topkeys[m] = topkeys[m - 1];
+                }
+                topkeys[0] = k;
+            }
+        }
+    }
+
+    const FOLD_THRESHOLD: u64 = 20;
+    for &key in topkeys.iter() {
+        if key == 0 {
+            continue;
+        }
+        let count = u64::from(counts[key]);
+        if count < 10 || count * (size as u64) < total * FOLD_THRESHOLD {
+            break;
+        }
+        let seq = int2seq(key as u32, KEYLEN);
+        let diff = seq.windows(2).filter(|w| w[0] != w[1]).count();
+        if diff < 3 {
+            continue;
+        }
+        if let Some(adapter) = adapter_with_seed(key as i32, reads, shift_tail) {
+            return match match_known_adapter(&adapter) {
+                Some((known, name)) => {
+                    Detected::Known { seq: known.to_vec(), name: name.to_string() }
+                }
+                None => Detected::Novel { seq: adapter },
+            };
+        }
+    }
+
+    Detected::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// fastp's own `NucleotideTree::test()`.
+    #[test]
+    fn fastp_nucleotide_tree_test_case() {
+        let mut tree = NucleotideTree::new();
+        for _ in 0..100 {
+            tree.add_seq(b"AAAATTTT");
+            tree.add_seq(b"AAAATTTTGGGG");
+            tree.add_seq(b"AAAATTTTGGGGCCCC");
+            tree.add_seq(b"AAAATTTTGGGGCCAA");
+        }
+        tree.add_seq(b"AAAATTTTGGGACCCC");
+        let mut reached_leaf = true;
+        let path = tree.dominant_path(&mut reached_leaf);
+        assert_eq!(path, b"AAAATTTTGGGGCC".to_vec());
+    }
+
+    /// fastp's own `Evaluator::test()`.
+    #[test]
+    fn fastp_seq2int_roundtrip() {
+        let s = b"ATCGATCGAT";
+        let key = seq2int(s, 0, 10, -1);
+        assert_eq!(int2seq(key as u32, 10), s.to_vec());
+    }
+
+    #[test]
+    fn rolling_and_fresh_keys_agree() {
+        let s = b"ACGTACGTACGTACGT";
+        let fresh = seq2int(s, 1, 10, -1);
+        let rolled = seq2int(s, 1, 10, seq2int(s, 0, 10, -1));
+        assert_eq!(fresh, rolled);
+    }
+
+    #[test]
+    fn an_n_poisons_the_key() {
+        assert_eq!(seq2int(b"ACGTNCGTAC", 0, 10, -1), -1);
+    }
+
+    /// Synthetic library: 20k reads of varied insert, a third carrying TruSeq.
+    #[test]
+    fn detects_truseq_in_a_contaminated_library() {
+        let truseq = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+        let bases = b"ACGT";
+        let mut store: Vec<Vec<u8>> = Vec::new();
+        let mut seed = 12345u64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for i in 0..20_000 {
+            let insert_len = 60 + rand() % 60;
+            let mut read: Vec<u8> = (0..insert_len).map(|_| bases[rand() % 4]).collect();
+            if i % 3 == 0 {
+                read.extend_from_slice(truseq);
+            }
+            read.resize(150, b'A');
+            store.push(read);
+        }
+        let reads: Vec<&[u8]> = store.iter().map(|v| v.as_slice()).collect();
+        match detect_adapter(&reads, 1) {
+            Detected::Known { seq, name } => {
+                assert_eq!(seq, truseq.to_vec());
+                assert!(name.contains("TruSeq"), "got {name}");
+            }
+            other => panic!("expected the TruSeq entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_clean_library_yields_nothing() {
+        let bases = b"ACGT";
+        let mut seed = 999u64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let store: Vec<Vec<u8>> = (0..20_000)
+            .map(|_| (0..150).map(|_| bases[rand() % 4]).collect())
+            .collect();
+        let reads: Vec<&[u8]> = store.iter().map(|v| v.as_slice()).collect();
+        assert_eq!(detect_adapter(&reads, 1), Detected::None);
+    }
+
+    #[test]
+    fn too_small_a_sample_refuses_to_guess() {
+        let truseq = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+        let store: Vec<Vec<u8>> = (0..500)
+            .map(|_| {
+                let mut r = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
+                r.extend_from_slice(truseq);
+                r
+            })
+            .collect();
+        let reads: Vec<&[u8]> = store.iter().map(|v| v.as_slice()).collect();
+        assert_eq!(detect_adapter(&reads, 1), Detected::None);
+    }
+}

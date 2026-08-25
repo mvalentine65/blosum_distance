@@ -8,6 +8,7 @@ mod flexcull;
 mod identity;
 mod interval_tree;
 mod ntbatch;
+mod reads;
 mod overlap;
 mod blosum_tables;
 mod translate;

@@ -8,6 +8,11 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use flate2::read::MultiGzDecoder;
+// Same mapping this file used to define inline, but table-driven: it runs once
+// per base of every read through `forward_is_canonical`.
+use crate::reads::ingest::{group_inputs, Ingest, InputGroup};
+use crate::reads::pipeline::{TrimOptions, TrimStats};
+use crate::reads::seqops::complement;
 
 // --- Optimized DedupTable from main_bestrs.rs ---
 
@@ -35,6 +40,8 @@ struct Record {
 }
 
 struct DedupTable {
+    grows: usize,
+    grow_time: std::time::Duration,
     buckets: Vec<Bucket>,
     mask: usize,
     arena: Vec<u8>,
@@ -51,6 +58,8 @@ impl DedupTable {
         let mut cap = (expected_uniques * 10) / 7;
         cap = cap.next_power_of_two().max(1024);
         Self {
+            grows: 0,
+            grow_time: std::time::Duration::ZERO,
             buckets: vec![Bucket::default(); cap],
             mask: cap - 1,
             arena: Vec::with_capacity(expected_bytes.max(64 * 1024 * 1024)),
@@ -68,6 +77,8 @@ impl DedupTable {
 
     fn maybe_grow(&mut self) {
         if (self.used * 10) < (self.buckets.len() * 7) { return; }
+        let _t = std::time::Instant::now();
+        self.grows += 1;
         let old = std::mem::take(&mut self.buckets);
         let new_cap = old.len() * 2;
         self.buckets = vec![Bucket::default(); new_cap];
@@ -82,6 +93,7 @@ impl DedupTable {
             self.buckets[i] = b;
             self.used += 1;
         }
+        self.grow_time += _t.elapsed();
     }
 
     #[inline]
@@ -125,18 +137,6 @@ impl DedupTable {
 }
 
 // --- Canonicalization Helpers ---
-
-#[inline]
-fn complement(b: u8) -> u8 {
-    match b {
-        b'A' | b'a' => b'T',
-        b'C' | b'c' => b'G',
-        b'G' | b'g' => b'C',
-        b'T' | b't' => b'A',
-        b'N' | b'n' => b'N',
-        _ => b'N',
-    }
-}
 
 #[inline]
 fn forward_is_canonical(seq: &[u8]) -> bool {
@@ -217,46 +217,196 @@ fn size_hint(paths: &[PathBuf]) -> (usize, usize) {
 
 /// Phase 1: read every input and fill the dedup table. Shared so `fast_dedupe`
 /// and `dedupe_reads` can never disagree about ids.
-fn build_table(input_paths: Vec<PathBuf>) -> Result<DedupTable> {
+///
+/// With `trim` on, every record first goes through the fastp-derived chain in
+/// [`crate::reads`]: adapters are detected from the head of the input and then
+/// trimmed, quality filters drop what fails, and only the survivors are
+/// canonicalised and hashed. That ordering is the point — trimming is what lets
+/// two copies of the same fragment carrying different adapter remnants collapse
+/// onto one entry, which they cannot do once hashed.
+fn build_table(input_paths: Vec<PathBuf>, trim: bool) -> Result<(DedupTable, TrimSummary)> {
+    let prof = std::env::var("SAPPHYRE_PROFILE").is_ok();
+    let mut t_read = std::time::Duration::ZERO;
+    let mut t_trim = std::time::Duration::ZERO;
+    let mut t_hash = std::time::Duration::ZERO;
+    let t_all = std::time::Instant::now();
     let (expected_uniques, expected_bytes) = size_hint(&input_paths);
     let mut table = DedupTable::with_capacity(expected_uniques, expected_bytes);
+
+    if !trim {
+        let mut scratch = Vec::with_capacity(300);
+        for path in input_paths {
+            let mut src = RecordSource::open(&path)?;
+            loop {
+                let t0 = std::time::Instant::now();
+                let rec = src.next_record()?;
+                if prof { t_read += t0.elapsed(); }
+                let Some((seq, _qual)) = rec else { break };
+                let t1 = std::time::Instant::now();
+                add_canonical(&mut table, &seq, &mut scratch);
+                if prof { t_hash += t1.elapsed(); }
+            }
+        }
+        if prof {
+            eprintln!(
+                "[profile] no-trim total {:.1}s | read+decompress {:.1}s | canonicalise+hash {:.1}s",
+                t_all.elapsed().as_secs_f64(), t_read.as_secs_f64(), t_hash.as_secs_f64());
+        }
+        return Ok((table, TrimSummary::default()));
+    }
+
+    let mut ingest = Ingest::new(TrimOptions::default());
     let mut scratch = Vec::with_capacity(300);
 
-    for path in input_paths {
-        match detect_format(&path)? {
-            InputFormat::Fastq => {
-                let mut reader = FastqReader::new(open_reader(&path)?);
-                let mut records = reader.records();
-                while let Some(record) = records.next() {
-                    let rec = record.context("Error reading FASTQ record")?;
-                    let seq = rec.seq();
-                    if forward_is_canonical(seq) {
-                        table.add(seq);
-                    } else {
-                        scratch.clear();
-                        scratch.extend(seq.iter().rev().map(|&b| complement(b)));
-                        table.add(&scratch);
-                    }
+    for group in group_inputs(&input_paths) {
+        match group {
+            InputGroup::Paired(p1, p2) => {
+                // Read the mates in lockstep so the overlap analyser can see
+                // both halves of a fragment.
+                let mut a = RecordSource::open(&p1)?;
+                let mut b = RecordSource::open(&p2)?;
+                loop {
+                    let t0 = std::time::Instant::now();
+                    let pair = (a.next_record()?, b.next_record()?);
+                    if prof { t_read += t0.elapsed(); }
+                    let (Some((s1, q1)), Some((s2, q2))) = pair else { break };
+                    let t1 = std::time::Instant::now();
+                    ingest.push_pair(&s1, &q1, &s2, &q2, &mut |kept: &[u8]| {
+                        let t2 = std::time::Instant::now();
+                        add_canonical(&mut table, kept, &mut scratch);
+                        if prof { t_hash += t2.elapsed(); }
+                    });
+                    if prof { t_trim += t1.elapsed(); }
                 }
             }
-            InputFormat::Fasta => {
-                let mut reader = FastaReader::new(open_reader(&path)?);
-                let mut records = reader.records();
-                while let Some(record) = records.next() {
-                    let rec = record.context("Error reading FASTA record")?;
-                    let seq = rec.seq();
-                    if forward_is_canonical(seq) {
-                        table.add(seq);
-                    } else {
-                        scratch.clear();
-                        scratch.extend(seq.iter().rev().map(|&b| complement(b)));
-                        table.add(&scratch);
-                    }
+            InputGroup::Single(path) => {
+                let mut src = RecordSource::open(&path)?;
+                while let Some((seq, qual)) = src.next_record()? {
+                    ingest.push_single(&seq, &qual, &mut |kept: &[u8]| {
+                        add_canonical(&mut table, kept, &mut scratch)
+                    });
                 }
             }
         }
     }
-    Ok(table)
+    // Anything still staged awaiting detection has to be drained, or every
+    // input shorter than the detection sample would vanish.
+    ingest.finish(&mut |kept: &[u8]| add_canonical(&mut table, kept, &mut scratch));
+
+    if prof {
+        eprintln!(
+            "[table] buckets {} ({:.2} GB) | uniques {} | load {:.1}% | grows {} ({:.1}s) | arena {:.2} GB of {:.2} GB reserved",
+            table.buckets.len(),
+            (table.buckets.len() * std::mem::size_of::<Bucket>()) as f64 / 1e9,
+            table.next_id,
+            100.0 * table.next_id as f64 / table.buckets.len() as f64,
+            table.grows,
+            table.grow_time.as_secs_f64(),
+            table.arena.len() as f64 / 1e9,
+            table.arena.capacity() as f64 / 1e9);
+        eprintln!(
+            "[profile] trim total {:.1}s | read+decompress {:.1}s | trim chain {:.1}s (of which hash {:.1}s)",
+            t_all.elapsed().as_secs_f64(), t_read.as_secs_f64(),
+            (t_trim - t_hash).as_secs_f64(), t_hash.as_secs_f64());
+    }
+    let summary = TrimSummary::from(ingest.stats(), ingest.detected());
+    Ok((table, summary))
+}
+
+/// Canonicalise and hash one surviving sequence.
+#[inline]
+fn add_canonical(table: &mut DedupTable, seq: &[u8], scratch: &mut Vec<u8>) {
+    if seq.is_empty() {
+        return;
+    }
+    if forward_is_canonical(seq) {
+        table.add(seq);
+    } else {
+        scratch.clear();
+        scratch.extend(seq.iter().rev().map(|&b| complement(b)));
+        table.add(scratch);
+    }
+}
+
+/// A FASTQ or FASTA file yielding `(sequence, quality)`; quality is empty for
+/// FASTA, which makes every quality-dependent stage a no-op downstream.
+enum RecordSource {
+    Fastq(FastqReader<Box<dyn Read + Send>>),
+    Fasta(FastaReader<Box<dyn Read + Send>>),
+}
+
+impl RecordSource {
+    fn open(path: &PathBuf) -> Result<Self> {
+        Ok(match detect_format(path)? {
+            InputFormat::Fastq => RecordSource::Fastq(FastqReader::new(open_reader(path)?)),
+            InputFormat::Fasta => RecordSource::Fasta(FastaReader::new(open_reader(path)?)),
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn next_record(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            RecordSource::Fastq(r) => match r.next() {
+                None => Ok(None),
+                Some(rec) => {
+                    let rec = rec.context("Error reading FASTQ record")?;
+                    Ok(Some((rec.seq().to_vec(), rec.qual().to_vec())))
+                }
+            },
+            RecordSource::Fasta(r) => match r.next() {
+                None => Ok(None),
+                Some(rec) => {
+                    let rec = rec.context("Error reading FASTA record")?;
+                    Ok(Some((rec.seq().to_vec(), Vec::new())))
+                }
+            },
+        }
+    }
+}
+
+/// Stream one file, handing each record to `f`. Used by the untrimmed path,
+/// which has no need to pair anything up.
+fn for_each_record(
+    path: &PathBuf,
+    mut f: impl FnMut(&[u8], &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut src = RecordSource::open(path)?;
+    while let Some((seq, qual)) = src.next_record()? {
+        f(&seq, &qual)?;
+    }
+    Ok(())
+}
+
+/// What trimming did, for prepare's summary line.
+#[derive(Default, Clone)]
+pub struct TrimSummary {
+    pub reads_in: u64,
+    pub reads_passed: u64,
+    pub adapter_trimmed_reads: u64,
+    pub adapter_trimmed_bases: u64,
+    pub failed_quality: u64,
+    pub failed_n_base: u64,
+    pub failed_length: u64,
+    pub failed_adapter_dimer: u64,
+    pub adapter_r1: Option<String>,
+    pub adapter_r2: Option<String>,
+}
+
+impl TrimSummary {
+    fn from(stats: &TrimStats, detected: (Option<&[u8]>, Option<&[u8]>)) -> Self {
+        TrimSummary {
+            reads_in: stats.reads_in,
+            reads_passed: stats.reads_passed,
+            adapter_trimmed_reads: stats.adapter_trimmed_reads,
+            adapter_trimmed_bases: stats.adapter_trimmed_bases,
+            failed_quality: stats.failed_quality,
+            failed_n_base: stats.failed_n_base,
+            failed_length: stats.failed_length,
+            failed_adapter_dimer: stats.failed_adapter_dimer,
+            adapter_r1: detected.0.map(|s| String::from_utf8_lossy(s).into_owned()),
+            adapter_r2: detected.1.map(|s| String::from_utf8_lossy(s).into_owned()),
+        }
+    }
 }
 
 const fn valid_nt_table() -> [bool; 256] {
@@ -281,6 +431,7 @@ const DUPES_MAGIC: &[u8; 8] = b"SPKD1\0\0\0";
 #[pyclass]
 pub struct PreparedReads {
     arena: Vec<u8>,
+    trim: TrimSummary,
     /// (node id, arena offset, length) per emitted record, in id order.
     records: Vec<(u64, usize, u32)>,
     batch_size: usize,
@@ -326,6 +477,42 @@ impl PreparedReads {
     fn packed_dupes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.dupes_blob)
     }
+
+    // --- Trimming summary. All zero when trimming was switched off. ---
+
+    /// Reads read in, before any filtering.
+    fn reads_in(&self) -> u64 {
+        self.trim.reads_in
+    }
+
+    /// Reads that survived trimming and filtering.
+    fn reads_passed(&self) -> u64 {
+        self.trim.reads_passed
+    }
+
+    fn adapter_trimmed_reads(&self) -> u64 {
+        self.trim.adapter_trimmed_reads
+    }
+
+    fn adapter_trimmed_bases(&self) -> u64 {
+        self.trim.adapter_trimmed_bases
+    }
+
+    /// Dropped reads by reason: quality, N content, length, adapter dimer.
+    fn filtered_counts(&self) -> (u64, u64, u64, u64) {
+        (
+            self.trim.failed_quality,
+            self.trim.failed_n_base,
+            self.trim.failed_length,
+            self.trim.failed_adapter_dimer,
+        )
+    }
+
+    /// Adapters detection settled on, or None when nothing convincing was
+    /// found -- which is the expected answer for an already-clean library.
+    fn detected_adapters(&self) -> (Option<String>, Option<String>) {
+        (self.trim.adapter_r1.clone(), self.trim.adapter_r2.clone())
+    }
 }
 
 /// Dedupe the inputs and return the records the sequences db should hold.
@@ -339,6 +526,7 @@ pub fn dedupe_reads(
     inputs: Vec<String>,
     min_length: usize,
     batch_size: usize,
+    trim: bool,
 ) -> PyResult<PreparedReads> {
     if batch_size == 0 {
         return Err(PyValueError::new_err("batch_size must be non-zero"));
@@ -350,7 +538,8 @@ pub fn dedupe_reads(
         a_name.cmp(b_name).then_with(|| a.as_os_str().cmp(b.as_os_str()))
     });
 
-    let table = build_table(input_paths).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let (table, trim_summary) =
+        build_table(input_paths, trim).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     let mut records: Vec<(u64, usize, u32)> = Vec::with_capacity(table.next_id);
     let mut dupe_keys: Vec<i64> = Vec::with_capacity(table.next_id);
@@ -414,6 +603,7 @@ pub fn dedupe_reads(
 
     Ok(PreparedReads {
         arena: table.arena,
+        trim: trim_summary,
         records,
         batch_size,
         dupes_blob,

@@ -18,7 +18,7 @@ use crate::reads::adapter::{trim_by_multi_sequences, trim_by_sequence, AdapterSc
 use crate::reads::seed::PreparedAdapter;
 use crate::reads::correct::{correct_by_overlap, PairBuffers};
 use crate::reads::filter::{pass_filter, trim_and_cut, FilterOptions, FilterVerdict, QualityCut};
-use crate::reads::overlap::{analyze, trim_by_overlap, OverlapScratch};
+use crate::reads::overlap::{analyze, trim_by_overlap, OverlapResult, OverlapScratch};
 use crate::reads::polyx::{trim_poly_g, trim_poly_x};
 use crate::reads::read::ReadRec;
 
@@ -90,8 +90,12 @@ impl Default for TrimOptions {
     }
 }
 
+/// Largest insert size tracked; anything longer, or any pair whose overlap
+/// could not be placed, lands in the final bucket. fastp's `insertSizeMax`.
+pub const INSERT_SIZE_MAX: usize = 512;
+
 /// Tallies for the run summary.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrimStats {
     pub reads_in: u64,
     pub reads_passed: u64,
@@ -107,9 +111,42 @@ pub struct TrimStats {
     pub failed_adapter_dimer: u64,
     pub corrected_bases: u64,
     pub pairs_merged: u64,
+    /// Bases seen before trimming, and bases kept after it.
+    pub bases_in: u64,
+    pub bases_out: u64,
+    /// Length of every surviving read, indexed by length.
+    pub length_hist: Vec<u64>,
+    /// Fragment length per pair, indexed by size; the last bucket counts pairs
+    /// whose overlap could not be placed. Only filled for paired input, and
+    /// only when the overlap was computed at all.
+    pub insert_hist: Vec<u64>,
 }
 
 impl TrimStats {
+    fn note_kept(&mut self, len: usize) {
+        self.bases_out += len as u64;
+        if self.length_hist.len() <= len {
+            self.length_hist.resize(len + 1, 0);
+        }
+        self.length_hist[len] += 1;
+    }
+
+    /// fastp's `statInsertSize`: a positive offset means the fragment spans
+    /// both reads, a negative one means it is shorter than a single read.
+    fn note_insert(&mut self, ov: &OverlapResult, len1: usize, len2: usize, f1: usize, f2: usize) {
+        if self.insert_hist.is_empty() {
+            self.insert_hist = vec![0; INSERT_SIZE_MAX + 1];
+        }
+        let isize = if !ov.overlapped {
+            INSERT_SIZE_MAX
+        } else if ov.offset > 0 {
+            (len1 + len2 + f1 + f2).saturating_sub(ov.overlap_len)
+        } else {
+            ov.overlap_len + f1 + f2
+        };
+        self.insert_hist[isize.min(INSERT_SIZE_MAX)] += 1;
+    }
+
     fn record(&mut self, verdict: FilterVerdict) -> bool {
         match verdict {
             FilterVerdict::Pass => {
@@ -222,11 +259,13 @@ pub fn process_single<'a>(
     scratch: &mut TrimScratch,
 ) -> Option<ReadRec<'a>> {
     stats.reads_in += 1;
+    stats.bases_in += seq.len() as u64;
     let mut r = ReadRec::new(seq, qual);
     if !trim_common(&mut r, opts, stats, scratch) {
         return None;
     }
     if stats.record(pass_filter(&r, &opts.filters)) {
+        stats.note_kept(r.len());
         Some(r)
     } else {
         None
@@ -250,6 +289,7 @@ pub fn process_pair<'a>(
     scratch: &mut TrimScratch,
 ) -> PairOutcome<'a> {
     stats.reads_in += 2;
+    stats.bases_in += (seq1.len() + seq2.len()) as u64;
     let mut r1 = ReadRec::new(seq1, qual1);
     let mut r2 = ReadRec::new(seq2, qual2);
 
@@ -291,6 +331,7 @@ pub fn process_pair<'a>(
                 opts.allow_gap_overlap,
                 &mut scratch.overlap,
             );
+            stats.note_insert(&ov, r1.len(), r2.len(), front1, front2);
             if let Some((removed1, removed2)) =
                 trim_by_overlap(&mut r1, &mut r2, ov, front1, front2)
             {
@@ -358,6 +399,8 @@ pub fn process_pair<'a>(
     let keep = stats.record_n(worse, 2);
 
     if keep {
+        stats.note_kept(r1.len());
+        stats.note_kept(r2.len());
         PairOutcome { r1: Some(r1), r2: Some(r2) }
     } else {
         PairOutcome { r1: None, r2: None }

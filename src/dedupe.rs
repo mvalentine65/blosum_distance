@@ -238,13 +238,13 @@ fn build_table(input_paths: Vec<PathBuf>, trim: bool) -> Result<(DedupTable, Tri
         for path in input_paths {
             let mut src = RecordSource::open(&path)?;
             loop {
-                let t0 = std::time::Instant::now();
+                let t0 = prof.then(std::time::Instant::now);
                 let rec = src.next_record()?;
-                if prof { t_read += t0.elapsed(); }
+                if let Some(t) = t0 { t_read += t.elapsed(); }
                 let Some((seq, _qual)) = rec else { break };
-                let t1 = std::time::Instant::now();
+                let t1 = prof.then(std::time::Instant::now);
                 add_canonical(&mut table, &seq, &mut scratch);
-                if prof { t_hash += t1.elapsed(); }
+                if let Some(t) = t1 { t_hash += t.elapsed(); }
             }
         }
         if prof {
@@ -266,17 +266,17 @@ fn build_table(input_paths: Vec<PathBuf>, trim: bool) -> Result<(DedupTable, Tri
                 let mut a = RecordSource::open(&p1)?;
                 let mut b = RecordSource::open(&p2)?;
                 loop {
-                    let t0 = std::time::Instant::now();
+                    let t0 = prof.then(std::time::Instant::now);
                     let pair = (a.next_record()?, b.next_record()?);
-                    if prof { t_read += t0.elapsed(); }
+                    if let Some(t) = t0 { t_read += t.elapsed(); }
                     let (Some((s1, q1)), Some((s2, q2))) = pair else { break };
-                    let t1 = std::time::Instant::now();
+                    let t1 = prof.then(std::time::Instant::now);
                     ingest.push_pair(&s1, &q1, &s2, &q2, &mut |kept: &[u8]| {
-                        let t2 = std::time::Instant::now();
+                        let t2 = prof.then(std::time::Instant::now);
                         add_canonical(&mut table, kept, &mut scratch);
-                        if prof { t_hash += t2.elapsed(); }
+                        if let Some(t) = t2 { t_hash += t.elapsed(); }
                     });
-                    if prof { t_trim += t1.elapsed(); }
+                    if let Some(t) = t1 { t_trim += t.elapsed(); }
                 }
             }
             InputGroup::Single(path) => {
@@ -364,19 +364,6 @@ impl RecordSource {
     }
 }
 
-/// Stream one file, handing each record to `f`. Used by the untrimmed path,
-/// which has no need to pair anything up.
-fn for_each_record(
-    path: &PathBuf,
-    mut f: impl FnMut(&[u8], &[u8]) -> Result<()>,
-) -> Result<()> {
-    let mut src = RecordSource::open(path)?;
-    while let Some((seq, qual)) = src.next_record()? {
-        f(&seq, &qual)?;
-    }
-    Ok(())
-}
-
 /// What trimming did, for prepare's summary line.
 #[derive(Default, Clone)]
 pub struct TrimSummary {
@@ -390,6 +377,12 @@ pub struct TrimSummary {
     pub failed_adapter_dimer: u64,
     pub adapter_r1: Option<String>,
     pub adapter_r2: Option<String>,
+    pub bases_in: u64,
+    pub bases_out: u64,
+    pub polyx_trimmed_reads: u64,
+    pub polyx_trimmed_bases: u64,
+    pub length_hist: Vec<u64>,
+    pub insert_hist: Vec<u64>,
 }
 
 impl TrimSummary {
@@ -405,6 +398,12 @@ impl TrimSummary {
             failed_adapter_dimer: stats.failed_adapter_dimer,
             adapter_r1: detected.0.map(|s| String::from_utf8_lossy(s).into_owned()),
             adapter_r2: detected.1.map(|s| String::from_utf8_lossy(s).into_owned()),
+            bases_in: stats.bases_in,
+            bases_out: stats.bases_out,
+            polyx_trimmed_reads: stats.polyx_trimmed_reads,
+            polyx_trimmed_bases: stats.polyx_trimmed_bases,
+            length_hist: stats.length_hist.clone(),
+            insert_hist: stats.insert_hist.clone(),
         }
     }
 }
@@ -512,6 +511,27 @@ impl PreparedReads {
     /// found -- which is the expected answer for an already-clean library.
     fn detected_adapters(&self) -> (Option<String>, Option<String>) {
         (self.trim.adapter_r1.clone(), self.trim.adapter_r2.clone())
+    }
+
+    /// Bases before trimming and after it.
+    fn base_counts(&self) -> (u64, u64) {
+        (self.trim.bases_in, self.trim.bases_out)
+    }
+
+    /// polyG/polyX tails removed: (reads, bases).
+    fn polyx_trimmed(&self) -> (u64, u64) {
+        (self.trim.polyx_trimmed_reads, self.trim.polyx_trimmed_bases)
+    }
+
+    /// Length of every surviving read, indexed by length.
+    fn length_histogram(&self) -> Vec<u64> {
+        self.trim.length_hist.clone()
+    }
+
+    /// Fragment length per pair, indexed by size. The final bucket holds pairs
+    /// whose overlap could not be placed. Empty for unpaired input.
+    fn insert_size_histogram(&self) -> Vec<u64> {
+        self.trim.insert_hist.clone()
     }
 }
 

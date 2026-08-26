@@ -30,6 +30,7 @@ pub mod ingest;
 pub mod known_adapters;
 pub mod matcher;
 pub mod overlap;
+pub mod periodicity;
 pub mod pipeline;
 pub mod polyx;
 pub mod read;

@@ -11,6 +11,7 @@ use flate2::read::MultiGzDecoder;
 // Same mapping this file used to define inline, but table-driven: it runs once
 // per base of every read through `forward_is_canonical`.
 use crate::reads::ingest::{group_inputs, Ingest, InputGroup};
+use crate::reads::periodicity::{canonical_unit, repeat_period};
 use crate::reads::pipeline::{TrimOptions, TrimStats};
 use crate::reads::seqops::complement;
 
@@ -364,6 +365,10 @@ impl RecordSource {
     }
 }
 
+/// How many repeat units the summary carries. Far more than a report shows;
+/// the tail stays visible as the gap between the listed counts and the total.
+const REPEAT_UNITS_REPORTED: usize = 50;
+
 /// What trimming did, for prepare's summary line.
 #[derive(Default, Clone)]
 pub struct TrimSummary {
@@ -383,6 +388,12 @@ pub struct TrimSummary {
     pub polyx_trimmed_bases: u64,
     pub length_hist: Vec<u64>,
     pub insert_hist: Vec<u64>,
+    pub repeat_sequences: u64,
+    pub repeat_reads: u64,
+    pub repeat_bases: u64,
+    /// Repeat unit and count, commonest first, capped at the head of the tail.
+    pub repeat_units: Vec<(String, u64)>,
+    pub repeat_units_distinct: u64,
 }
 
 impl TrimSummary {
@@ -404,6 +415,11 @@ impl TrimSummary {
             polyx_trimmed_bases: stats.polyx_trimmed_bases,
             length_hist: stats.length_hist.clone(),
             insert_hist: stats.insert_hist.clone(),
+            repeat_sequences: 0,
+            repeat_reads: 0,
+            repeat_bases: 0,
+            repeat_units: Vec::new(),
+            repeat_units_distinct: 0,
         }
     }
 }
@@ -528,6 +544,21 @@ impl PreparedReads {
         self.trim.length_hist.clone()
     }
 
+    /// Tandem repeats dropped: (sequences, reads they represented, bases).
+    fn repeats_removed(&self) -> (u64, u64, u64) {
+        (
+            self.trim.repeat_sequences,
+            self.trim.repeat_reads,
+            self.trim.repeat_bases,
+        )
+    }
+
+    /// Commonest repeat units, and how many distinct units were seen. Folded
+    /// across rotation and strand, so `(AG)n` and `(CT)n` are one satellite.
+    fn repeat_units(&self) -> (Vec<(String, u64)>, u64) {
+        (self.trim.repeat_units.clone(), self.trim.repeat_units_distinct)
+    }
+
     /// Fragment length per pair, indexed by size. The final bucket holds pairs
     /// whose overlap could not be placed. Empty for unpaired input.
     fn insert_size_histogram(&self) -> Vec<u64> {
@@ -547,6 +578,7 @@ pub fn dedupe_reads(
     min_length: usize,
     batch_size: usize,
     trim: bool,
+    repeat_filter: bool,
 ) -> PyResult<PreparedReads> {
     if batch_size == 0 {
         return Err(PyValueError::new_err("batch_size must be non-zero"));
@@ -566,8 +598,14 @@ pub fn dedupe_reads(
     let mut dupe_vals: Vec<i64> = Vec::with_capacity(table.next_id);
     let mut total_dupes: u64 = 0;
 
+    // Ids are per emitted record, not per unique sequence: a read split at an
+    // N can yield several runs, and downstream keys them in a dict by id.
     let mut next_node_id: u64 = 0;
     let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut repeat_sequences: u64 = 0;
+    let mut repeat_reads: u64 = 0;
+    let mut repeat_bases: u64 = 0;
+    let mut repeat_units: ahash::AHashMap<Vec<u8>, u64> = ahash::AHashMap::new();
 
     for id in 0..table.next_id {
         let b = table.buckets[table.id_to_slot[id] as usize];
@@ -596,10 +634,32 @@ pub fn dedupe_reads(
             }
         }
 
+        // Dropped here, not in the trim chain: once per unique sequence rather
+        // than per read, and only on runs that already cleared the floor.
+        if repeat_filter {
+            runs.retain(|&(off, len)| {
+                let seq = &table.arena[off..off + len];
+                let hit = repeat_period(
+                    seq,
+                    crate::reads::periodicity::DEFAULT_THRESHOLD,
+                );
+                let Some(period) = hit else {
+                    return true;
+                };
+                repeat_sequences += 1;
+                repeat_reads += u64::from(rec.count);
+                repeat_bases += len as u64;
+                *repeat_units.entry(canonical_unit(seq, period)).or_insert(0) += 1;
+                false
+            });
+        }
+
         if runs.is_empty() {
             continue;
         }
 
+        // Duplicates are identical reads, so they split identically and each
+        // run inherits the parent's count. The total still counts them once.
         let dupes = u64::from(rec.count) - 1;
         total_dupes += dupes;
 
@@ -624,6 +684,22 @@ pub fn dedupe_reads(
     for v in &dupe_vals {
         dupes_blob.extend_from_slice(&v.to_le_bytes());
     }
+
+    // Commonest first, then alphabetically so ties are stable across runs.
+    let mut units: Vec<(Vec<u8>, u64)> = repeat_units.into_iter().collect();
+    units.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let units_distinct = units.len() as u64;
+    units.truncate(REPEAT_UNITS_REPORTED);
+
+    let mut trim_summary = trim_summary;
+    trim_summary.repeat_sequences = repeat_sequences;
+    trim_summary.repeat_reads = repeat_reads;
+    trim_summary.repeat_bases = repeat_bases;
+    trim_summary.repeat_units_distinct = units_distinct;
+    trim_summary.repeat_units = units
+        .into_iter()
+        .map(|(u, n)| (String::from_utf8_lossy(&u).into_owned(), n))
+        .collect();
 
     Ok(PreparedReads {
         arena: table.arena,

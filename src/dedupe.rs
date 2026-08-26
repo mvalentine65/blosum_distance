@@ -566,21 +566,21 @@ pub fn dedupe_reads(
     let mut dupe_vals: Vec<i64> = Vec::with_capacity(table.next_id);
     let mut total_dupes: u64 = 0;
 
+    let mut next_node_id: u64 = 0;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+
     for id in 0..table.next_id {
         let b = table.buckets[table.id_to_slot[id] as usize];
         let rec = table.records[id];
-        let node_id = (id + 1) as u64;
         let off = rec.off as usize;
         let seq = &table.arena[off..off + b.len as usize];
 
         // Whole read when it holds no N, else the N-free runs, each kept only
         // at or above the minimum length.
-        let mut emitted = false;
+        runs.clear();
         if !seq.contains(&b'N') && !seq.contains(&b'n') {
             if seq.len() >= min_length {
-                validate_residues(node_id, seq)?;
-                records.push((node_id, off, seq.len() as u32));
-                emitted = true;
+                runs.push((off, seq.len()));
             }
         } else {
             let mut chunk_start = 0usize;
@@ -589,22 +589,26 @@ pub fn dedupe_reads(
                 if is_end || seq[i] == b'N' || seq[i] == b'n' {
                     let len = i - chunk_start;
                     if len >= min_length {
-                        let chunk_off = off + chunk_start;
-                        validate_residues(node_id, &table.arena[chunk_off..chunk_off + len])?;
-                        records.push((node_id, chunk_off, len as u32));
-                        emitted = true;
+                        runs.push((off + chunk_start, len));
                     }
                     chunk_start = i + 1;
                 }
             }
         }
 
-        // prepare recorded the dupe count once per surviving header.
-        if emitted {
-            let dupes = u64::from(rec.count) - 1;
-            total_dupes += dupes;
+        if runs.is_empty() {
+            continue;
+        }
+
+        let dupes = u64::from(rec.count) - 1;
+        total_dupes += dupes;
+
+        for &(chunk_off, len) in &runs {
+            next_node_id += 1;
+            validate_residues(next_node_id, &table.arena[chunk_off..chunk_off + len])?;
+            records.push((next_node_id, chunk_off, len as u32));
             if dupes != 0 {
-                dupe_keys.push(node_id as i64);
+                dupe_keys.push(next_node_id as i64);
                 dupe_vals.push(dupes as i64);
             }
         }

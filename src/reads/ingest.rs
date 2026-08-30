@@ -40,12 +40,15 @@ pub enum InputGroup {
     Single(PathBuf),
 }
 
-/// Strip the mate marker from a file name, returning `(stem, mate)`.
+/// Strip the mate marker from a file name, returning `(stem, mate, segment)`.
 ///
 /// Mirrors the convention `prepare.py`'s `_TRUNCATE_TAXA_RE` already relies on
-/// to group both mates under one taxa: a trailing `_1`/`_2` or `_R1`/`_R2`
-/// before the extensions.
-fn split_mate(name: &str) -> Option<(String, u8)> {
+/// to group both mates under one taxa: a trailing `_1`/`_2` or `_R1`/`_R2`,
+/// optionally followed by the segment index bcl2fastq appends to every file
+/// ("_001", bumped per chunk once a library outgrows one file). The segment
+/// comes back so pairing can require it to match -- `R1_002` against `R2_003`
+/// would feed the analyser two unrelated fragments in lockstep.
+fn split_mate(name: &str) -> Option<(String, u8, Option<String>)> {
     let mut stem = name;
     // Peel the extensions prepare accepts, longest suffix first.
     loop {
@@ -65,6 +68,18 @@ fn split_mate(name: &str) -> Option<(String, u8)> {
             None => break,
         }
     }
+    // A bare marker wins over a segmented one, so `lib_1` stays mate 1 of `lib`
+    // rather than becoming segment 1 of a stem with no marker left.
+    if let Some((base, mate)) = trailing_mate(stem) {
+        return Some((base, mate, None));
+    }
+    let (head, seg) = trailing_segment(stem)?;
+    let (base, mate) = trailing_mate(head)?;
+    Some((base, mate, Some(seg)))
+}
+
+/// Split a trailing `_1`/`_2`/`_R1`/`_R2` off a stem.
+fn trailing_mate(stem: &str) -> Option<(String, u8)> {
     let bytes = stem.as_bytes();
     if bytes.len() >= 2 && (bytes[bytes.len() - 1] == b'1' || bytes[bytes.len() - 1] == b'2') {
         let mate = bytes[bytes.len() - 1] - b'0';
@@ -77,6 +92,16 @@ fn split_mate(name: &str) -> Option<(String, u8)> {
         }
     }
     None
+}
+
+/// Split a trailing `_<digits>` segment index off a stem.
+fn trailing_segment(stem: &str) -> Option<(&str, String)> {
+    let cut = stem.rfind('_')?;
+    let seg = &stem[cut + 1..];
+    if seg.is_empty() || !seg.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((&stem[..cut], seg.to_string()))
 }
 
 /// Pair up a taxa's files by name, leaving anything unmatched on its own.
@@ -95,13 +120,14 @@ pub fn group_inputs(paths: &[PathBuf]) -> Vec<InputGroup> {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        let Some((stem_i, mate_i)) = split_mate(name_i) else {
+        let Some((stem_i, mate_i, seg_i)) = split_mate(name_i) else {
             used[i] = true;
             out.push(InputGroup::Single(paths[i].clone()));
             continue;
         };
 
-        // Look for the opposite mate of the same stem in the same directory.
+        // Look for the opposite mate of the same stem and segment in the same
+        // directory.
         let mut partner = None;
         for (j, item) in paths.iter().enumerate().skip(i + 1) {
             if used[j] {
@@ -111,8 +137,8 @@ pub fn group_inputs(paths: &[PathBuf]) -> Vec<InputGroup> {
                 continue;
             }
             let name_j = item.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-            if let Some((stem_j, mate_j)) = split_mate(name_j) {
-                if stem_j == stem_i && mate_j != mate_i {
+            if let Some((stem_j, mate_j, seg_j)) = split_mate(name_j) {
+                if stem_j == stem_i && seg_j == seg_i && mate_j != mate_i {
                     partner = Some(j);
                     break;
                 }

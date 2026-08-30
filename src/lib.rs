@@ -488,12 +488,5 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::blosum62_distance;
-
-    #[test]
-    fn test_blosum62_gap_penalty() {
-        let result = blosum62_distance(String::from("A"), String::from("-"));
-        assert_eq!(result, 2.0)
-    }
-}
+#[path = "tests/lib.rs"]
+mod tests;

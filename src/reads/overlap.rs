@@ -51,13 +51,19 @@ pub struct OverlapScratch {
 /// merely counted. fastp's own unit test asserts an overlap with 30 mismatches
 /// is accepted this way.
 fn accept_no_gap(a: &[u8], b: &[u8], len: usize, diff_limit: usize) -> Option<usize> {
+    let len = len.min(a.len()).min(b.len());
     let protected_prefix = len.min(COMPLETE_COMPARE_REQUIRE);
     let mut mismatch = count_mismatches_bounded(a, b, protected_prefix, diff_limit);
     if mismatch > diff_limit {
         return None;
     }
-    if len > COMPLETE_COMPARE_REQUIRE {
-        mismatch = count_mismatches(a, b, len);
+    if len > protected_prefix {
+        // The prefix count is exact on this branch, so only the rest is left.
+        mismatch += count_mismatches(
+            &a[protected_prefix..],
+            &b[protected_prefix..],
+            len - protected_prefix,
+        );
     }
     Some(mismatch)
 }
@@ -77,10 +83,12 @@ pub fn analyze(
     if len1 == 0 || len2 == 0 {
         return OverlapResult::default();
     }
-    scratch.rcr2.clear();
-    scratch.rcr2.resize(len2, 0);
-    reverse_complement_into(r2, &mut scratch.rcr2);
-    let str2 = &scratch.rcr2[..];
+    // revcomp overwrites every byte it is given, so the buffer only ever grows.
+    if scratch.rcr2.len() < len2 {
+        scratch.rcr2.resize(len2, 0);
+    }
+    reverse_complement_into(r2, &mut scratch.rcr2[..len2]);
+    let str2 = &scratch.rcr2[..len2];
 
     let limit_for = |overlap_len: usize| -> usize {
         diff_limit.min((overlap_len as f64 * diff_percent_limit) as usize)

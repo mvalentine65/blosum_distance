@@ -139,7 +139,7 @@ pub fn pass_filter(r: &ReadRec<'_>, opts: &FilterOptions) -> FilterVerdict {
 
     if let Some(q) = opts.qual {
         if q.enabled && r.has_qual() {
-            let m = count_quality_metrics(r.quals(), r.bases(), q.qualified_qual + 33);
+            let m = count_quality_metrics(r.quals(), r.bases(), i64::from(q.qualified_qual) + 33);
             if (m.low_qual as f64) > q.unqualified_percent_limit * rlen as f64 / 100.0 {
                 return FilterVerdict::FailQuality;
             }
@@ -266,7 +266,7 @@ pub fn trim_and_cut(
             s += 1;
         }
         if found_low_qual_window {
-            while s < l - 1 && qual[s] >= 33 + cut.quality_right {
+            while s < l - 1 && i64::from(qual[s]) >= 33 + i64::from(cut.quality_right) {
                 s += 1;
             }
             rlen = s - front;

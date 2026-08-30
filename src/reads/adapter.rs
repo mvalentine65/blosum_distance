@@ -120,14 +120,12 @@ pub fn trim_by_sequence(
         if body_max >= 0 {
             if prepared.can_filter() {
                 prepared.candidates(rdata, body_max as usize, &mut scratch.seen, &mut scratch.candidates);
-                let candidates = std::mem::take(&mut scratch.candidates);
-                for &cand in &candidates {
+                for &cand in &scratch.candidates {
                     if probe(cand as isize) {
                         found_pos = Some(cand as isize);
                         break;
                     }
                 }
-                scratch.candidates = candidates;
             } else {
                 let mut pos = 0isize;
                 while pos <= body_max {

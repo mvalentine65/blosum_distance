@@ -94,7 +94,9 @@ pub fn trim_poly_x(r: &mut ReadRec<'_>, compare_req: usize) -> Option<(u8, usize
                 need_to_break = false;
             }
         }
-        if need_to_break && (pos >= ALLOW_ONE_MISMATCH_FOR_EACH || pos + 1 >= compare_req - 1) {
+        if need_to_break
+            && (pos >= ALLOW_ONE_MISMATCH_FOR_EACH || pos + 1 >= compare_req.saturating_sub(1))
+        {
             break;
         }
         pos += 1;
@@ -118,7 +120,9 @@ pub fn trim_poly_x(r: &mut ReadRec<'_>, compare_req: usize) -> Option<(u8, usize
     // tests `data[rlen-pos-1]` before the bounds check and so reads the string
     // terminator at pos == -1; we check the bound first, which lands on the
     // same outcome (no trim) without the out-of-range read.
-    let mut back = pos as isize;
+    // `pos` reaches rlen when the scan never broke, i.e. the whole read is the
+    // run; the walk-back has to start at the last base that exists.
+    let mut back = pos.min(rlen - 1) as isize;
     while back >= 0 && data[rlen - back as usize - 1] != poly_base {
         back -= 1;
     }

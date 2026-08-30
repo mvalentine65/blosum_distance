@@ -234,7 +234,7 @@ pub fn check_known_adapters(reads: &[&[u8]]) -> Option<(Vec<u8>, String)> {
 }
 
 /// Grow a seed k-mer into a full adapter, fastp's `getAdapterWithSeed`.
-fn adapter_with_seed(seed: i32, reads: &[&[u8]], shift_tail: usize) -> Option<Vec<u8>> {
+fn adapter_with_seed(seed: i32, reads: &[&[u8]], shift_tail: usize) -> Option<Detected> {
     const MAX_SEARCH_LENGTH: usize = 500;
 
     let mut forward = NucleotideTree::new();
@@ -269,11 +269,11 @@ fn adapter_with_seed(seed: i32, reads: &[&[u8]], shift_tail: usize) -> Option<Ve
         adapter.truncate(60);
     }
 
-    if let Some((known, _)) = match_known_adapter(&adapter) {
-        return Some(known.to_vec());
+    if let Some((known, name)) = match_known_adapter(&adapter) {
+        return Some(Detected::Known { seq: known.to_vec(), name: name.to_string() });
     }
     if reached_leaf {
-        Some(adapter)
+        Some(Detected::Novel { seq: adapter })
     } else {
         None
     }
@@ -288,17 +288,6 @@ pub enum Detected {
     Novel { seq: Vec<u8> },
     /// Nothing convincing — the library looks clean, or the sample is too small.
     None,
-}
-
-impl Detected {
-    /// The sequence, whichever way it was found.
-    #[allow(dead_code)]
-    pub fn seq(&self) -> Option<&[u8]> {
-        match self {
-            Detected::Known { seq, .. } | Detected::Novel { seq } => Some(seq),
-            Detected::None => None,
-        }
-    }
 }
 
 /// Detect the adapter carried by a sample of reads, fastp's
@@ -390,13 +379,8 @@ pub fn detect_adapter(reads: &[&[u8]], shift_tail: usize) -> Detected {
         if diff < 3 {
             continue;
         }
-        if let Some(adapter) = adapter_with_seed(key as i32, reads, shift_tail) {
-            return match match_known_adapter(&adapter) {
-                Some((known, name)) => {
-                    Detected::Known { seq: known.to_vec(), name: name.to_string() }
-                }
-                None => Detected::Novel { seq: adapter },
-            };
+        if let Some(detected) = adapter_with_seed(key as i32, reads, shift_tail) {
+            return detected;
         }
     }
 

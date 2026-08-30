@@ -49,13 +49,16 @@ fn split_mate(name: &str) -> Option<(String, u8)> {
     let mut stem = name;
     // Peel the extensions prepare accepts, longest suffix first.
     loop {
-        let lower = stem.to_ascii_lowercase();
+        let bytes = stem.as_bytes();
         let stripped = [
             ".fq.gz", ".fastq.gz", ".fa.gz", ".fasta.gz", ".fna.gz", ".fas.gz",
             ".fq", ".fastq", ".fa", ".fasta", ".fna", ".fas",
         ]
         .iter()
-        .find(|ext| lower.ends_with(*ext))
+        .find(|ext| {
+            bytes.len() >= ext.len()
+                && bytes[bytes.len() - ext.len()..].eq_ignore_ascii_case(ext.as_bytes())
+        })
         .map(|ext| stem.len() - ext.len());
         match stripped {
             Some(cut) => stem = &stem[..cut],

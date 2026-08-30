@@ -68,7 +68,8 @@ fn accumulate(
             break;
         }
     }
-    for i in (0..cmplen - 1).rev() {
+    // acc_right[0] is never a split point, so it is never filled.
+    for i in (1..cmplen - 1).rev() {
         acc_right[i] = acc_right[i + 1] + i32::from(ins_data[i + 1] != normal_data[i]);
         if acc_right[i] + acc_left[0] > diff_limit {
             for slot in acc_right.iter_mut().take(i) {

@@ -1,9 +1,12 @@
 //! Sequence primitives.
 //!
 //! Ported from fastp 1.3.6 `src/simd.cpp` (MIT, (c) 2016 OpenGene). fastp
-//! dispatches these through Google Highway; we keep the scalar forms, which
-//! LLVM vectorises on its own and which carry no build dependency. Semantics
-//! match the Highway scalar tails exactly.
+//! dispatches these through Google Highway; we stay in safe Rust — bio's
+//! vectorised `hamming` for the exact count, a block-at-a-time loop LLVM
+//! vectorises for the bounded one. Semantics match the Highway scalar tails
+//! exactly.
+
+use bio::alignment::distance::simd::hamming;
 
 /// Complement lookup, built the way fastp's `kComplement` table works: A/a,
 /// C/c, T/t, G/g map across cases and everything else falls to N. A table
@@ -57,13 +60,9 @@ pub fn reverse_complement(src: &[u8]) -> Vec<u8> {
 #[inline]
 pub fn count_mismatches(a: &[u8], b: &[u8], len: usize) -> usize {
     let n = len.min(a.len()).min(b.len());
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SSE2 is part of the x86_64 baseline, so no runtime probe is needed.
-        return unsafe { count_mismatches_sse2(&a[..n], &b[..n]) };
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    count_mismatches_scalar(&a[..n], &b[..n])
+    // bio's vectorised hamming; the clamp above gives it the equal lengths it
+    // requires.
+    hamming(&a[..n], &b[..n]) as usize
 }
 
 /// Mismatches over the first `len` bytes, abandoning the count once it passes
@@ -72,13 +71,22 @@ pub fn count_mismatches(a: &[u8], b: &[u8], len: usize) -> usize {
 /// value only on the accepting branch, where no early exit can have happened.
 #[inline]
 pub fn count_mismatches_bounded(a: &[u8], b: &[u8], len: usize, limit: usize) -> usize {
+    /// Bases compared before the budget is re-checked.
+    const BLOCK: usize = 16;
     let n = len.min(a.len()).min(b.len());
-    #[cfg(target_arch = "x86_64")]
-    {
-        return unsafe { count_mismatches_bounded_sse2(&a[..n], &b[..n], limit) };
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut diff = 0usize;
+    let mut i = 0usize;
+    // A block at a time so the compare still vectorises; overshooting `limit`
+    // within a block is what the contract above already allows.
+    while i + BLOCK <= n {
+        diff += count_mismatches_scalar(&a[i..i + BLOCK], &b[i..i + BLOCK]);
+        if diff > limit {
+            return diff;
+        }
+        i += BLOCK;
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    count_mismatches_bounded_scalar(&a[..n], &b[..n], limit)
+    diff + count_mismatches_bounded_scalar(&a[i..], &b[i..], limit - diff)
 }
 
 #[inline]
@@ -92,62 +100,12 @@ fn count_mismatches_scalar(a: &[u8], b: &[u8]) -> usize {
     diff
 }
 
-/// Fallback for non-x86_64, and the reference the SIMD path is tested against.
-#[allow(dead_code)]
+/// The tail of the bounded scan, and the reference it is tested against.
 #[inline]
 fn count_mismatches_bounded_scalar(a: &[u8], b: &[u8], limit: usize) -> usize {
     let mut diff = 0;
     for i in 0..a.len() {
         if a[i] != b[i] {
-            diff += 1;
-            if diff > limit {
-                return diff;
-            }
-        }
-    }
-    diff
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn count_mismatches_sse2(a: &[u8], b: &[u8]) -> usize {
-    use std::arch::x86_64::*;
-    let n = a.len();
-    let mut i = 0;
-    let mut diff = 0usize;
-    while i + 16 <= n {
-        let va = _mm_loadu_si128(a.as_ptr().add(i).cast());
-        let vb = _mm_loadu_si128(b.as_ptr().add(i).cast());
-        // movemask sets a bit per *equal* byte, so the mismatches are the
-        // zero bits within the low 16.
-        let eq = _mm_movemask_epi8(_mm_cmpeq_epi8(va, vb)) as u32;
-        diff += 16 - (eq & 0xFFFF).count_ones() as usize;
-        i += 16;
-    }
-    diff + count_mismatches_scalar(&a[i..], &b[i..])
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn count_mismatches_bounded_sse2(a: &[u8], b: &[u8], limit: usize) -> usize {
-    use std::arch::x86_64::*;
-    let n = a.len();
-    let mut i = 0;
-    let mut diff = 0usize;
-    while i + 16 <= n {
-        let va = _mm_loadu_si128(a.as_ptr().add(i).cast());
-        let vb = _mm_loadu_si128(b.as_ptr().add(i).cast());
-        let eq = _mm_movemask_epi8(_mm_cmpeq_epi8(va, vb)) as u32;
-        diff += 16 - (eq & 0xFFFF).count_ones() as usize;
-        if diff > limit {
-            // Overshoots the scalar count, but every caller only asks whether
-            // the limit was blown.
-            return diff;
-        }
-        i += 16;
-    }
-    for j in i..n {
-        if a[j] != b[j] {
             diff += 1;
             if diff > limit {
                 return diff;
@@ -175,7 +133,8 @@ pub fn count_adjacent_diffs(data: &[u8]) -> usize {
 
 /// Per-read quality tallies, all three in one pass.
 ///
-/// * `low_qual` — bases scoring under `qualified_qual` (a raw phred+33 byte)
+/// * `low_qual` — bases scoring under `qualified_qual` (a raw phred+33 value,
+///   widened so the caller's `+ 33` cannot wrap)
 /// * `n_bases`  — literal `N` calls
 /// * `total_qual` — sum of phred scores, i.e. each byte less 33
 pub struct QualityMetrics {
@@ -184,13 +143,13 @@ pub struct QualityMetrics {
     pub total_qual: i64,
 }
 
-pub fn count_quality_metrics(qual: &[u8], seq: &[u8], qualified_qual: u8) -> QualityMetrics {
+pub fn count_quality_metrics(qual: &[u8], seq: &[u8], qualified_qual: i64) -> QualityMetrics {
     let n = qual.len().min(seq.len());
     let mut m = QualityMetrics { low_qual: 0, n_bases: 0, total_qual: 0 };
     for i in 0..n {
         let q = qual[i];
         m.total_qual += i64::from(q) - 33;
-        if q < qualified_qual {
+        if i64::from(q) < qualified_qual {
             m.low_qual += 1;
         }
         if seq[i] == b'N' {
@@ -267,7 +226,7 @@ mod tests {
     #[test]
     fn quality_metrics_sum_phred_not_bytes() {
         // 'I' is phred 40, '#' is phred 2
-        let m = count_quality_metrics(b"II#I", b"ACNG", b'5');
+        let m = count_quality_metrics(b"II#I", b"ACNG", i64::from(b'5'));
         assert_eq!(m.total_qual, 40 + 40 + 2 + 40);
         assert_eq!(m.low_qual, 1);
         assert_eq!(m.n_bases, 1);

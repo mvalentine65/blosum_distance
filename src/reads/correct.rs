@@ -103,12 +103,13 @@ pub fn merge(
     let len1 = len1.min(seq1.len());
     let len2 = if ov.offset > 0 { seq2.len().saturating_sub(ol) } else { 0 };
 
-    let rc2: Vec<u8> = crate::reads::seqops::reverse_complement(seq2);
-    let rq2: Vec<u8> = qual2.iter().rev().copied().collect();
-
     let mut seq = seq1[..len1].to_vec();
     let mut qual = qual1[..len1.min(qual1.len())].to_vec();
-    if ov.offset > 0 && len2 > 0 && ol + len2 <= rc2.len() {
+    // Only a positive offset splices R2's tail on, so nothing is reversed until
+    // it is known to be needed.
+    if ov.offset > 0 && len2 > 0 && ol + len2 <= seq2.len() {
+        let rc2 = crate::reads::seqops::reverse_complement(seq2);
+        let rq2: Vec<u8> = qual2.iter().rev().copied().collect();
         seq.extend_from_slice(&rc2[ol..ol + len2]);
         qual.extend_from_slice(&rq2[ol..ol + len2]);
     }

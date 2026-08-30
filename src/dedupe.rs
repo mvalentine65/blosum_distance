@@ -778,35 +778,49 @@ fn add_canonical(table: &mut DedupTable, seq: &[u8], scratch: &mut Vec<u8>) {
     }
 }
 
-/// A FASTQ or FASTA file yielding `(sequence, quality)`; quality is empty for
-/// FASTA, which makes every quality-dependent stage a no-op downstream.
-enum RecordSource {
+enum Reader {
     Fastq(FastqReader<Box<dyn Read + Send>>),
     Fasta(FastaReader<Box<dyn Read + Send>>),
 }
 
+struct RecordSource {
+    reader: Reader,
+    path: String,
+    record: u64,
+}
+
 impl RecordSource {
     fn open(path: &PathBuf) -> Result<Self> {
-        Ok(match detect_format(path)? {
-            InputFormat::Fastq => RecordSource::Fastq(FastqReader::new(open_reader(path)?)),
-            InputFormat::Fasta => RecordSource::Fasta(FastaReader::new(open_reader(path)?)),
-        })
+        let reader = match detect_format(path)? {
+            InputFormat::Fastq => Reader::Fastq(FastqReader::new(open_reader(path)?)),
+            InputFormat::Fasta => Reader::Fasta(FastaReader::new(open_reader(path)?)),
+        };
+        Ok(RecordSource { reader, path: path.display().to_string(), record: 0 })
     }
 
     #[allow(clippy::type_complexity)]
     fn next_record(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        match self {
-            RecordSource::Fastq(r) => match r.next() {
+        // Disjoint field borrows: the context closure reads path/record while
+        // reader is borrowed mutably.
+        let Self { reader, path, record } = self;
+        *record += 1;
+        let n = *record;
+        match reader {
+            Reader::Fastq(r) => match r.next() {
                 None => Ok(None),
                 Some(rec) => {
-                    let rec = rec.context("Error reading FASTQ record")?;
+                    let rec = rec.with_context(|| {
+                        format!("Error reading FASTQ record {n} of {path}")
+                    })?;
                     Ok(Some((rec.seq().to_vec(), rec.qual().to_vec())))
                 }
             },
-            RecordSource::Fasta(r) => match r.next() {
+            Reader::Fasta(r) => match r.next() {
                 None => Ok(None),
                 Some(rec) => {
-                    let rec = rec.context("Error reading FASTA record")?;
+                    let rec = rec.with_context(|| {
+                        format!("Error reading FASTA record {n} of {path}")
+                    })?;
                     Ok(Some((rec.seq().to_vec(), Vec::new())))
                 }
             },
@@ -1040,7 +1054,7 @@ pub fn dedupe_reads(
     });
 
     let (table, trim_summary) =
-        build_table(input_paths, trim).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        build_table(input_paths, trim).map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
 
     let mut records: Vec<(u64, usize, u32)> = Vec::with_capacity(table.next_id);
     // Serialised as they are found; the blob needs every key before every value,

@@ -44,10 +44,8 @@ pub enum InputGroup {
 ///
 /// Mirrors the convention `prepare.py`'s `_TRUNCATE_TAXA_RE` already relies on
 /// to group both mates under one taxa: a trailing `_1`/`_2` or `_R1`/`_R2`,
-/// optionally followed by the segment index bcl2fastq appends to every file
-/// ("_001", bumped per chunk once a library outgrows one file). The segment
-/// comes back so pairing can require it to match -- `R1_002` against `R2_003`
-/// would feed the analyser two unrelated fragments in lockstep.
+/// optionally followed by bcl2fastq's segment index. Pairing requires the
+/// segment to match, or `R1_002` would read in lockstep with `R2_003`.
 fn split_mate(name: &str) -> Option<(String, u8, Option<String>)> {
     let mut stem = name;
     // Peel the extensions prepare accepts, longest suffix first.
@@ -68,8 +66,7 @@ fn split_mate(name: &str) -> Option<(String, u8, Option<String>)> {
             None => break,
         }
     }
-    // A bare marker wins over a segmented one, so `lib_1` stays mate 1 of `lib`
-    // rather than becoming segment 1 of a stem with no marker left.
+    // A bare marker wins, so `lib_1` stays mate 1 rather than segment 1.
     if let Some((base, mate)) = trailing_mate(stem) {
         return Some((base, mate, None));
     }
@@ -126,8 +123,7 @@ pub fn group_inputs(paths: &[PathBuf]) -> Vec<InputGroup> {
             continue;
         };
 
-        // Look for the opposite mate of the same stem and segment in the same
-        // directory.
+        // Look for the opposite mate of the same stem, segment and directory.
         let mut partner = None;
         for (j, item) in paths.iter().enumerate().skip(i + 1) {
             if used[j] {

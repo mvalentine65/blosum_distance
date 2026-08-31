@@ -13,6 +13,11 @@ use crate::reads::known_adapters::match_known_adapter;
 
 const KEYLEN: usize = 10;
 
+/// Shortest overlap `check_known_adapters` will consider.
+const MATCH_REQ: usize = 8;
+/// One mismatch is forgiven per this many compared bases.
+const ALLOW_ONE_MISMATCH_FOR_EACH: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Nucleotide tree
 // ---------------------------------------------------------------------------
@@ -153,14 +158,130 @@ pub fn int2seq(mut val: u32, seqlen: usize) -> Vec<u8> {
 
 /// Look for a known adapter carried by enough of the sample, fastp's
 /// `checkKnownAdapters`.
+
+/// Eight bases packed two bits each, or None if any base is not ACGT. A block
+/// that matches the adapter exactly cannot hold anything else, since the
+/// adapter table is pure ACGT, so refusing to index those positions loses no
+/// true match -- soft-masked and N bases included.
+#[inline]
+fn pack8(b: &[u8]) -> Option<u16> {
+    let mut key = 0u16;
+    for &c in &b[..8] {
+        let two = match c {
+            b'A' => 0,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            _ => return None,
+        };
+        key = (key << 2) | two;
+    }
+    Some(key)
+}
+
+#[inline]
+fn base2bits(c: u8) -> Option<u16> {
+    match c {
+        b'A' => Some(0),
+        b'C' => Some(1),
+        b'G' => Some(2),
+        b'T' => Some(3),
+        _ => None,
+    }
+}
+
+/// Which adapter blocks carry each eight-base key.
+///
+/// `check_known_adapters` forgives `cmplen / ALLOW_ONE_MISMATCH_FOR_EACH`
+/// mismatches over a window of `cmplen` bases, so cutting the adapter into
+/// `allowed + 1` disjoint eight-base blocks leaves at least one of them
+/// mismatch-free whenever the window matches. Blocks sit at offsets 0, 8,
+/// 16 ... and `8 * (allowed + 1) <= cmplen` holds for every window the scan can
+/// reach (its loop bound keeps `cmplen >= 9`), so the block a given window is
+/// guaranteed to match on is always one this table carries. Sizing from the
+/// adapter's own length makes it a superset for the shorter windows at a
+/// read's tail, which is equally safe: extra blocks only add candidates, and
+/// every candidate is still verified by the original window test.
+///
+/// Indexed by key so a read costs one lookup per position, rather than every
+/// adapter walking every position of every read.
+struct SeedTable {
+    /// 1 << 16 buckets, each the head of a chain into `entries`.
+    head: Vec<u32>,
+    next: Vec<u32>,
+    /// (adapter index, block offset)
+    entries: Vec<(u16, u8)>,
+    /// Adapters too short to carry a block; these still need a full scan.
+    seedless: Vec<u16>,
+}
+
+const NO_ENTRY: u32 = u32::MAX;
+/// Marks an adapter that has no seed block and must be scanned in full.
+const SCAN_ALL: u32 = u32::MAX;
+
+fn seed_table() -> &'static SeedTable {
+    use crate::reads::known_adapters::KNOWN_ADAPTERS;
+    static TABLE: std::sync::OnceLock<SeedTable> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = SeedTable {
+            head: vec![NO_ENTRY; 1 << 16],
+            next: Vec::new(),
+            entries: Vec::new(),
+            seedless: Vec::new(),
+        };
+        for (ai, &(adapter, _)) in KNOWN_ADAPTERS.iter().enumerate() {
+            let alen = adapter.len();
+            let mut planted = false;
+            if alen >= 8 {
+                let allowed_max = alen / ALLOW_ONE_MISMATCH_FOR_EACH;
+                for j in 0..=allowed_max {
+                    let off = j * 8;
+                    if off + 8 > alen {
+                        break;
+                    }
+                    let Some(key) = pack8(&adapter[off..off + 8]) else {
+                        continue;
+                    };
+                    let k = key as usize;
+                    t.entries.push((ai as u16, off as u8));
+                    t.next.push(t.head[k]);
+                    t.head[k] = (t.entries.len() - 1) as u32;
+                    planted = true;
+                }
+            }
+            if !planted {
+                t.seedless.push(ai as u16);
+            }
+        }
+        t
+    })
+}
+
+/// fastp's window test: the adapter's prefix against the read from `pos`,
+/// forgiving one mismatch per ALLOW_ONE_MISMATCH_FOR_EACH bases compared.
+/// Returns the mismatch count when it passes.
+#[inline]
+fn window_match(adapter: &[u8], r: &[u8], pos: usize) -> Option<usize> {
+    let cmplen = (r.len() - pos).min(adapter.len());
+    let allowed = cmplen / ALLOW_ONE_MISMATCH_FOR_EACH;
+    let mut mismatch = 0;
+    for i in 0..cmplen {
+        if adapter[i] != r[i + pos] {
+            mismatch += 1;
+            if mismatch > allowed {
+                return None;
+            }
+        }
+    }
+    Some(mismatch)
+}
+
 pub fn check_known_adapters(reads: &[&[u8]]) -> Option<(Vec<u8>, String)> {
     use crate::reads::known_adapters::KNOWN_ADAPTERS;
 
     const MAX_CHECK_READS: usize = 100_000;
     const MAX_CHECK_BASES: usize = MAX_CHECK_READS * 1000;
     const MAX_HIT: usize = 1000;
-    const MATCH_REQ: usize = 8;
-    const ALLOW_ONE_MISMATCH_FOR_EACH: usize = 16;
 
     let mut counts = vec![0usize; KNOWN_ADAPTERS.len()];
     let mut mismatches = vec![0usize; KNOWN_ADAPTERS.len()];
@@ -168,6 +289,10 @@ pub fn check_known_adapters(reads: &[&[u8]]) -> Option<(Vec<u8>, String)> {
     let mut checked_reads = 0usize;
     let mut checked_bases = 0usize;
     let mut cur_max = 0usize;
+
+    let table = seed_table();
+    // (adapter index, candidate offset), collected per read.
+    let mut candidates: Vec<(u16, u32)> = Vec::new();
 
     for r in reads {
         let rlen = r.len();
@@ -179,39 +304,89 @@ pub fn check_known_adapters(reads: &[&[u8]]) -> Option<(Vec<u8>, String)> {
         if cur_max > MAX_HIT {
             break;
         }
-        for (ai, &(adapter, _)) in KNOWN_ADAPTERS.iter().enumerate() {
-            let alen = adapter.len();
-            if alen >= rlen {
-                continue;
+        let limit = rlen.saturating_sub(MATCH_REQ);
+
+        // One rolling pass over the read proposes every adapter's candidate
+        // offsets. A true match always shows up here, by the pigeonhole
+        // argument on SeedTable; each candidate is still verified below.
+        candidates.clear();
+        if rlen >= 8 {
+            let mut key = 0u16;
+            let mut run = 0usize;
+            for (pos, &c) in r.iter().enumerate() {
+                match base2bits(c) {
+                    Some(two) => {
+                        key = (key << 2) | two;
+                        run += 1;
+                    }
+                    None => {
+                        run = 0;
+                        continue;
+                    }
+                }
+                if run < 8 {
+                    continue;
+                }
+                let start = pos + 1 - 8;
+                let mut e = table.head[key as usize];
+                while e != NO_ENTRY {
+                    let (ai, off) = table.entries[e as usize];
+                    let off = off as usize;
+                    if start >= off && start - off < limit {
+                        candidates.push((ai, (start - off) as u32));
+                    }
+                    e = table.next[e as usize];
+                }
             }
-            // Once a front-runner exists, stop scoring the stragglers.
-            if cur_max > 20 && counts[ai] < cur_max / 10 {
-                continue;
+        }
+        // Adapters with no block to seed on still need a full scan. Marking
+        // them here rather than looping separately keeps adapters visited in
+        // index order, which matters because cur_max gates later ones.
+        for &ai in &table.seedless {
+            candidates.push((ai, SCAN_ALL));
+        }
+        // The old scan took the lowest matching offset for each adapter, so
+        // order by adapter then offset before testing.
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        let mut i = 0usize;
+        while i < candidates.len() {
+            let ai = candidates[i].0;
+            let mut j = i;
+            while j < candidates.len() && candidates[j].0 == ai {
+                j += 1;
             }
-            for pos in 0..rlen.saturating_sub(MATCH_REQ) {
-                let cmplen = (rlen - pos).min(alen);
-                let allowed = cmplen / ALLOW_ONE_MISMATCH_FOR_EACH;
-                let mut mismatch = 0;
-                let mut matched = true;
-                for i in 0..cmplen {
-                    if adapter[i] != r[i + pos] {
-                        mismatch += 1;
-                        if mismatch > allowed {
-                            matched = false;
+            let (adapter, _) = KNOWN_ADAPTERS[ai as usize];
+            if adapter.len() < rlen && !(cur_max > 20 && counts[ai as usize] < cur_max / 10) {
+                let scan_all = candidates[j - 1].1 == SCAN_ALL;
+                let mut hit = None;
+                if scan_all {
+                    for pos in 0..limit {
+                        if let Some(mismatch) = window_match(adapter, r, pos) {
+                            hit = Some(mismatch);
+                            break;
+                        }
+                    }
+                } else {
+                    for &(_, pos) in &candidates[i..j] {
+                        if let Some(mismatch) = window_match(adapter, r, pos as usize) {
+                            hit = Some(mismatch);
                             break;
                         }
                     }
                 }
-                if matched {
-                    counts[ai] += 1;
-                    if cur_max < counts[ai] {
-                        cur_max = counts[ai];
+                if let Some(mismatch) = hit {
+                    counts[ai as usize] += 1;
+                    if cur_max < counts[ai as usize] {
+                        cur_max = counts[ai as usize];
                     }
-                    mismatches[ai] += mismatch;
-                    break;
+                    mismatches[ai as usize] += mismatch;
                 }
             }
+            i = j;
         }
+
     }
 
     let mut best = None;

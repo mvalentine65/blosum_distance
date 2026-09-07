@@ -408,14 +408,15 @@ pub fn check_known_adapters(reads: &[&[u8]]) -> Option<(Vec<u8>, String)> {
     None
 }
 
-/// Grow a seed k-mer into a full adapter, fastp's `getAdapterWithSeed`.
-fn adapter_with_seed(seed: i32, reads: &[&[u8]], shift_tail: usize) -> Option<Detected> {
+/// Grow seed k-mers into adapters, fastp's `getAdapterWithSeed` over every
+/// candidate at once: one walk records where each seed landed, and the trees
+/// are grown from that in priority order, so an unevaluated seed costs none.
+fn adapters_with_seeds(seeds: &[i32], reads: &[&[u8]], shift_tail: usize) -> Option<Detected> {
     const MAX_SEARCH_LENGTH: usize = 500;
 
-    let mut forward = NucleotideTree::new();
-    let mut backward = NucleotideTree::new();
+    let mut hits: Vec<Vec<(u32, u32)>> = seeds.iter().map(|_| Vec::new()).collect();
 
-    for r in reads {
+    for (ri, r) in reads.iter().enumerate() {
         let rlen = r.len();
         if rlen < KEYLEN + shift_tail + 20 {
             continue;
@@ -424,34 +425,45 @@ fn adapter_with_seed(seed: i32, reads: &[&[u8]], shift_tail: usize) -> Option<De
         let mut key = -1i32;
         for pos in 20..=last.min(MAX_SEARCH_LENGTH) {
             key = seq2int(r, pos, KEYLEN, key);
-            if key == seed {
-                forward.add_seq(&r[pos + KEYLEN..rlen - shift_tail]);
-                let mut rev: Vec<u8> = r[..pos].to_vec();
-                rev.reverse();
-                backward.add_seq(&rev);
-            }
+            // At most TOPNUM seeds, so a scan beats hashing the key.
+            let Some(s) = seeds.iter().position(|&sd| sd == key) else {
+                continue;
+            };
+            hits[s].push((ri as u32, pos as u32));
         }
     }
 
-    let mut reached_leaf = true;
-    let forward_path = forward.dominant_path(&mut reached_leaf);
-    let backward_path = backward.dominant_path(&mut reached_leaf);
+    for (s, &seed) in seeds.iter().enumerate() {
+        let mut forward = NucleotideTree::new();
+        let mut backward = NucleotideTree::new();
+        for &(ri, pos) in &hits[s] {
+            let r = reads[ri as usize];
+            let (rlen, pos) = (r.len(), pos as usize);
+            forward.add_seq(&r[pos + KEYLEN..rlen - shift_tail]);
+            let mut rev: Vec<u8> = r[..pos].to_vec();
+            rev.reverse();
+            backward.add_seq(&rev);
+        }
 
-    let mut adapter: Vec<u8> = backward_path.into_iter().rev().collect();
-    adapter.extend_from_slice(&int2seq(seed as u32, KEYLEN));
-    adapter.extend_from_slice(&forward_path);
-    if adapter.len() > 60 {
-        adapter.truncate(60);
-    }
+        let mut reached_leaf = true;
+        let forward_path = forward.dominant_path(&mut reached_leaf);
+        let backward_path = backward.dominant_path(&mut reached_leaf);
 
-    if let Some((known, name)) = match_known_adapter(&adapter) {
-        return Some(Detected::Known { seq: known.to_vec(), name: name.to_string() });
+        let mut adapter: Vec<u8> = backward_path.into_iter().rev().collect();
+        adapter.extend_from_slice(&int2seq(seed as u32, KEYLEN));
+        adapter.extend_from_slice(&forward_path);
+        if adapter.len() > 60 {
+            adapter.truncate(60);
+        }
+
+        if let Some((known, name)) = match_known_adapter(&adapter) {
+            return Some(Detected::Known { seq: known.to_vec(), name: name.to_string() });
+        }
+        if reached_leaf {
+            return Some(Detected::Novel { seq: adapter });
+        }
     }
-    if reached_leaf {
-        Some(Detected::Novel { seq: adapter })
-    } else {
-        None
-    }
+    None
 }
 
 /// What detection concluded.
@@ -540,7 +552,11 @@ pub fn detect_adapter(reads: &[&[u8]], shift_tail: usize) -> Detected {
         }
     }
 
+    // Settle the candidate list first: every test here reads `counts` and the
+    // key itself, never a read, so the whole list is known before the sample
+    // is walked and one walk can serve all of them.
     const FOLD_THRESHOLD: u64 = 20;
+    let mut seeds: Vec<i32> = Vec::new();
     for &key in topkeys.iter() {
         if key == 0 {
             continue;
@@ -554,12 +570,15 @@ pub fn detect_adapter(reads: &[&[u8]], shift_tail: usize) -> Detected {
         if diff < 3 {
             continue;
         }
-        if let Some(detected) = adapter_with_seed(key as i32, reads, shift_tail) {
-            return detected;
-        }
+        seeds.push(key as i32);
     }
-
-    Detected::None
+    if seeds.is_empty() {
+        return Detected::None;
+    }
+    match adapters_with_seeds(&seeds, reads, shift_tail) {
+        Some(detected) => detected,
+        None => Detected::None,
+    }
 }
 
 #[cfg(test)]

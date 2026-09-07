@@ -1,6 +1,6 @@
 [package]
 name = "sapphyre_tools"
-version = "0.11.39"
+version = "0.11.40"
 edition = "2021"
 # Oldest toolchain we build on. Cargo skips dependency versions that need a
 # newer rustc, instead of resolving to one and failing at compile time.
@@ -20,6 +20,8 @@ fastx = "0.6"
 meminterval = "0.4.2"
 anyhow = "1"
 ahash = "0.8"
+# Already in the tree; named here so the N scan can use memchr2.
+memchr = "2"
 seq_io = "0.3"
 flate2 = { version = "1", features = ["zlib-ng"] }
 # Must cover every codec --nt-compression can select; exon_dp opens the nt DB.

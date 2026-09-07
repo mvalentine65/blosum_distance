@@ -5,6 +5,7 @@ use pyo3::types::PyBytes;
 use seq_io::fastq::{Reader as FastqReader, Record as FastqRecord};
 use seq_io::fasta::{Reader as FastaReader, Record as FastaRecord};
 use std::fs::File;
+use std::iter::once;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use flate2::read::MultiGzDecoder;
@@ -30,6 +31,9 @@ struct Bucket {
 
 /// `id` of an unoccupied slot. Doubles as the occupancy flag.
 const EMPTY: u32 = u32::MAX;
+
+/// How far ahead the consumer warms bucket lines.
+const PREFETCH_AHEAD: usize = 16;
 
 impl Default for Bucket {
     fn default() -> Self {
@@ -96,6 +100,22 @@ impl DedupTable {
             self.used += 1;
         }
         self.grow_time += _t.elapsed();
+    }
+
+    /// Warm the bucket a later read will probe. A hint, and `mask` keeps the
+    /// index in bounds, so it stays correct across a grow.
+    #[inline]
+    fn prefetch(&self, h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(
+                self.buckets.as_ptr().add((h as usize) & self.mask) as *const i8,
+                _MM_HINT_T0,
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = h;
     }
 
     #[inline]
@@ -614,7 +634,12 @@ fn build_table_parallel(
             }
             let t1 = prof.then(std::time::Instant::now);
             let mut pos = 0usize;
-            for &(len, h) in &kept.spans {
+            for (k, &(len, h)) in kept.spans.iter().enumerate() {
+                // The worker hashed the batch, so the probe address is known
+                // ahead of its turn. A random line out of a 2 GB table.
+                if let Some(&(_, ahead)) = kept.spans.get(k + PREFETCH_AHEAD) {
+                    table.prefetch(ahead);
+                }
                 let end = pos + len as usize;
                 table.add_hashed(&kept.buf[pos..end], h);
                 pos = end;
@@ -1081,21 +1106,18 @@ pub fn dedupe_reads(
         // Whole read when it holds no N, else the N-free runs, each kept only
         // at or above the minimum length.
         runs.clear();
-        if !seq.contains(&b'N') && !seq.contains(&b'n') {
+        if memchr::memchr2(b'N', b'n', seq).is_none() {
             if seq.len() >= min_length {
                 runs.push((off, seq.len()));
             }
         } else {
             let mut chunk_start = 0usize;
-            for i in 0..=seq.len() {
-                let is_end = i == seq.len();
-                if is_end || seq[i] == b'N' || seq[i] == b'n' {
-                    let len = i - chunk_start;
-                    if len >= min_length {
-                        runs.push((off + chunk_start, len));
-                    }
-                    chunk_start = i + 1;
+            for i in memchr::memchr2_iter(b'N', b'n', seq).chain(once(seq.len())) {
+                let len = i - chunk_start;
+                if len >= min_length {
+                    runs.push((off + chunk_start, len));
                 }
+                chunk_start = i + 1;
             }
         }
 

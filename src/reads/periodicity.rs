@@ -35,23 +35,31 @@ pub const MAX_PERIOD: usize = 12;
 /// sequence sits near 0, so there is a wide empty margin below this.
 pub const DEFAULT_THRESHOLD: f64 = 0.8;
 
-/// Positions where `s` agrees with itself `p` bases earlier. Chunked like the
-/// adapter scan, which is what lets it vectorise.
+/// Whether `s` agrees with itself `p` bases earlier on at least `bound` of the
+/// `len - p` compared positions. Chunked like the adapter scan, so it vectorises.
+///
+/// Counts mismatches to stop early: `n - miss` is the most matches still
+/// reachable, so the caller's test on that best case gives the same verdict.
 #[inline]
-fn matches_at_lag(s: &[u8], p: usize) -> usize {
+fn lag_reaches(s: &[u8], p: usize, bound: f64) -> bool {
     let (a, b) = (&s[p..], &s[..s.len() - p]);
-    let mut same = 0usize;
+    let n = a.len();
+    let mut miss = 0usize;
     let mut ca = a.chunks_exact(16);
     let mut cb = b.chunks_exact(16);
     for (x, y) in ca.by_ref().zip(cb.by_ref()) {
-        same += x.iter().zip(y).filter(|(l, r)| l == r).count();
+        miss += x.iter().zip(y).filter(|(l, r)| l != r).count();
+        if ((n - miss) as f64) < bound {
+            return false;
+        }
     }
-    same + ca
+    miss += ca
         .remainder()
         .iter()
         .zip(cb.remainder())
-        .filter(|(l, r)| l == r)
-        .count()
+        .filter(|(l, r)| l != r)
+        .count();
+    ((n - miss) as f64) >= bound
 }
 
 /// The repeat period, if this sequence is one. `None` means it is not.
@@ -94,7 +102,7 @@ pub fn repeat_period(s: &[u8], threshold: f64) -> Option<usize> {
     // Comparing counts against this bound avoids a divide inside the loop.
     let need = e + threshold * (1.0 - e);
     for p in 1..=MAX_PERIOD.min(l - 1) {
-        if matches_at_lag(s, p) as f64 >= need * (l - p) as f64 {
+        if lag_reaches(s, p, need * (l - p) as f64) {
             return Some(p);
         }
     }

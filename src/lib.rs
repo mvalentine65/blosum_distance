@@ -468,9 +468,8 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(delete_empty_columns_pairs, m)?)?;
     m.add_function(wrap_pyfunction!(is_low_complexity_nt, m)?)?;
     m.add_function(wrap_pyfunction!(exon_dp::exon_dp, m)?)?;
-    m.add_function(wrap_pyfunction!(join_by_tripled_index, m)?)?;
     m.add_function(wrap_pyfunction!(join_with_exclusions, m)?)?;
-    m.add_function(wrap_pyfunction!(join_triplets_with_exclusions, m)?)?;
+    m.add_function(wrap_pyfunction!(join_triplets_with_exclusions_many, m)?)?;
     m.add_function(wrap_pyfunction!(get_overlap, m)?)?;
     m.add_function(wrap_pyfunction!(is_same_kmer, m)?)?;
     m.add_function(wrap_pyfunction!(translate::translate, m)?)?;
@@ -480,6 +479,7 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(column_cull::apply_gff_culls, m)?)?;
     m.add_function(wrap_pyfunction!(exonfinder_post::exonfinder_process_gene, m)?)?;
 
+    m.add_class::<CullTables>()?;
     m.add_class::<ntbatch::NtBatchScanner>()?;
     m.add_class::<dedupe::PreparedReads>()?;
     m.add_function(wrap_pyfunction!(dedupe::dedupe_reads, m)?)?;

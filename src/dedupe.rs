@@ -22,11 +22,13 @@ use crate::reads::seqops::complement;
 
 // --- Optimized DedupTable from main_bestrs.rs ---
 
+/// 8 bytes: the slot index comes from the hash's low bits, `tag` keeps its high
+/// 32 to reject collisions. That is too little to re-place an entry, so a grow
+/// hashes the stored sequences again.
 #[derive(Clone, Copy)]
 struct Bucket {
-    hash: u64,
+    tag: u32,
     id: u32,
-    len: u32,
 }
 
 /// `id` of an unoccupied slot. Doubles as the occupancy flag.
@@ -37,12 +39,128 @@ const PREFETCH_AHEAD: usize = 16;
 
 impl Default for Bucket {
     fn default() -> Self {
-        Bucket { hash: 0, id: EMPTY, len: 0 }
+        Bucket { tag: 0, id: EMPTY }
     }
 }
 
-/// Per-unique data, indexed by id. `len` rides in the tail padding `off` and
-/// `count` already forced, so the writer never has to go back to the buckets.
+#[inline]
+fn tag_of(h: u64) -> u32 {
+    (h >> 32) as u32
+}
+
+/// Ask for transparent huge pages on a large buffer before it is first
+/// written, so filling it faults once per 2 MB rather than once per 4 KB. Only
+/// a hint: a no-op where THP is off or unsupported.
+fn advise_huge(ptr: *const u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if len < 4 << 20 {
+            return;
+        }
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let start = (ptr as usize).div_ceil(page) * page;
+        let end = (ptr as usize + len) / page * page;
+        if end > start {
+            libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (ptr, len);
+}
+
+/// `advise_huge` over a vector's whole allocation, used or not.
+fn advise_huge_vec<T>(v: &Vec<T>) {
+    advise_huge(v.as_ptr().cast(), v.capacity() * std::mem::size_of::<T>());
+}
+
+/// Empty-bucket table of `cap` slots, advised before the fill touches it.
+fn empty_buckets(cap: usize) -> Vec<Bucket> {
+    let mut buckets = Vec::with_capacity(cap);
+    advise_huge_vec(&buckets);
+    buckets.resize(cap, Bucket::default());
+    buckets
+}
+
+// --- 2-bit storage ---
+//
+// A sequence of only A/C/G/T is stored at 2 bits per base, and its length word
+// carries PACKED. Anything else (N, IUPAC codes, lowercase, stray bytes) is
+// stored as it came, so N-splitting and residue errors see the original bytes.
+// Equal sequences always get the same form, so the table can compare stored
+// bytes directly.
+
+/// Set on a length word whose sequence is 2-bit packed.
+const PACKED: u32 = 1 << 31;
+
+/// 2-bit code per byte; 4 for bytes that cannot be packed.
+static BASE_CODE: [u8; 256] = {
+    let mut t = [4u8; 256];
+    t[b'A' as usize] = 0;
+    t[b'C' as usize] = 1;
+    t[b'G' as usize] = 2;
+    t[b'T' as usize] = 3;
+    t
+};
+
+/// The four bases a packed byte holds, first base in the low bits.
+static PACKED_BASES: [[u8; 4]; 256] = {
+    let mut t = [[0u8; 4]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut i = 0;
+        while i < 4 {
+            t[byte][i] = b"ACGT"[(byte >> (2 * i)) & 3];
+            i += 1;
+        }
+        byte += 1;
+    }
+    t
+};
+
+/// Append `seq`'s stored form to `out`; returns its length word.
+#[inline]
+fn encode_into(seq: &[u8], out: &mut Vec<u8>) -> u32 {
+    let len = seq.len() as u32;
+    if seq.iter().any(|&b| BASE_CODE[b as usize] == 4) {
+        out.extend_from_slice(seq);
+        return len;
+    }
+    out.reserve(seq.len().div_ceil(4));
+    for chunk in seq.chunks(4) {
+        let mut byte = 0u8;
+        for (i, &b) in chunk.iter().enumerate() {
+            byte |= BASE_CODE[b as usize] << (2 * i);
+        }
+        out.push(byte);
+    }
+    len | PACKED
+}
+
+/// Bases in a length word.
+#[inline]
+fn base_len(len_word: u32) -> usize {
+    (len_word & !PACKED) as usize
+}
+
+/// Bytes a length word's sequence occupies in the arena.
+#[inline]
+fn stored_len(len_word: u32) -> usize {
+    if len_word & PACKED != 0 {
+        base_len(len_word).div_ceil(4)
+    } else {
+        base_len(len_word)
+    }
+}
+
+/// Write the first `out.len()` bases of `packed` to `out`.
+#[inline]
+fn unpack_into(packed: &[u8], out: &mut [u8]) {
+    for (dst, &byte) in out.chunks_mut(4).zip(packed) {
+        dst.copy_from_slice(&PACKED_BASES[byte as usize][..dst.len()]);
+    }
+}
+
+/// Per-unique data, indexed by id. `len` is a length word.
 #[derive(Clone, Copy, Default)]
 struct Record {
     off: u64,
@@ -59,21 +177,28 @@ struct DedupTable {
     used: usize,
     records: Vec<Record>,
     next_id: usize,
+    /// `add`'s encode buffer.
+    scratch: Vec<u8>,
 }
 
 impl DedupTable {
     fn with_capacity(expected_uniques: usize, expected_bytes: usize) -> Self {
         let mut cap = (expected_uniques * 10) / 7;
         cap = cap.next_power_of_two().max(1024);
+        let arena = Vec::with_capacity(expected_bytes.max(64 * 1024 * 1024));
+        advise_huge_vec(&arena);
+        let records = Vec::with_capacity(expected_uniques);
+        advise_huge_vec(&records);
         Self {
             grows: 0,
             grow_time: std::time::Duration::ZERO,
-            buckets: vec![Bucket::default(); cap],
+            buckets: empty_buckets(cap),
             mask: cap - 1,
-            arena: Vec::with_capacity(expected_bytes.max(64 * 1024 * 1024)),
+            arena,
             used: 0,
-            records: Vec::with_capacity(expected_uniques),
+            records,
             next_id: 0,
+            scratch: Vec::with_capacity(300),
         }
     }
 
@@ -86,18 +211,20 @@ impl DedupTable {
         if (self.used * 10) < (self.buckets.len() * 7) { return; }
         let _t = std::time::Instant::now();
         self.grows += 1;
-        let old = std::mem::take(&mut self.buckets);
-        let new_cap = old.len() * 2;
-        self.buckets = vec![Bucket::default(); new_cap];
+        let new_cap = self.buckets.len() * 2;
+        // Rebuilt from records rather than the old buckets, so those can go first.
+        drop(std::mem::take(&mut self.buckets));
+        self.buckets = empty_buckets(new_cap);
         self.mask = new_cap - 1;
-        self.used = 0;
-        for b in old.into_iter().filter(|b| b.id != EMPTY) {
-            let mut i = (b.hash as usize) & self.mask;
+        // Records are in id order, so this walks the arena front to back.
+        for (id, rec) in self.records.iter().enumerate() {
+            let off = rec.off as usize;
+            let h = Self::hash64(rec.len, &self.arena[off..off + stored_len(rec.len)]);
+            let mut i = (h as usize) & self.mask;
             while self.buckets[i].id != EMPTY {
                 i = (i + 1) & self.mask;
             }
-            self.buckets[i] = b;
-            self.used += 1;
+            self.buckets[i] = Bucket { tag: tag_of(h), id: id as u32 };
         }
         self.grow_time += _t.elapsed();
     }
@@ -118,43 +245,50 @@ impl DedupTable {
         let _ = h;
     }
 
+    /// Hash of a stored form. The length word goes in too: packed sequences of
+    /// different lengths can share bytes (`A` and `AA` both pack to 0x00).
     #[inline]
-    fn hash64(seq: &[u8]) -> u64 {
+    fn hash64(len_word: u32, stored: &[u8]) -> u64 {
         use std::hash::Hasher;
         let mut h = ahash::AHasher::default();
-        h.write(seq);
+        h.write_u32(len_word);
+        h.write(stored);
         h.finish()
     }
 
     fn add(&mut self, seq: &[u8]) {
-        let h = Self::hash64(seq);
-        self.add_hashed(seq, h);
+        let mut stored = std::mem::take(&mut self.scratch);
+        stored.clear();
+        let len_word = encode_into(seq, &mut stored);
+        let h = Self::hash64(len_word, &stored);
+        self.add_hashed(&stored, len_word, h);
+        self.scratch = stored;
     }
 
-    /// `add` with the hash already computed. Lets a worker thread do the
-    /// hashing off the critical path; the insert itself stays single-threaded
+    /// `add` with the sequence already encoded and hashed. Lets a worker thread
+    /// do that off the critical path; the insert itself stays single-threaded
     /// because `next_id` is the encounter order the output depends on.
-    fn add_hashed(&mut self, seq: &[u8], h: u64) {
+    fn add_hashed(&mut self, stored: &[u8], len_word: u32, h: u64) {
         self.maybe_grow();
-        let len = seq.len() as u32;
+        let tag = tag_of(h);
         let mut i = (h as usize) & self.mask;
         loop {
             let bucket = self.buckets[i];
             if bucket.id == EMPTY {
                 let off = self.arena.len() as u64;
-                self.arena.extend_from_slice(seq);
+                self.arena.extend_from_slice(stored);
                 let id = self.next_id as u32;
                 self.next_id += 1;
-                self.records.push(Record { off, count: 1, len });
-                self.buckets[i] = Bucket { hash: h, id, len };
+                self.records.push(Record { off, count: 1, len: len_word });
+                self.buckets[i] = Bucket { tag, id };
                 self.used += 1;
                 return;
             }
-            // hash and length reject almost every collision without touching
-            // records or the arena.
-            if bucket.hash == h && bucket.len == len {
+            // The tag rejects almost every collision without touching records
+            // or the arena.
+            if bucket.tag == tag {
                 let rec = self.records[bucket.id as usize];
-                if self.arena_get(rec.off as usize, len as usize) == seq {
+                if rec.len == len_word && self.arena_get(rec.off as usize, stored.len()) == stored {
                     self.records[bucket.id as usize].count += 1;
                     return;
                 }
@@ -240,7 +374,8 @@ fn size_hint(paths: &[PathBuf]) -> (usize, usize) {
         };
         records += (bytes / per_record) as usize;
     }
-    (records.max(1_000_000), records.saturating_mul(150))
+    // ~150 bp reads pack to ~38 bytes.
+    (records.max(1_000_000), records.saturating_mul(40))
 }
 
 /// Phase 1: read every input and fill the dedup table. Shared so `fast_dedupe`
@@ -390,20 +525,20 @@ impl ItemStream {
     }
 }
 
-/// Survivors of one batch, packed back to back. `spans` carries each kept
-/// sequence's length and hash in emission order, so the consumer can insert
-/// them without rehashing.
+/// Survivors of one batch, in stored form back to back. `spans` carries each
+/// kept sequence's length word and hash in emission order, so the consumer can
+/// insert them without re-encoding.
 #[derive(Default)]
 struct Kept {
     buf: Vec<u8>,
     spans: Vec<(u32, u64)>,
 }
 
-/// Canonicalise and hash one survivor into `out`. Mirrors `add_canonical`,
-/// including its empty-sequence early return, but defers the table insert.
+/// Canonicalise, encode and hash one survivor into `out`. Mirrors
+/// `add_canonical`, including its length early return, but defers the insert.
 #[inline]
-fn push_kept(out: &mut Kept, seq: &[u8], canon: &mut Vec<u8>) {
-    if seq.is_empty() {
+fn push_kept(out: &mut Kept, seq: &[u8], canon: &mut Vec<u8>, min_length: usize) {
+    if seq.is_empty() || seq.len() < min_length {
         return;
     }
     let bytes: &[u8] = if forward_is_canonical(seq) {
@@ -413,8 +548,9 @@ fn push_kept(out: &mut Kept, seq: &[u8], canon: &mut Vec<u8>) {
         canon.extend(seq.iter().rev().map(|&b| complement(b)));
         canon
     };
-    out.spans.push((bytes.len() as u32, DedupTable::hash64(bytes)));
-    out.buf.extend_from_slice(bytes);
+    let start = out.buf.len();
+    let len_word = encode_into(bytes, &mut out.buf);
+    out.spans.push((len_word, DedupTable::hash64(len_word, &out.buf[start..])));
 }
 
 /// The trim chain over one batch. Pure given `opts`: the only state is the
@@ -425,20 +561,21 @@ fn run_batch(
     stats: &mut TrimStats,
     scratch: &mut TrimScratch,
     canon: &mut Vec<u8>,
+    min_length: usize,
 ) -> Kept {
     let mut out = Kept::default();
     for it in items {
         if it.s2.is_empty() {
             if let Some(r) = process_single(&it.s1, &it.q1, opts, stats, scratch) {
-                push_kept(&mut out, r.bases(), canon);
+                push_kept(&mut out, r.bases(), canon, min_length);
             }
         } else {
             let o = process_pair(&it.s1, &it.q1, &it.s2, &it.q2, opts, stats, scratch);
             if let Some(r) = o.r1 {
-                push_kept(&mut out, r.bases(), canon);
+                push_kept(&mut out, r.bases(), canon, min_length);
             }
             if let Some(r) = o.r2 {
-                push_kept(&mut out, r.bases(), canon);
+                push_kept(&mut out, r.bases(), canon, min_length);
             }
         }
     }
@@ -488,6 +625,7 @@ fn build_table_parallel(
     input_paths: Vec<PathBuf>,
     table: &mut DedupTable,
     workers: usize,
+    min_length: usize,
     prof: bool,
 ) -> Result<TrimSummary> {
     const BATCH: usize = 4096;
@@ -545,7 +683,8 @@ fn build_table_parallel(
                 let mut scratch = TrimScratch::default();
                 let mut canon = Vec::with_capacity(300);
                 while let Ok(items) = rx_in.recv() {
-                    let kept = run_batch(&items, opts, &mut stats, &mut scratch, &mut canon);
+                    let kept =
+                        run_batch(&items, opts, &mut stats, &mut scratch, &mut canon, min_length);
                     if tx_out.send(kept).is_err() {
                         break;
                     }
@@ -634,14 +773,14 @@ fn build_table_parallel(
             }
             let t1 = prof.then(std::time::Instant::now);
             let mut pos = 0usize;
-            for (k, &(len, h)) in kept.spans.iter().enumerate() {
+            for (k, &(len_word, h)) in kept.spans.iter().enumerate() {
                 // The worker hashed the batch, so the probe address is known
                 // ahead of its turn. A random line out of a 2 GB table.
                 if let Some(&(_, ahead)) = kept.spans.get(k + PREFETCH_AHEAD) {
                     table.prefetch(ahead);
                 }
-                let end = pos + len as usize;
-                table.add_hashed(&kept.buf[pos..end], h);
+                let end = pos + stored_len(len_word);
+                table.add_hashed(&kept.buf[pos..end], len_word, h);
                 pos = end;
             }
             if let Some(t) = t1 {
@@ -668,7 +807,13 @@ fn build_table_parallel(
     Ok(TrimSummary::from(&totals, (det1.as_deref(), det2.as_deref())))
 }
 
-fn build_table(input_paths: Vec<PathBuf>, trim: bool) -> Result<(DedupTable, TrimSummary)> {
+/// Sequences shorter than `min_length` are never inserted: no N-free run of
+/// theirs can reach the floor, so `dedupe_reads` would drop them unemitted.
+fn build_table(
+    input_paths: Vec<PathBuf>,
+    trim: bool,
+    min_length: usize,
+) -> Result<(DedupTable, TrimSummary)> {
     let prof = std::env::var("SAPPHYRE_PROFILE").is_ok();
     let mut t_read = std::time::Duration::ZERO;
     let mut t_trim = std::time::Duration::ZERO;
@@ -687,7 +832,7 @@ fn build_table(input_paths: Vec<PathBuf>, trim: bool) -> Result<(DedupTable, Tri
                 if let Some(t) = t0 { t_read += t.elapsed(); }
                 let Some((seq, _qual)) = rec else { break };
                 let t1 = prof.then(std::time::Instant::now);
-                add_canonical(&mut table, &seq, &mut scratch);
+                add_canonical(&mut table, &seq, &mut scratch, min_length);
                 if let Some(t) = t1 { t_hash += t.elapsed(); }
             }
         }
@@ -719,7 +864,7 @@ fn build_table(input_paths: Vec<PathBuf>, trim: bool) -> Result<(DedupTable, Tri
         });
 
     if workers >= 1 {
-        let summary = build_table_parallel(input_paths, &mut table, workers, prof)?;
+        let summary = build_table_parallel(input_paths, &mut table, workers, min_length, prof)?;
         if prof {
             eprintln!(
                 "[profile] parallel trim total {:.1}s | {} workers",
@@ -748,7 +893,7 @@ fn build_table(input_paths: Vec<PathBuf>, trim: bool) -> Result<(DedupTable, Tri
                     let t1 = prof.then(std::time::Instant::now);
                     ingest.push_pair(&s1, &q1, &s2, &q2, &mut |kept: &[u8]| {
                         let t2 = prof.then(std::time::Instant::now);
-                        add_canonical(&mut table, kept, &mut scratch);
+                        add_canonical(&mut table, kept, &mut scratch, min_length);
                         if let Some(t) = t2 { t_hash += t.elapsed(); }
                     });
                     if let Some(t) = t1 { t_trim += t.elapsed(); }
@@ -758,7 +903,7 @@ fn build_table(input_paths: Vec<PathBuf>, trim: bool) -> Result<(DedupTable, Tri
                 let mut src = RecordSource::open(&path)?;
                 while let Some((seq, qual)) = src.next_record()? {
                     ingest.push_single(&seq, &qual, &mut |kept: &[u8]| {
-                        add_canonical(&mut table, kept, &mut scratch)
+                        add_canonical(&mut table, kept, &mut scratch, min_length)
                     });
                 }
             }
@@ -766,7 +911,7 @@ fn build_table(input_paths: Vec<PathBuf>, trim: bool) -> Result<(DedupTable, Tri
     }
     // Anything still staged awaiting detection has to be drained, or every
     // input shorter than the detection sample would vanish.
-    ingest.finish(&mut |kept: &[u8]| add_canonical(&mut table, kept, &mut scratch));
+    ingest.finish(&mut |kept: &[u8]| add_canonical(&mut table, kept, &mut scratch, min_length));
 
     if prof {
         eprintln!(
@@ -790,8 +935,8 @@ fn build_table(input_paths: Vec<PathBuf>, trim: bool) -> Result<(DedupTable, Tri
 
 /// Canonicalise and hash one surviving sequence.
 #[inline]
-fn add_canonical(table: &mut DedupTable, seq: &[u8], scratch: &mut Vec<u8>) {
-    if seq.is_empty() {
+fn add_canonical(table: &mut DedupTable, seq: &[u8], scratch: &mut Vec<u8>, min_length: usize) {
+    if seq.is_empty() || seq.len() < min_length {
         return;
     }
     if forward_is_canonical(seq) {
@@ -935,8 +1080,10 @@ const DUPES_MAGIC: &[u8; 8] = b"SPKD1\0\0\0";
 pub struct PreparedReads {
     arena: Vec<u8>,
     trim: TrimSummary,
-    /// (node id, arena offset, length) per emitted record, in id order.
-    records: Vec<(u64, usize, u32)>,
+    /// Arena offset and length word per emitted record. Record `i` has node id
+    /// `i + 1`.
+    offsets: Vec<usize>,
+    lens: Vec<u32>,
     batch_size: usize,
     dupes_blob: Vec<u8>,
     total_dupes: u64,
@@ -946,7 +1093,7 @@ pub struct PreparedReads {
 impl PreparedReads {
     /// Number of records that survived the length filter and N-splitting.
     fn record_count(&self) -> usize {
-        self.records.len()
+        self.lens.len()
     }
 
     /// Total duplicate observations, i.e. sum of (count - 1).
@@ -955,25 +1102,55 @@ impl PreparedReads {
     }
 
     fn batch_count(&self) -> usize {
-        self.records.len().div_ceil(self.batch_size)
+        self.lens.len().div_ceil(self.batch_size)
     }
 
     /// Batch `index` as concatenated `>id\nSEQ\n` records.
     fn batch<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyBytes>> {
+        let count = self.lens.len();
         let start = index * self.batch_size;
-        if start >= self.records.len() && !self.records.is_empty() {
+        if start >= count && count != 0 {
             return Err(PyValueError::new_err(format!("batch {index} out of range")));
         }
-        let end = ((index + 1) * self.batch_size).min(self.records.len());
-        let mut out = Vec::with_capacity((end - start) * 160);
-        for &(node_id, off, len) in &self.records[start..end] {
-            out.push(b'>');
-            out.extend_from_slice(node_id.to_string().as_bytes());
-            out.push(b'\n');
-            out.extend_from_slice(&self.arena[off..off + len as usize]);
-            out.push(b'\n');
+        let end = ((index + 1) * self.batch_size).min(count);
+        // Exact size of the `>id\nSEQ\n` records, so they can be written straight
+        // into the bytes object: no Rust-side copy, and none of the zero fill
+        // `PyBytes::new_with` does, each of which faulted in the whole batch.
+        let size: usize = (start..end)
+            .map(|i| decimal_len(i + 1) + base_len(self.lens[i]) + 3)
+            .sum();
+        unsafe {
+            let ptr = pyo3::ffi::PyBytes_FromStringAndSize(
+                std::ptr::null(),
+                size as pyo3::ffi::Py_ssize_t,
+            );
+            let bytes = Bound::from_owned_ptr_or_err(py, ptr)?.cast_into_unchecked::<PyBytes>();
+            let buf: *mut u8 = pyo3::ffi::PyBytes_AsString(ptr).cast();
+            advise_huge(buf, size);
+            let out = std::slice::from_raw_parts_mut(buf, size);
+            let mut pos = 0usize;
+            for i in start..end {
+                let (off, len_word) = (self.offsets[i], self.lens[i]);
+                let len = base_len(len_word);
+                let digits = decimal_len(i + 1);
+                out[pos] = b'>';
+                write_decimal(&mut out[pos + 1..pos + 1 + digits], i + 1);
+                pos += 1 + digits;
+                out[pos] = b'\n';
+                let seq = &mut out[pos + 1..pos + 1 + len];
+                if len_word & PACKED != 0 {
+                    unpack_into(&self.arena[off..off + stored_len(len_word)], seq);
+                } else {
+                    seq.copy_from_slice(&self.arena[off..off + len]);
+                }
+                pos += 1 + len;
+                out[pos] = b'\n';
+                pos += 1;
+            }
+            // Python must never see an unwritten byte.
+            assert_eq!(pos, size);
+            Ok(bytes)
         }
-        Ok(PyBytes::new(py, &out))
     }
 
     /// The packed duplicate counts, in the same layout `packed_dupes` writes.
@@ -1078,10 +1255,15 @@ pub fn dedupe_reads(
         a_name.cmp(b_name).then_with(|| a.as_os_str().cmp(b.as_os_str()))
     });
 
-    let (table, trim_summary) =
-        build_table(input_paths, trim).map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+    let (mut table, trim_summary) = build_table(input_paths, trim, min_length)
+        .map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+    // Only records and the arena are read from here on.
+    drop(std::mem::take(&mut table.buckets));
 
-    let mut records: Vec<(u64, usize, u32)> = Vec::with_capacity(table.next_id);
+    let mut offsets: Vec<usize> = Vec::with_capacity(table.next_id);
+    advise_huge_vec(&offsets);
+    let mut lens: Vec<u32> = Vec::with_capacity(table.next_id);
+    advise_huge_vec(&lens);
     // Serialised as they are found; the blob needs every key before every value,
     // which is the only reason both runs are held at all.
     let mut dupe_key_bytes: Vec<u8> = Vec::new();
@@ -1097,16 +1279,24 @@ pub fn dedupe_reads(
     let mut repeat_reads: u64 = 0;
     let mut repeat_bases: u64 = 0;
     let mut repeat_units: ahash::AHashMap<Vec<u8>, u64> = ahash::AHashMap::new();
+    // A packed sequence unpacked for the repeat check.
+    let mut bases: Vec<u8> = Vec::with_capacity(300);
 
     for id in 0..table.next_id {
         let rec = table.records[id];
         let off = rec.off as usize;
-        let seq = &table.arena[off..off + rec.len as usize];
+        let packed = rec.len & PACKED != 0;
+        let seq = &table.arena[off..off + stored_len(rec.len)];
 
         // Whole read when it holds no N, else the N-free runs, each kept only
-        // at or above the minimum length.
+        // at or above the minimum length. A packed read is all ACGT: one run.
+        // Runs of a packed read keep `off` and count bases.
         runs.clear();
-        if memchr::memchr2(b'N', b'n', seq).is_none() {
+        if packed {
+            if base_len(rec.len) >= min_length {
+                runs.push((off, base_len(rec.len)));
+            }
+        } else if memchr::memchr2(b'N', b'n', seq).is_none() {
             if seq.len() >= min_length {
                 runs.push((off, seq.len()));
             }
@@ -1125,7 +1315,13 @@ pub fn dedupe_reads(
         // than per read, and only on runs that already cleared the floor.
         if repeat_filter {
             runs.retain(|&(off, len)| {
-                let seq = &table.arena[off..off + len];
+                let seq: &[u8] = if packed {
+                    bases.resize(len, 0);
+                    unpack_into(&table.arena[off..off + len.div_ceil(4)], &mut bases);
+                    &bases
+                } else {
+                    &table.arena[off..off + len]
+                };
                 let hit = repeat_period(
                     seq,
                     crate::reads::periodicity::DEFAULT_THRESHOLD,
@@ -1152,8 +1348,13 @@ pub fn dedupe_reads(
 
         for &(chunk_off, len) in &runs {
             next_node_id += 1;
-            validate_residues(next_node_id, &table.arena[chunk_off..chunk_off + len])?;
-            records.push((next_node_id, chunk_off, len as u32));
+            if packed {
+                lens.push(len as u32 | PACKED);
+            } else {
+                validate_residues(next_node_id, &table.arena[chunk_off..chunk_off + len])?;
+                lens.push(len as u32);
+            }
+            offsets.push(chunk_off);
             if dupes != 0 {
                 dupe_key_bytes.extend_from_slice(&(next_node_id as i64).to_le_bytes());
                 dupe_val_bytes.extend_from_slice(&(dupes as i64).to_le_bytes());
@@ -1189,11 +1390,26 @@ pub fn dedupe_reads(
     Ok(PreparedReads {
         arena: table.arena,
         trim: trim_summary,
-        records,
+        offsets,
+        lens,
         batch_size,
         dupes_blob,
         total_dupes,
     })
+}
+
+#[inline]
+fn decimal_len(n: usize) -> usize {
+    n.checked_ilog10().map_or(1, |digits| digits as usize + 1)
+}
+
+/// Write `n` in decimal, right-aligned to fill `out`.
+#[inline]
+fn write_decimal(out: &mut [u8], mut n: usize) {
+    for byte in out.iter_mut().rev() {
+        *byte = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
 }
 
 fn validate_residues(node_id: u64, seq: &[u8]) -> PyResult<()> {

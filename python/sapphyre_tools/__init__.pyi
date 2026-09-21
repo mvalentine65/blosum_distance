@@ -112,6 +112,8 @@ def hmm_align(
     tmpdir: Optional[str] = ...,
     gene_name: Optional[str] = ...,
     taxa: Optional[str] = ...,
+    cached_hmm: Optional[str] = ...,
+    cached_template: Optional[str] = ...,
 ) -> List[Tuple[str, str]]: ...
 def exon_dp(folder: str, sub_dir: str, taxa_path: str) -> Any: ...
 # flank_inputs, gap_inputs and gff_nodes are extracted by attribute name

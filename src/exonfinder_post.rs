@@ -2020,7 +2020,7 @@ fn genomic_sort_key(
 /// records.
 ///
 /// Natives are folded into the hmm_align reference template, which
-/// `aligner.rs` masks `*`->`X` so hmmbuild will accept them.  `--mapali` then
+/// `aligner.rs` masks `*`->`X` so bathbuild will accept them.  `--mapali` then
 /// copies those rows into the output verbatim (only re-gapping to absorb
 /// candidate insert columns), so the emitted native rows carry `X` where they
 /// had a stop.  `--mapali` preserves residue identity and order, so we walk
@@ -2125,14 +2125,14 @@ pub fn exonfinder_process_gene(
     // -------------------------------------------------------------------
     // 1. Reference template + candidate list for hmm_align.
     //
-    // The template (hmmbuild input *and* --mapali) is the resolve output
+    // The template (bathbuild input *and* --mapali) is the resolve output
     // MSA: the orthoset refs plus the already-aligned natives.  --mapali maps
     // an existing alignment onto the model *without* realigning it, so the
     // natives come back frozen in their resolve columns and only the new
     // flank/gap stubs are aligned fresh.  Building the profile from
     // refs+natives also gives those stubs a data-informed model for free.
     //
-    // aligner.rs masks `*`->`X` on the template so hmmbuild accepts it; the
+    // aligner.rs masks `*`->`X` on the template so bathbuild accepts it; the
     // native stops are restored right after the align call (see
     // restore_native_stops) so the emitted AA matches the resolve input.
     // -------------------------------------------------------------------
@@ -2165,6 +2165,8 @@ pub fn exonfinder_process_gene(
     // 2. hmm_align (re-uses existing pyfunction; pass our py token).
     // -------------------------------------------------------------------
     let t_hmm = Instant::now();
+    // No cached model here: our template is refs+natives, so its checksum can
+    // never match the refs-only model in the bhmm cache.  Always build.
     let mut aligned = hmm_align(
         py,
         cands_aa,
@@ -2172,8 +2174,10 @@ pub fn exonfinder_process_gene(
         tmpdir.clone(),
         Some(gene_name.clone()),
         taxa.clone(),
+        None,
+        None,
     )?;
-    // Natives were `*`->`X` masked for hmmbuild; put their stop codons back
+    // Natives were `*`->`X` masked for bathbuild; put their stop codons back
     // before cull so the emitted AA matches the resolve input residues.
     restore_native_stops(&mut aligned, &natives_aa);
     let t_hmm = t_hmm.elapsed().as_secs_f64();

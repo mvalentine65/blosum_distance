@@ -25,7 +25,7 @@ fn parse_fasta_file(path: &str) -> Vec<(String, String)> {
 /// avoids the intermediate Python string allocation.
 ///
 /// When `mask_stops` is true, stop codons (`*`) are rewritten to `X` on the
-/// fly so HMMER's hmmbuild doesn't choke on them.  We only do this for the
+/// fly so bathbuild doesn't choke on them.  We only do this for the
 /// reference alignment; candidate `*`s are passed through verbatim.
 fn write_fasta_to_writer<W: Write>(
     out: &mut W,
@@ -76,7 +76,7 @@ fn run_command(cmd: &mut Command, name: &str) -> Result<(), String> {
     Err(format!("{} failed: {}", name, stderr))
 }
 
-/// Run hmmbuild + hmmalign on candidate sequences against a reference alignment.
+/// Run bathbuild + bathalign on candidate sequences against a reference alignment.
 ///
 /// Returns aligned (header, sequence) tuples with insertion dots normalised to
 /// dashes and all residues uppercased.
@@ -87,10 +87,16 @@ fn run_command(cmd: &mut Command, name: &str) -> Result<(), String> {
 ///
 /// `gene_name` and `taxa`, when provided, are embedded in each scratch file's
 /// prefix; `gene_name` is also used as the HMM's internal name.  Tagging by
-/// taxa+gene avoids collisions when many workers run hmmbuild/hmmalign
+/// taxa+gene avoids collisions when many workers run bathbuild/bathalign
 /// concurrently against the same tmpdir for different runs of the same gene.
+///
+/// `cached_hmm` + `cached_template` opt into the bhmm cache hmmsearch fills:
+/// the model and the exact MSA it was built from.  Both must be given and both
+/// must exist, or we fall back to building.  When they are used `references` is
+/// ignored -- `--mapali` re-derives the template's checksum and bathalign dies
+/// on a mismatch, so model and template can only travel as a pair.
 #[pyfunction]
-#[pyo3(signature = (candidates, references, tmpdir = None, gene_name = None, taxa = None))]
+#[pyo3(signature = (candidates, references, tmpdir = None, gene_name = None, taxa = None, cached_hmm = None, cached_template = None))]
 pub fn hmm_align(
     py: Python<'_>,
     candidates: Vec<(String, String)>,
@@ -98,9 +104,19 @@ pub fn hmm_align(
     tmpdir: Option<String>,
     gene_name: Option<String>,
     taxa: Option<String>,
+    cached_hmm: Option<String>,
+    cached_template: Option<String>,
 ) -> PyResult<Vec<(String, String)>> {
     py.detach(move || {
-        hmm_align_inner(candidates, references, tmpdir, gene_name, taxa)
+        hmm_align_inner(
+            candidates,
+            references,
+            tmpdir,
+            gene_name,
+            taxa,
+            cached_hmm,
+            cached_template,
+        )
     })
     .map_err(PyRuntimeError::new_err)
 }
@@ -111,6 +127,8 @@ fn hmm_align_inner(
     tmpdir: Option<String>,
     gene_name: Option<String>,
     taxa: Option<String>,
+    cached_hmm: Option<String>,
+    cached_template: Option<String>,
 ) -> Result<Vec<(String, String)>, String> {
     // Sanitise tag components so they're safe inside a filename — strip anything
     // that isn't alphanumeric/_/-/. so we don't accidentally inject path
@@ -141,53 +159,87 @@ fn hmm_align_inner(
         .map_err(|e| e.to_string())
     };
 
-    let mut temp_aln = make_temp("aln", ".fa")?;
-    let temp_hmm = make_temp("hmm", ".hmm")?;
+    // A cache entry is only usable as a pair; a half-populated cache dir falls
+    // back to building rather than handing bathalign a checksum it will reject.
+    let cache_hit = match (&cached_hmm, &cached_template) {
+        (Some(h), Some(t)) if Path::new(h).is_file() && Path::new(t).is_file() => {
+            Some((h.clone(), t.clone()))
+        }
+        _ => None,
+    };
+
     let mut temp_cand = make_temp("cand", ".fa")?;
     let temp_result = make_temp("res", ".afa")?;
 
     // Write through the existing tempfile handles - no second open().
-    // Mask stop codons (`*` -> `X`) in references only; the HMM model is
-    // built from these and HMMER won't accept `*`.  Candidate `*`s are
-    // preserved so downstream stages still see the stop signal.
+    // Candidate `*`s are preserved so downstream stages still see the stop
+    // signal; only the reference template masks them (see below).
     //
     // write_fasta_to_writer builds the complete Vec<u8> internally and emits
     // it in a single write_all, so wrapping the file in a BufWriter would
     // just add another copy-and-flush layer for no benefit.
-    write_fasta_to_writer(temp_aln.as_file_mut(), &references, true)
-        .map_err(|e| e.to_string())?;
     write_fasta_to_writer(temp_cand.as_file_mut(), &candidates, false)
         .map_err(|e| e.to_string())?;
 
-    let aln_path = temp_aln.path().to_str().unwrap().to_string();
-    let hmm_path = temp_hmm.path().to_str().unwrap().to_string();
     let cand_path = temp_cand.path().to_str().unwrap().to_string();
     let result_path = temp_result.path().to_str().unwrap().to_string();
 
-    // hmmbuild
-    //
-    // --cpu 1 keeps each invocation single-threaded; SAPPHYRE drives this
-    // function from a multiprocessing pool, so HMMER's default of 2 pthreads
-    // per call would oversubscribe (N_workers x 2 threads).
     let hmm_name = if gene_slug.is_empty() { "hmm" } else { gene_slug.as_str() };
-    //
-    // The E-value calibration fits (200 sampled sequences each by default) are
-    // ~18% of hmmbuild's runtime and only populate the STATS lines. hmmalign
-    // never reads those, and this HMM is consumed by the hmmalign below and
-    // then discarded, so trim the fits. 25 still fits the Gumbel/exponential
-    // tails; 1 fails outright with "failed to determine msv mu".
-    let mut hmmbuild = Command::new("hmmbuild");
-    hmmbuild
-        .args(["-n", hmm_name])
-        .args(["--cpu", "1"])
-        .args(["--EmN", "25", "--EvN", "25", "--EfN", "25"])
-        .arg(&hmm_path)
-        .arg(&aln_path);
-    run_command(&mut hmmbuild, "hmmbuild")?;
 
-    // hmmalign --mapali (hmmalign is single-threaded in HMMER3 — no --cpu).
-    let mut hmmalign = Command::new("hmmalign");
-    hmmalign.args([
+    // These two keep the scratch files alive for the length of the call; on a
+    // cache hit neither is created and the cached paths are used instead.
+    let mut _aln_guard = None;
+    let mut _hmm_guard = None;
+
+    let (aln_path, hmm_path) = match cache_hit {
+        Some((cached_hmm_path, cached_template_path)) => (cached_template_path, cached_hmm_path),
+        None => {
+            let mut temp_aln = make_temp("aln", ".fa")?;
+            let temp_hmm = make_temp("hmm", ".bhmm")?;
+
+            // Mask stop codons (`*` -> `X`) in references only; the model is
+            // built from these and bathbuild won't accept `*`.
+            write_fasta_to_writer(temp_aln.as_file_mut(), &references, true)
+                .map_err(|e| e.to_string())?;
+
+            let aln_path = temp_aln.path().to_str().unwrap().to_string();
+            let hmm_path = temp_hmm.path().to_str().unwrap().to_string();
+
+            // bathbuild
+            //
+            // --cpu 1 keeps each invocation single-threaded; SAPPHYRE drives
+            // this function from a multiprocessing pool, so a default of 2
+            // pthreads per call would oversubscribe (N_workers x 2 threads).
+            //
+            // --informat afa is required: bathbuild refuses to guess between
+            // aligned and unaligned FASTA and errors out rather than picking.
+            //
+            // The E-value calibration fits (200 sampled sequences each by
+            // default) are ~18% of build runtime and only populate the STATS
+            // lines. Alignment never reads those, and this model is built here,
+            // consumed by the bathalign below and then discarded, so trim the
+            // fits. 25 still fits the Gumbel/exponential tails; 1 fails
+            // outright with "failed to determine msv mu".  Do NOT copy this
+            // trim to a model the bhmm cache will hand to bathsearch.
+            let mut bathbuild = Command::new("bathbuild");
+            bathbuild
+                .args(["--informat", "afa"])
+                .args(["-n", hmm_name])
+                .args(["--cpu", "1"])
+                .args(["--EmN", "25", "--EvN", "25", "--EfN", "25"])
+                .arg(&hmm_path)
+                .arg(&aln_path);
+            run_command(&mut bathbuild, "bathbuild")?;
+
+            _aln_guard = Some(temp_aln);
+            _hmm_guard = Some(temp_hmm);
+            (aln_path, hmm_path)
+        }
+    };
+
+    // bathalign --mapali (single-threaded, like HMMER3 hmmalign — no --cpu).
+    let mut bathalign = Command::new("bathalign");
+    bathalign.args([
         "--mapali",
         &aln_path,
         "--outformat",
@@ -197,7 +249,7 @@ fn hmm_align_inner(
         &hmm_path,
         &cand_path,
     ]);
-    run_command(&mut hmmalign, "hmmalign")?;
+    run_command(&mut bathalign, "bathalign")?;
 
     // Parse and normalise output in place: '.' -> '-', uppercase residues.
     let recs = parse_fasta_file(&result_path);

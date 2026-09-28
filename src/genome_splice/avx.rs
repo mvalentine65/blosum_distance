@@ -436,55 +436,53 @@ unsafe fn backward(dsq: &[u8], om: &OProfile, xf: &Xf, fwd: &Omx, bck: &mut Omx)
     x[SB] = xb; x[SC] = 0.0; x[SJ] = 0.0; x[SN] = xn; x[SE] = 0.0; x[SSCALE] = 1.0;
 }
 
-/// Posterior decoding into bck (in place, as bathfill calls it). false on overflow.
+/// Posterior decoding into bck (in place, as bathfill calls it), and the optimal
+/// accuracy fill into fwd, one row at a time: row i is decoded and then filled
+/// while it is still in cache. false on overflow.
 #[target_feature(enable = "avx2")]
-unsafe fn decoding(l: usize, om: &OProfile, xf: &Xf, fwd: &Omx, bck: &mut Omx) -> bool {
+unsafe fn decode_optacc(l: usize, om: &OProfile, xf: &Xf, fwd: &mut Omx, bck: &mut Omx) -> bool {
     let q_ = om.q;
     let row = q_ * 3;
     let mut scaleproduct: f32 = (1.0f64 / bck.xmx[SN] as f64) as f32;
     let has_own = bck.has_own_scales;
     for q in 0..q_ * 3 { bck.dp[q] = _mm256_setzero_ps(); }
     for s in 0..5 { bck.xmx[s] = 0.0; }
-    for i in 1..=l {
-        let totrv = _mm256_set1_ps(scaleproduct * fwd.xmx[i * NX + SSCALE]);
-        let base = i * row;
-        for q in 0..q_ {
-            let mi = base + q * 3;
-            bck.dp[mi + XM] = _mm256_mul_ps(_mm256_mul_ps(fwd.dp[mi + XM], bck.dp[mi + XM]), totrv);
-            bck.dp[mi + XD] = _mm256_setzero_ps();
-            bck.dp[mi + XI] = _mm256_mul_ps(_mm256_mul_ps(fwd.dp[mi + XI], bck.dp[mi + XI]), totrv);
-        }
-        let xr = i * NX;
-        let pr = (i - 1) * NX;
-        bck.xmx[xr + SE] = 0.0;
-        bck.xmx[xr + SN] = fwd.xmx[pr + SN] * bck.xmx[xr + SN] * xf.n[LOOP] * scaleproduct;
-        bck.xmx[xr + SJ] = fwd.xmx[pr + SJ] * bck.xmx[xr + SJ] * xf.j[LOOP] * scaleproduct;
-        bck.xmx[xr + SC] = fwd.xmx[pr + SC] * bck.xmx[xr + SC] * xf.c[LOOP] * scaleproduct;
-        bck.xmx[xr + SB] = 0.0;
-        if has_own { scaleproduct *= fwd.xmx[xr + SSCALE] / bck.xmx[xr + SSCALE]; }
-    }
-    !scaleproduct.is_infinite()
-}
-
-/// Optimal accuracy fill into ox (the forward storage), from posteriors pp.
-#[target_feature(enable = "avx2")]
-unsafe fn optacc(l: usize, om: &OProfile, xf: &Xf, pp: &Omx, ox: &mut Omx) {
-    let q_ = om.q;
-    let row = q_ * 3;
+    // Forward's N, J, C of the previous row: the fill overwrites them
+    let mut fprev = [fwd.xmx[SN], fwd.xmx[SJ], fwd.xmx[SC]];
     let zerov = _mm256_setzero_ps();
     let infv = _mm256_set1_ps(f32::NEG_INFINITY);
     let rs = |v: __m256| _mm256_blend_ps::<0x01>(rightshiftz(v), infv);
     let t = &om.tfv;
     let gt = |v: __m256| _mm256_cmp_ps::<_CMP_GT_OQ>(v, zerov);
+    let (pp, ox) = (bck, fwd);
     for q in 0..q_ { ox.dp[q * 3 + XM] = infv; ox.dp[q * 3 + XI] = infv; ox.dp[q * 3 + XD] = infv; }
     ox.xmx[SE] = f32::NEG_INFINITY; ox.xmx[SN] = 0.0; ox.xmx[SJ] = f32::NEG_INFINITY; ox.xmx[SB] = 0.0; ox.xmx[SC] = f32::NEG_INFINITY;
     for i in 1..=l {
+        let xr = i * NX;
+        let pr = (i - 1) * NX;
+        // decoding
+        let totrv = _mm256_set1_ps(scaleproduct * ox.xmx[xr + SSCALE]);
+        let base = i * row;
+        for q in 0..q_ {
+            let mi = base + q * 3;
+            pp.dp[mi + XM] = _mm256_mul_ps(_mm256_mul_ps(ox.dp[mi + XM], pp.dp[mi + XM]), totrv);
+            pp.dp[mi + XD] = _mm256_setzero_ps();
+            pp.dp[mi + XI] = _mm256_mul_ps(_mm256_mul_ps(ox.dp[mi + XI], pp.dp[mi + XI]), totrv);
+        }
+        pp.xmx[xr + SE] = 0.0;
+        pp.xmx[xr + SN] = fprev[0] * pp.xmx[xr + SN] * xf.n[LOOP] * scaleproduct;
+        pp.xmx[xr + SJ] = fprev[1] * pp.xmx[xr + SJ] * xf.j[LOOP] * scaleproduct;
+        pp.xmx[xr + SC] = fprev[2] * pp.xmx[xr + SC] * xf.c[LOOP] * scaleproduct;
+        pp.xmx[xr + SB] = 0.0;
+        fprev = [ox.xmx[xr + SN], ox.xmx[xr + SJ], ox.xmx[xr + SC]];
+        if has_own { scaleproduct *= ox.xmx[xr + SSCALE] / pp.xmx[xr + SSCALE]; }
+        // optimal accuracy
         let pc = i * row;
         let pv = (i - 1) * row;
         let mut tp = 0usize;
         let mut dcv = infv;
         let mut xev = infv;
-        let xbv = _mm256_set1_ps(ox.xmx[(i - 1) * NX + SB]);
+        let xbv = _mm256_set1_ps(ox.xmx[pr + SB]);
         let mut mpv = rs(ox.dp[pv + (q_ - 1) * 3 + XM]);
         let mut dpv = rs(ox.dp[pv + (q_ - 1) * 3 + XD]);
         let mut ipv = rs(ox.dp[pv + (q_ - 1) * 3 + XI]);
@@ -519,8 +517,6 @@ unsafe fn optacc(l: usize, om: &OProfile, xf: &Xf, pp: &Omx, ox: &mut Omx) {
             }
         }
         for q in 0..q_ { xev = _mm256_max_ps(xev, ox.dp[pc + q * 3 + XD]); }
-        let xr = i * NX;
-        let pr = (i - 1) * NX;
         ox.xmx[xr + SE] = hmax(xev);
         let x = &mut ox.xmx;
         let t1 = if xf.j[LOOP] == 0.0 { 0.0 } else { x[pr + SJ] + pp.xmx[xr + SJ] };
@@ -534,6 +530,7 @@ unsafe fn optacc(l: usize, om: &OProfile, xf: &Xf, pp: &Omx, ox: &mut Omx) {
         let t2 = if xf.j[MOVE] == 0.0 { 0.0 } else { x[xr + SJ] };
         x[xr + SB] = t1.max(t2);
     }
+    !scaleproduct.is_infinite()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -647,8 +644,7 @@ pub fn align(p: &Profile, om: &OProfile, seq: &[u8], dp: &mut AvxDp) -> Option<(
         let p1 = l as f32 / (l as f32 + 1.0);
         let nullsc = ((l as f32) as f64 * (p1 as f64).ln() + (1.0 - p1 as f64).ln()) as f32;
         let bits = ((fwdsc - nullsc) as f64 / std::f64::consts::LN_2) as f32;
-        if !decoding(l, om, &xf, &dp.fwd, &mut dp.bck) { return None; }
-        optacc(l, om, &xf, &dp.bck, &mut dp.fwd);
+        if !decode_optacc(l, om, &xf, &mut dp.fwd, &mut dp.bck) { return None; }
         let tr = oatrace(l, om, &xf, &dp.bck, &dp.fwd);
         let mut h = AlnHit { bits, ..Default::default() };
         let trace: Vec<(usize, usize)> = tr.iter().map(|&(kk, ii)| (kk + p.a - 1, ii)).collect();

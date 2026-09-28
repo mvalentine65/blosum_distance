@@ -462,7 +462,8 @@ fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i6
 #[derive(Clone, Copy)]
 enum Ev { M { r: usize, k: usize }, S { d: usize, a: usize, ph: usize }, F { k: usize, n: usize }, I { d: usize, a: usize, ph: usize } }
 
-struct Trace { ev: Vec<Ev>, kstart: usize, kend: usize }
+/// ins: where each insert codon ends (k), for the null-run check
+struct Trace { ev: Vec<Ev>, ins: Vec<usize>, kstart: usize, kend: usize }
 
 fn traceback(t: &Tables, p: &SpliceWork) -> (f64, Trace) {
     #[derive(Clone, Copy, PartialEq)]
@@ -471,7 +472,7 @@ fn traceback(t: &Tables, p: &SpliceWork) -> (f64, Trace) {
     let (mut r, mut k) = (t.lp, 0usize);
     let mut best = NEG;
     for j in 0..w { if p.last[j] > best { best = p.last[j]; k = j; } }
-    let mut tr = Trace { ev: Vec::new(), kstart: 0, kend: k };
+    let mut tr = Trace { ev: Vec::new(), ins: Vec::new(), kstart: 0, kend: k };
     if best <= HALF { return (best, tr); }
     let mut st = St::Bin;
     let mut a_end: i64 = -1;
@@ -508,7 +509,7 @@ fn traceback(t: &Tables, p: &SpliceWork) -> (f64, Trace) {
                 }
             }
             St::X => { let v = dec(p.ptr[q], B_X); if r == 0 { return (NEG, tr); } r -= 1; st = if v == 1 { St::X } else { St::Ml }; }
-            St::Y => { let v = dec(p.ptr[q], B_Y); if k < 3 { return (NEG, tr); } k -= 3; st = if v == 1 { St::Y } else { St::Ml }; }
+            St::Y => { let v = dec(p.ptr[q], B_Y); if k < 3 { return (NEG, tr); } tr.ins.push(k); k -= 3; st = if v == 1 { St::Y } else { St::Ml }; }
             St::F => { let n = dec(p.ptr[q], B_F) as usize; tr.ev.push(Ev::F { k, n }); k -= n; st = St::Bp; }
             St::A => { a_end = k as i64 - 1; st = if dec(p.ptr[q], B_A) == 0 { St::I } else { St::Il }; k -= 1; }
             St::I => {
@@ -605,15 +606,24 @@ pub fn splice(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work
     let ins_stop = prm.stop > -100.0;
     let flo = loc.axe + prm.ext;
     let fhi = loc.bxs - prm.ext;
-    if prm.null_run {
-        let ok = frame_ok(loc, flo, if fhi > flo { fhi } else { flo });
-        kernel(&t, &ok, &in_gap, ra, rb, prm.fs, prm.skip, ins_stop, work);
-        res.null = traceback(&t, work).0;
-    }
     let ok = frame_ok(loc, 0, 0);
     kernel(&t, &ok, &in_gap, ra, rb, prm.fs, prm.skip, ins_stop, work);
     let (sc, tr) = traceback(&t, work);
     res.free = sc;
+    if prm.null_run {
+        let fhi = if fhi > flo { fhi } else { flo };
+        // a free path with no codon the null run bars is also the null run's best
+        let barred = |k: usize| {
+            let x = k as i64 - 3;
+            x >= flo && x < fhi && !(x >= loc.axs && x < loc.axe) && !(x >= loc.bxs && x < loc.bxe)
+        };
+        let uses = tr.ev.iter().any(|e| matches!(*e, Ev::M { k, .. } if barred(k))) || tr.ins.iter().any(|&k| barred(k));
+        res.null = if fhi == flo || (sc > HALF && !uses) { sc } else {
+            let ok = frame_ok(loc, flo, fhi);
+            kernel(&t, &ok, &in_gap, ra, rb, prm.fs, prm.skip, ins_stop, work);
+            traceback(&t, work).0
+        };
+    }
     if res.free > HALF {
         summarize(&t, loc, &tr, res);
         SpliceStatus::Ok

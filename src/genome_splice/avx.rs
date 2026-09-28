@@ -182,9 +182,13 @@ pub struct Omx {
 
 impl Omx {
     fn grow(&mut self, rows: usize, q: usize) {
+        self.grow2(rows, rows, q);
+    }
+    /// dp rows and special-state rows apart: a rolling Forward keeps two dp rows
+    fn grow2(&mut self, rows: usize, xrows: usize, q: usize) {
         let n = rows * q * 3;
         if self.dp.len() < n { self.dp.resize(n, unsafe { _mm256_setzero_ps() }); }
-        if self.xmx.len() < rows * NX { self.xmx.resize(rows * NX, 0.0); }
+        if self.xmx.len() < xrows * NX { self.xmx.resize(xrows * NX, 0.0); }
     }
 }
 
@@ -202,8 +206,10 @@ fn xf_for(om: &OProfile, l: usize) -> Xf {
     Xf { n: [pmove, ploop], c: [pmove, ploop], j: [pmove, ploop], e: [om.e_move, om.e_loop] }
 }
 
+/// ROLL: two dp rows (row i in slot i & 1), for callers that want only the
+/// score or the special states; the arithmetic is the same.
 #[target_feature(enable = "avx2")]
-unsafe fn forward(dsq: &[u8], om: &OProfile, xf: &Xf, ox: &mut Omx) -> f32 {
+unsafe fn forward<const ROLL: bool>(dsq: &[u8], om: &OProfile, xf: &Xf, ox: &mut Omx) -> f32 {
     let l = dsq.len() - 1; // dsq[1..=l]
     let q_ = om.q;
     let row = q_ * 3;
@@ -215,8 +221,7 @@ unsafe fn forward(dsq: &[u8], om: &OProfile, xf: &Xf, ox: &mut Omx) -> f32 {
     x[SE] = xe; x[SN] = xn; x[SJ] = xj; x[SB] = xb; x[SC] = xc; x[SSCALE] = 1.0;
     ox.totscale = 0.0;
     for i in 1..=l {
-        let pc = i * row;
-        let pp = (i - 1) * row;
+        let (pc, pp) = if ROLL { ((i & 1) * row, ((i - 1) & 1) * row) } else { (i * row, (i - 1) * row) };
         let rp = dsq[i] as usize * q_;
         let mut tp = 0usize;
         let mut dcv = zerov;
@@ -639,7 +644,7 @@ pub fn align(p: &Profile, om: &OProfile, seq: &[u8], dp: &mut AvxDp) -> Option<(
     dp.fwd.grow(l + 1, om.q);
     dp.bck.grow(l + 1, om.q);
     unsafe {
-        let fwdsc = forward(&dsq, om, &xf, &mut dp.fwd);
+        let fwdsc = forward::<false>(&dsq, om, &xf, &mut dp.fwd);
         backward(&dsq, om, &xf, &dp.fwd, &mut dp.bck);
         let p1 = l as f32 / (l as f32 + 1.0);
         let nullsc = ((l as f32) as f64 * (p1 as f64).ln() + (1.0 - p1 as f64).ln()) as f32;
@@ -667,8 +672,8 @@ pub fn fwd_lnc(om: &OProfile, seq: &[u8], dp: &mut AvxDp) -> Vec<f64> {
     dsq.push(0u8);
     dsq.extend_from_slice(seq);
     let xf = xf_for(om, l);
-    dp.fwd.grow(l + 1, om.q);
-    unsafe { forward(&dsq, om, &xf, &mut dp.fwd); }
+    dp.fwd.grow2(2, l + 1, om.q);
+    unsafe { forward::<true>(&dsq, om, &xf, &mut dp.fwd); }
     let mut cum = 0.0f64;
     for i in 1..=l {
         cum += (dp.fwd.xmx[i * NX + SSCALE] as f64).ln();
@@ -685,9 +690,9 @@ pub fn fwd_bits(om: &OProfile, seq: &[u8], dp: &mut AvxDp) -> f32 {
     dsq.push(0u8);
     dsq.extend_from_slice(seq);
     let xf = xf_for(om, l);
-    dp.fwd.grow(l + 1, om.q);
+    dp.fwd.grow2(2, l + 1, om.q);
     unsafe {
-        let fwdsc = forward(&dsq, om, &xf, &mut dp.fwd);
+        let fwdsc = forward::<true>(&dsq, om, &xf, &mut dp.fwd);
         let p1 = l as f32 / (l as f32 + 1.0);
         let nullsc = ((l as f32) as f64 * (p1 as f64).ln() + (1.0 - p1 as f64).ln()) as f32;
         ((fwdsc - nullsc) as f64 / std::f64::consts::LN_2) as f32

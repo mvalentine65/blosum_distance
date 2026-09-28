@@ -1,0 +1,242 @@
+//! ORF stage: align stop-to-stop ORFs to the missing nodes of a window, judge
+//! and dedup them; anchor frame detection and trimming.
+
+use super::align::{residue_code, AlnHit, Dp, Profile};
+use super::chain::{ChainExon, SRC_ORF};
+use super::hmm::Hmm;
+use super::sites::{revcomp, translate};
+use std::fmt::Write as _;
+
+pub struct OrfOpts {
+    pub margin: i64,
+    pub min_aa: usize,
+    pub thr: f32,
+    pub near: i64,
+    pub revthr: f32,
+    pub minm: i32,
+    pub all: bool,
+    pub decoy: bool,
+    pub overlap: i64,
+    pub anchored: bool,
+    /// flank windows: charge log2(1 + ORFs nearer the anchor) instead of log2(ORFs)
+    pub rank: bool,
+}
+
+/// A profile slice kept while consecutive calls use the same model and nodes.
+/// With AVX2 the striped profile runs BATH's SIMD path; otherwise the generic one.
+#[derive(Default)]
+pub struct Aligner {
+    key: Option<(usize, usize, usize)>,
+    prof: Option<Profile>,
+    #[cfg(target_arch = "x86_64")]
+    oprof: Option<super::avx::OProfile>,
+    #[cfg(target_arch = "x86_64")]
+    avxdp: super::avx::AvxDp,
+    pub dp: Dp,
+    /// spliced-aligner buffers, reused across junctions
+    pub sw: super::splice::SpliceWork,
+}
+
+impl Aligner {
+    pub fn set(&mut self, hmm_id: usize, hmm: &Hmm, a: usize, b: usize) {
+        if self.key == Some((hmm_id, a, b)) {
+            return;
+        }
+        let p = Profile::new(hmm, a, b);
+        #[cfg(target_arch = "x86_64")]
+        { self.oprof = if super::avx::available() { Some(super::avx::OProfile::new(&p)) } else { None }; }
+        self.prof = Some(p);
+        self.key = Some((hmm_id, a, b));
+    }
+    fn run(&mut self, pep: &[u8]) -> (AlnHit, Vec<(usize, usize)>) {
+        let seq: Vec<u8> = pep.iter().map(|&c| residue_code(c)).collect();
+        let p = self.prof.as_ref().unwrap();
+        #[cfg(target_arch = "x86_64")]
+        if let Some(om) = self.oprof.as_ref() {
+            if let Some(r) = super::avx::align(p, om, &seq, &mut self.avxdp) { return r; }
+        }
+        super::align::align_both(p, &seq, &mut self.dp)
+    }
+    /// ln C per residue of `pep` against the current slice (see avx::fwd_lnc).
+    pub fn fwd_lnc(&mut self, pep: &[u8]) -> Vec<f64> {
+        let seq: Vec<u8> = pep.iter().map(|&c| residue_code(c)).collect();
+        #[cfg(target_arch = "x86_64")]
+        if let Some(om) = self.oprof.as_ref() { return super::avx::fwd_lnc(om, &seq, &mut self.avxdp); }
+        super::align::fwd_lnc(self.prof.as_ref().unwrap(), &seq, &mut self.dp)
+    }
+    /// Forward bits of `pep` against the current slice.
+    pub fn fwd_bits(&mut self, pep: &[u8]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(om) = self.oprof.as_ref() {
+            let seq: Vec<u8> = pep.iter().map(|&c| residue_code(c)).collect();
+            return super::avx::fwd_bits(om, &seq, &mut self.avxdp);
+        }
+        self.one(pep).bits
+    }
+    pub fn one(&mut self, pep: &[u8]) -> AlnHit {
+        self.run(pep).0
+    }
+}
+
+pub fn translate_frame(nt: &[u8], f: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nt.len() / 3 + 1);
+    let mut i = f;
+    while i + 2 < nt.len() {
+        out.push(translate(&nt[i..i + 3]));
+        i += 3;
+    }
+    out
+}
+
+/// Frame (0-2 from the anchor's first base) whose translation best aligns to
+/// nodes k1..k2; stops read as X. With keep > 0, also the kept span next to
+/// the junction (side 0: A keeps its tail; side 1: B keeps its head) and the
+/// node the cut falls at. Returns (frame relative to lo, lo, hi, k).
+pub fn anchor_frame(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, nt: &[u8], k1: usize, k2: usize,
+                    side: i32, keep: usize, pad: i64) -> (i64, i64, i64, usize) {
+    let n = nt.len() as i64;
+    let (mut lo, mut hi) = (0i64, n);
+    let mut kcut = if side == 0 { k1 } else { k2 };
+    al.set(hmm_id, hmm, k1, k2);
+    let (mut best, mut bsc) = (0usize, f32::NEG_INFINITY);
+    let frames: Vec<Vec<u8>> = (0..3)
+        .map(|f| translate_frame(nt, f).into_iter().map(|c| if c == b'*' { b'X' } else { c }).collect())
+        .collect();
+    // frame by Forward alone (the bits a full run reports); only the best one is decoded
+    for f in 0..3 {
+        if frames[f].is_empty() {
+            continue;
+        }
+        let b = al.fwd_bits(&frames[f]);
+        if b > bsc {
+            bsc = b;
+            best = f;
+        }
+    }
+    if keep > 0 && k2 + 1 - k1 > keep {
+        // frame 0 when none scored
+        let tr = al.one_trace(&frames[best]);
+        let cut = if side == 0 { k2 - keep + 1 } else { k1 + keep - 1 };
+        let mut res = 0usize;
+        for &(node, i) in &tr {
+            if side == 0 && node >= cut { res = i; break; }
+            if side == 1 && node <= cut { res = i; }
+        }
+        if res > 0 {
+            if side == 0 { lo = (best as i64 + 3 * (res as i64 - 1) - pad).max(0); } else { hi = (best as i64 + 3 * res as i64 + pad).min(n); }
+            kcut = cut;
+        }
+    }
+    ((((best as i64 - lo) % 3) + 3) % 3, lo, hi, kcut)
+}
+
+impl Aligner {
+    /// Matched (node, residue) pairs of the optimal-accuracy path.
+    pub fn one_trace(&mut self, pep: &[u8]) -> Vec<(usize, usize)> {
+        self.run(pep).1
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Cand {
+    slo: i64,
+    shi: i64,
+    nmatch: i32,
+    kf: i32,
+    kl: i32,
+    dist: i64,
+    kept: bool,
+    bits: f32,
+    margin: f32,
+}
+
+/// One gap/flank window (+ strand sequence). Rows go to `out`; kept exons to `kept`.
+#[allow(clippy::too_many_arguments)]
+pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, o: &OrfOpts, id: &str, lead: &str, goff: i64,
+                  strand: u8, a0: i64, b0: i64, mut alo: i64, mut ahi: i64, wseq: &[u8],
+                  out: &mut String, kept: &mut Vec<ChainExon>) {
+    let w = wseq.len() as i64;
+    let s: Vec<u8> = if strand == b'-' {
+        let t1 = if alo != 0 { w - alo + 1 } else { 0 };
+        let t2 = if ahi != 0 { w - ahi + 1 } else { 0 };
+        alo = t1;
+        ahi = t2;
+        revcomp(wseq)
+    } else {
+        wseq.to_vec()
+    };
+    let up = (alo > 0 && alo <= w / 2) || (ahi > 0 && ahi <= w / 2);
+    let dn = alo > w / 2 || ahi > w / 2;
+    let a = 1.max(a0 - o.margin - if up { o.overlap } else { 0 });
+    let b = (hmm.m as i64).min(b0 + o.margin + if dn { o.overlap } else { 0 });
+    if b < a {
+        return;
+    }
+    let one_sided = o.anchored && up != dn;
+    let mut cands: Vec<Cand> = Vec::new();
+    let mut score = |aa: &[u8], start: i64, cands: &mut Vec<Cand>| {
+        let n = aa.len() as i64;
+        let ra: Vec<u8> = aa.iter().rev().copied().collect();
+        let (mut ca, mut cb) = (a, b);
+        if one_sided {
+            if up { cb = b.min(a + n + 10) } else { ca = a.max(b - n - 10) }
+        }
+        al.set(hmm_id, hmm, ca as usize, cb as usize);
+        let (fh, rh) = if o.decoy { (al.one(&ra), al.one(aa)) } else { (al.one(aa), al.one(&ra)) };
+        let olo = start + 1;
+        let ohi = start + 3 * n;
+        let slo = if fh.nmatch > 0 { start + 3 * (fh.rf as i64 - 1) + 1 } else { olo };
+        let shi = if fh.nmatch > 0 { start + 3 * fh.rl as i64 } else { ohi };
+        let mut d = 1i64 << 30;
+        if alo > 0 { d = d.min(if slo > alo { slo - alo } else if alo > shi { alo - shi } else { 0 }); }
+        if ahi > 0 { d = d.min(if ahi > shi { ahi - shi } else if slo > ahi { slo - ahi } else { 0 }); }
+        cands.push(Cand { slo, shi, nmatch: fh.nmatch, kf: fh.kf, kl: fh.kl, dist: d, kept: false, bits: fh.bits, margin: fh.bits - rh.bits });
+    };
+    for f in 0..3usize {
+        let mut aa: Vec<u8> = Vec::new();
+        let mut start = f as i64;
+        let mut i = f;
+        while i + 2 < s.len() {
+            let c = translate(&s[i..i + 3]);
+            if c != b'*' {
+                aa.push(c);
+            } else {
+                if aa.len() >= o.min_aa { score(&aa, start, &mut cands); }
+                aa.clear();
+                start = i as i64 + 3;
+            }
+            i += 3;
+        }
+        if aa.len() >= o.min_aa { score(&aa, start, &mut cands); }
+    }
+    let adj = if cands.len() > 1 { (cands.len() as f32).log2() } else { 0.0 };
+    let flank = up != dn;
+    for n in 0..cands.len() {
+        let a = if o.rank && flank {
+            let d = cands[n].dist;
+            (1.0 + cands.iter().filter(|x| x.dist < d).count() as f32).log2()
+        } else { adj };
+        let c = &mut cands[n];
+        c.kept = c.margin >= o.revthr && c.nmatch >= o.minm && (c.bits - a >= o.thr || c.dist <= o.near);
+    }
+    cands.sort_by(|x, y| y.bits.partial_cmp(&x.bits).unwrap_or(std::cmp::Ordering::Equal));
+    for k in 0..cands.len() {
+        if !cands[k].kept { continue; }
+        for kk in 0..k {
+            if !cands[kk].kept { continue; }
+            let ov = cands[k].kl.min(cands[kk].kl) - cands[k].kf.max(cands[kk].kf) + 1;
+            let sh = (cands[k].kl - cands[k].kf).min(cands[kk].kl - cands[kk].kf) + 1;
+            if 2 * ov > sh { cands[k].kept = false; break; }
+        }
+    }
+    for c in &cands {
+        if !c.kept && !o.all { continue; }
+        let (mut slo, mut shi) = (c.slo, c.shi);
+        if strand == b'-' { slo = w - c.shi + 1; shi = w - c.slo + 1; }
+        let _ = writeln!(out, "{lead}\t{}\t{}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{id}", goff + slo, goff + shi,
+                         c.bits, c.margin, c.nmatch, c.kf, c.kl, c.dist, c.kept as i32);
+        if c.kept {
+            kept.push(ChainExon { start: goff + slo, end: goff + shi, k1: c.kf as i64, k2: c.kl as i64, src: SRC_ORF });
+        }
+    }
+}

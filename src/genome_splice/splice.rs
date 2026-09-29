@@ -366,7 +366,9 @@ fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i6
                 s!(bp, cr + ((k) & RM), bpv);
                 let mut yv = neg;
                 if cod_ok && (ins_stop || ck as usize != RES_STOP) {
-                    let (vo, ve) = (g!(ml, cr + ((k - 3) & RM)) + t_mi, g!(yr, cr + ((k - 3) & RM)) + t_yy);
+                    // an inserted stop costs what a matched one does
+                    let yst = if ck as usize == RES_STOP { emj[RES_STOP] } else { 0.0 };
+                    let (vo, ve) = (g!(ml, cr + ((k - 3) & RM)) + t_mi + yst, g!(yr, cr + ((k - 3) & RM)) + t_yy + yst);
                     if vo > half || ve > half {
                         if ve > vo { yk = ve; w |= 2 << B_Y; } else { yk = vo; w |= 1 << B_Y; }
                         yv = yk;
@@ -582,6 +584,11 @@ fn summarize(t: &Tables, loc: &Locus, tr: &Trace, res: &mut SpliceResult) {
             }
         }
     }
+    // stops in inserted codons are stops too
+    for &k in &tr.ins {
+        if t.codaa[k] == RES_STOP as i32 { res.nstop += 1; add(res, DIS_STOP, k as i64 - 3, 0); }
+    }
+    res.dis.sort_by_key(|d| d.pos);
     res.exons.last_mut().unwrap().hi = tr.kend as i64 - 1;
     for &q in &pos {
         if let Some(last) = res.segs.last_mut() {

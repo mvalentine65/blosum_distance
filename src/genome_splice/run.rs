@@ -88,7 +88,7 @@ impl Default for Opts {
             orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false },
             chain: ChainOpts { min_gap: 10, max_gap: 250, flank: 15000, share: true, siblings: true },
             prm: Params::default(),
-            sa: 0.0, sb: 10.0, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, ends: true, score_full: false, stop_sites: true, stop_margin: 20.0, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, refine_stop: -4.0, refine_fs: f64::NAN,
+            sa: 0.0, sb: 10.0, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, refine_stop: -4.0, refine_fs: f64::NAN,
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }

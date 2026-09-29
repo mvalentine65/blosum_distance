@@ -3,7 +3,7 @@
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
 //! .pseudo.tsv, .gff3), genomic 1-based coordinates.
 
-use super::chain::{add_exon, SRC_ALT, SRC_INPUT, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
+use super::chain::{add_exon, SRC_ALT, SRC_INPUT, SRC_ORF, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, JxStatus};
 use super::module::alternatives;
@@ -12,7 +12,7 @@ use super::pseudo::Pseudo;
 use super::refine::{junction_sites, JxSites, Refine};
 use super::gff::write_gff;
 use super::score::{score_chain, ExonScore};
-use super::splice::{Params, DIS_STOP};
+use super::splice::{Params, DIS_STOP, MIN_INTRON};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -179,6 +179,30 @@ fn masked(seq: &[u8], start: i64, mask: Option<(i64, i64)>) -> Vec<u8> {
         if i < j { s[i..j].fill(b'N'); }
     }
     s
+}
+
+/// N-terminal (flank_only) rows get no gap windows: copy in a sibling's recovered exons from gaps sharing a flank.
+fn copy_to_flank_rows(cs: &mut [Chain]) {
+    let same = |x: &ChainExon, y: &ChainExon| x.start == y.start && x.end == y.end;
+    let mut add: Vec<(usize, ChainExon)> = Vec::new();
+    for (i, c) in cs.iter().enumerate() {
+        if !c.flank_only { continue; }
+        for s in cs.iter() {
+            if s.flank_only || s.passive || s.model != c.model || s.scaffold != c.scaffold || s.strand != c.strand { continue; }
+            for w in 1..c.ex.len() {
+                let (a, b) = (&c.ex[w - 1], &c.ex[w]);
+                if !s.ex.iter().any(|x| same(x, a) || same(x, b)) { continue; }
+                let (lo, hi) = (a.end.min(b.end), a.start.max(b.start));
+                for x in &s.ex {
+                    if (x.src == SRC_SPLICE || x.src == SRC_ORF) && a.k2 < x.k2 && x.k1 < b.k1
+                        && x.start - lo - 1 >= MIN_INTRON as i64 && hi - x.end - 1 >= MIN_INTRON as i64 {
+                        add.push((i, *x));
+                    }
+                }
+            }
+        }
+    }
+    for (i, x) in add { add_exon(&mut cs[i], &x); }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -501,6 +525,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             if grew.is_empty() { break; }
             only = Some(grew);
         }
+        copy_to_flank_rows(&mut cs);
     }
     let mut cache: HashMap<String, JxOut> = HashMap::new();
     if do_fill && do_refine && o.min_rev.is_finite() {

@@ -21,7 +21,7 @@ pub const HALF: f64 = -1e17;
 const HALFBITS: f64 = 2.0 / std::f64::consts::LN_2;
 const INTRON_OPEN: f64 = -30.0;
 const NONCANON: f64 = -30.0;
-const MIN_INTRON: usize = 30;
+pub const MIN_INTRON: usize = 30;
 const SKIP_INTRON: usize = 60;
 // kernel tiling: ring columns kept per row (> SKIP_INTRON + TILE is not needed:
 // rows above are read at most 3 back, own row at most SKIP_INTRON - 1 back)

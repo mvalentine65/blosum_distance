@@ -403,6 +403,11 @@ fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, u
             alt.gene = format!("{}~m{}", c.gene, n);
             alt.alt_of = Some(format!("{}:{}-{}", c.gene, c.ex[*j].start, c.ex[*j].end));
             alt.ex[*j] = e;
+            // An N-terminal row's recovered start pieces belong to the exon being
+            // replaced, not to its alternative, which starts the row itself.
+            if c.flank_only && c.ex[..*j].iter().all(|x| x.src != SRC_INPUT) {
+                alt.ex.drain(..*j);
+            }
             new.push(alt);
         }
     }

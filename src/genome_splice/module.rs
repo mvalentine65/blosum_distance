@@ -3,7 +3,8 @@
 //! read as X, so a degraded copy aligns as one piece; its stops are left to the
 //! pseudogene stage, not held against it. A hit is an alternative by
 //! exonfinder's module rule (similar length, the same model nodes) when it
-//! scores clearly above its own reversal.
+//! beats its own reversal clearly and per residue: repeats give long hits
+//! whose score is spread thin.
 
 use super::chain::{Chain, ChainExon, SRC_ALT};
 use super::hmm::Hmm;
@@ -13,9 +14,14 @@ use super::sites::revcomp;
 /// node overlap of the smaller span (the length ratio and the overlap of the
 /// larger span are the caller's: on the hit, or later on the refined exons)
 const NODES_SMALL: f64 = 0.80;
-/// bits a hit must score above its reversal; a stretch whose best alignment
-/// scores less holds no alternative and is not searched further
+/// bits a stretch's best alignment must score to be searched further
 const MIN_BITS: f32 = 5.0;
+/// bits a hit must score above its reversal, in all and per residue
+const MIN_MARGIN: f32 = 9.0;
+const MIN_DENSITY: f32 = 0.2;
+/// a short hit may pass on less, if denser
+const SHORT_MARGIN: f32 = 6.0;
+const SHORT_DENSITY: f32 = 0.25;
 /// nt between an alternative and the exon it replaces
 const MIN_DIST: i64 = 30;
 /// nodes past the exon's own range an alternative may reach
@@ -84,7 +90,9 @@ pub fn alternatives(al: &mut Aligner, hid: usize, hmm: &Hmm, c: &Chain, j: usize
                 }
                 let hit = &aa[hs..=he];
                 let rev: Vec<u8> = hit.iter().rev().copied().collect();
-                if al.fwd_bits(hit) - al.fwd_bits(&rev) < MIN_BITS { continue; }
+                let margin = al.fwd_bits(hit) - al.fwd_bits(&rev);
+                let dens = margin / hlen as f32;
+                if dens < MIN_DENSITY || (margin < MIN_MARGIN && (margin < SHORT_MARGIN || dens < SHORT_DENSITY)) { continue; }
                 let (o1, o2) = (f as i64 + 3 * hs as i64, f as i64 + 3 * he as i64 + 2);
                 let (gs, ge) = if c.strand == b'-' { (hi - o2, hi - o1) } else { (lo + o1, lo + o2) };
                 let dist = if ge < x.start { x.start - ge - 1 } else { gs - x.end - 1 };

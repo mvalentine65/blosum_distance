@@ -4,7 +4,7 @@
 //! locus A..B. Codons inside an anchor keep its frame; no intron may enter an
 //! anchor deeper than w_in. Introns score exonerate's splice PSSMs, intron open
 //! and non-canonical penalties; phase 1/2 introns score the codon assembled
-//! across them; 1-2 nt frameshifts and skipped nodes are penalised. Scores are
+//! across them; 1-2 nt frameshifts and node-skipping introns are penalised. Scores are
 //! in half-bits. This is the Viterbi of SAPPHYRE's forced_splice (after
 //! exonerate 2.4.0, GPL-3+, Guy St.C. Slater). The fill stage runs it twice:
 //! free, and with no codon starting inside the gap (beyond ext nt of either
@@ -33,7 +33,8 @@ const TILE: usize = 32;
 pub struct Params {
     pub stop: f64,
     pub fs: f64,
-    pub skip: f64,
+    /// once per intron that skips model nodes, however many
+    pub skip_open: f64,
     pub w_in: i64,
     pub ext: i64,
     pub max_cells: i64,
@@ -45,7 +46,7 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Params { stop: -1000.0, fs: -28.0, skip: -1.0, w_in: 60, ext: 45, max_cells: 40_000_000, xsc: -4.0, slack: 15, null_run: true, min_gap_nt: 30 }
+        Params { stop: -1000.0, fs: -28.0, skip_open: -20.0, w_in: 60, ext: 45, max_cells: 40_000_000, xsc: -4.0, slack: 15, null_run: true, min_gap_nt: 30 }
     }
 }
 
@@ -279,25 +280,25 @@ unsafe fn fold_avx<const N: usize>(o: &[f64; N], od: &[i32; N], a: f64, em: &[f6
 /// at each acceptor the row folds those into h1/h2, scored with the next node.
 /// Every row buffer and pointer word is written once per cell.
 #[allow(clippy::too_many_arguments)]
-fn kernel(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i64, rb: i64, fs: f64, skip: f64, ins_stop: bool, p: &mut SpliceWork) {
+fn kernel(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
     #[cfg(target_arch = "x86_64")]
     if super::avx::available() {
         // same code, compiled for AVX2; plain adds and compares, so results match
-        return unsafe { kernel_avx2(t, ok, in_gap, ra, rb, fs, skip, ins_stop, p) };
+        return unsafe { kernel_avx2(t, ok, in_gap, ra, rb, fs, skip_open, ins_stop, p) };
     }
-    kernel_body::<false>(t, ok, in_gap, ra, rb, fs, skip, ins_stop, p)
+    kernel_body::<false>(t, ok, in_gap, ra, rb, fs, skip_open, ins_stop, p)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn kernel_avx2(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i64, rb: i64, fs: f64, skip: f64, ins_stop: bool, p: &mut SpliceWork) {
-    kernel_body::<true>(t, ok, in_gap, ra, rb, fs, skip, ins_stop, p)
+unsafe fn kernel_avx2(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
+    kernel_body::<true>(t, ok, in_gap, ra, rb, fs, skip_open, ins_stop, p)
 }
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i64, rb: i64, fs: f64, skip: f64, ins_stop: bool, p: &mut SpliceWork) {
+fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
     let (lp, d) = (t.lp, t.d);
     let d1 = d + 1;
     let (l_, ls) = (MIN_INTRON as i64, SKIP_INTRON as i64);
@@ -397,8 +398,9 @@ fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i6
                     let (mut v, mut pp) = (neg, 0u32);
                     if ki - 1 >= z && g!(il, cr + ((k - 1) & RM)) > half { v = g!(il, cr + ((k - 1) & RM)); pp = 1; }
                     let dd = ki - ls + 1;
-                    if dd >= z && g!(e0, cr + ((dd as usize) & RM)) > v { v = g!(e0, cr + ((dd as usize) & RM)); pp = 2; }
-                    if r > 0 && g!(il, pr + ((k) & RM)) > half && g!(il, pr + ((k) & RM)) + skip > v { v = g!(il, pr + ((k) & RM)) + skip; pp = 3; }
+                    // a node-skipping intron pays skip_open once, however many nodes it skips
+                    if dd >= z && g!(e0, cr + ((dd as usize) & RM)) + skip_open > v { v = g!(e0, cr + ((dd as usize) & RM)) + skip_open; pp = 2; }
+                    if r > 0 && g!(il, pr + ((k) & RM)) > half && g!(il, pr + ((k) & RM)) > v { v = g!(il, pr + ((k) & RM)); pp = 3; }
                     if pp > 0 { ilv = v; w |= pp << B_IL; }
                 }
                 s!(ir, cr + ((k) & RM), icv);
@@ -614,7 +616,7 @@ pub fn splice(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work
     let flo = loc.axe + prm.ext;
     let fhi = loc.bxs - prm.ext;
     let ok = frame_ok(loc, 0, 0);
-    kernel(&t, &ok, &in_gap, ra, rb, prm.fs, prm.skip, ins_stop, work);
+    kernel(&t, &ok, &in_gap, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
     let (sc, tr) = traceback(&t, work);
     res.free = sc;
     if prm.null_run {
@@ -627,7 +629,7 @@ pub fn splice(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work
         let uses = tr.ev.iter().any(|e| matches!(*e, Ev::M { k, .. } if barred(k))) || tr.ins.iter().any(|&k| barred(k));
         res.null = if fhi == flo || (sc > HALF && !uses) { sc } else {
             let ok = frame_ok(loc, flo, fhi);
-            kernel(&t, &ok, &in_gap, ra, rb, prm.fs, prm.skip, ins_stop, work);
+            kernel(&t, &ok, &in_gap, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
             traceback(&t, work).0
         };
     }

@@ -47,8 +47,8 @@ pub struct Opts {
     pub orf: OrfOpts,
     pub chain: ChainOpts,
     pub prm: Params,
-    pub sa: f64,
-    pub sb: f64,
+    /// fill: bits a gap exon needs beyond log2 of its search space (gap x missing nodes x 3)
+    pub fill_margin: f64,
     pub min_seg: i64,
     pub keep: usize,
     pub min_strict: i64,
@@ -88,7 +88,7 @@ impl Default for Opts {
             orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false },
             chain: ChainOpts { min_gap: 10, max_gap: 250, flank: 15000, share: true, siblings: true },
             prm: Params::default(),
-            sa: 0.0, sb: 10.0, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, refine_stop: -4.0, refine_fs: f64::NAN,
+            fill_margin: 4.7, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, refine_stop: -4.0, refine_fs: f64::NAN,
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
@@ -118,8 +118,7 @@ impl Opts {
             "alt_size" => self.alt_size = v,
             "alt_nodes_large" => self.alt_nodes_large = v,
             "alt_refined" => self.alt_refined = v != 0.0,
-            "sa" => self.sa = v,
-            "sb" => self.sb = v,
+            "fill_margin" => self.fill_margin = v,
             "min_seg" => self.min_seg = v as i64,
             "ext" => self.prm.ext = v as i64,
             "w_in" => self.prm.w_in = v as i64,
@@ -139,6 +138,7 @@ impl Opts {
             "join" => self.join = v != 0.0,
             "refine_stop" => self.refine_stop = v,
             "refine_fs" => self.refine_fs = v,
+            "skip_open" => self.prm.skip_open = v,
             "cpu" => self.threads = (v as usize).max(1),
             _ => return Err(format!("unknown option '{k}'")),
         }
@@ -219,10 +219,11 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
         return;
     }
     let res = &jx.res;
-    let e = res.free - res.null;
-    // the evidence needed grows with the gap actually searched (a masked part isn't)
+    // evidence in bits against log2 of the search space: gap searched (not masked) x missing nodes x 3 frames
+    let e = (res.free - res.null) / 2.0;
     let masked = mask.map_or(0, |(x, y)| (y.min(hi) - x.max(lo) + 1).max(0));
-    let need = o.sa + o.sb * ((jx.gap - masked).max(1) as f64).log2();
+    let space = (jx.gap - masked).max(1) * (b.k1 - a.k2 - 1).max(1) * 3;
+    let need = (space as f64).log2() + o.fill_margin;
     let mut segs: Vec<String> = Vec::new();
     for &(s0, s1) in &res.segs {
         if s1 - s0 + 1 < o.min_seg { continue; }
@@ -230,8 +231,8 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
         segs.push(format!("{}-{}", p.min(q), p.max(q)));
     }
     let kept = e >= need && !segs.is_empty();
-    let _ = writeln!(wo.fills, "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, st,
-                     if segs.is_empty() { "-".to_string() } else { segs.join(";") }, e, res.free, res.null, jx.gap,
+    let _ = writeln!(wo.fills, "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, st,
+                     if segs.is_empty() { "-".to_string() } else { segs.join(";") }, e, need, res.free / 2.0, res.null / 2.0, jx.gap,
                      res.nmatch, res.kf, res.kl, res.nfs, res.nstop, res.nnonc, kept as i32, jid);
     let n = res.exons.len();
     let dna = jx.dna();

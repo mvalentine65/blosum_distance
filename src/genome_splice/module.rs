@@ -30,7 +30,10 @@ fn oriented(sc: &[u8], lo: i64, hi: i64, strand: u8) -> Vec<u8> {
 
 /// Alternatives of exon j (0 < j < last) of chain c.
 /// size: least length ratio of hit to exon; nodes_large: least node overlap of the larger span.
-pub fn alternatives(al: &mut Aligner, hid: usize, hmm: &Hmm, c: &Chain, j: usize, sc: &[u8], size: f64, nodes_large: f64) -> Vec<ChainExon> {
+/// stop: other modules' block in the intron before and after the exon; each scan ends there.
+#[allow(clippy::too_many_arguments)]
+pub fn alternatives(al: &mut Aligner, hid: usize, hmm: &Hmm, c: &Chain, j: usize, sc: &[u8], size: f64, nodes_large: f64,
+                    stop: [Option<(i64, i64)>; 2]) -> Vec<ChainExon> {
     let m = hmm.m as i64;
     let x = c.ex[j];
     let (a, b) = (1.max(x.k1 - MARGIN), m.min(x.k2 + MARGIN));
@@ -48,9 +51,12 @@ pub fn alternatives(al: &mut Aligner, hid: usize, hmm: &Hmm, c: &Chain, j: usize
     if xlen == 0 { return Vec::new(); }
     let xspan = x.k2 - x.k1 + 1;
     let mut out = Vec::new();
-    for nb in [j - 1, j + 1] {
+    for (nb, stop) in [(j - 1, stop[0]), (j + 1, stop[1])] {
         let p = c.ex[nb];
-        let (lo, hi) = if p.end < x.start { (p.end + 1, x.start - 1) } else { (x.end + 1, p.start - 1) };
+        let (mut lo, mut hi) = if p.end < x.start { (p.end + 1, x.start - 1) } else { (x.end + 1, p.start - 1) };
+        if let Some((s0, s1)) = stop {
+            if p.end < x.start { lo = lo.max(s1 + 1); } else { hi = hi.min(s0 - 1); }
+        }
         if hi - lo + 1 < 3 * (size * xlen as f64) as i64 || hi as usize > sc.len() || lo < 1 { continue; }
         let s = oriented(sc, lo, hi, c.strand);
         for f in 0..3usize {

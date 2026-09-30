@@ -3,7 +3,7 @@
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
 //! .pseudo.tsv, .gff3), genomic 1-based coordinates.
 
-use super::chain::{add_exon, sibling_mask, SRC_ALT, SRC_INPUT, SRC_ORF, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
+use super::chain::{add_exon, module_block, sibling_mask, SRC_ALT, SRC_INPUT, SRC_ORF, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
 use super::sites::translate;
@@ -459,7 +459,14 @@ fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, u
         let hid = mid[&c.model];
         // with the refined test the hit only passes a loose gate here
         let (size, large) = if o.alt_refined { (ALT_LOOSE_SIZE, 0.0) } else { (o.alt_size, o.alt_nodes_large) };
-        alternatives(al, hid, &models[hid], c, j, &genome[&c.scaffold], size, large)
+        // other modules in either intron (siblings sharing p cover n, siblings sharing n cover p) end its scan
+        let (p, x, n) = (&c.ex[j - 1], &c.ex[j], &c.ex[j + 1]);
+        let gap = |u: &ChainExon, v: &ChainExon| (u.end.min(v.end) + 1, u.start.max(v.start) - 1);
+        let stop = if o.chain.siblings {
+            let ((ps, pe), (ns, ne)) = (gap(p, x), gap(x, n));
+            [module_block(cs, ci, p, ps, pe, |y| y.k2 >= n.k1), module_block(cs, ci, n, ns, ne, |y| y.k1 <= p.k2)]
+        } else { [None, None] };
+        alternatives(al, hid, &models[hid], c, j, &genome[&c.scaffold], size, large, stop)
     });
     let mut taken: HashMap<(String, u8), Vec<(i64, i64)>> = HashMap::new();
     for c in cs.iter() {

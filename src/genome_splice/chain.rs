@@ -240,6 +240,21 @@ pub fn sibling_mask(cs: &[Chain], i: usize, a: &ChainExon, b: &ChainExon, gs: i6
     span
 }
 
+/// Block of other modules in gap gs..ge of chain i: exons there of sibling chains that share `share` and pass `test`.
+pub fn module_block(cs: &[Chain], i: usize, share: &ChainExon, gs: i64, ge: i64, test: impl Fn(&ChainExon) -> bool) -> Option<(i64, i64)> {
+    let c = &cs[i];
+    let mut span: Option<(i64, i64)> = None;
+    for (k, o) in cs.iter().enumerate() {
+        if k == i || o.passive || o.model != c.model || o.scaffold != c.scaffold || o.strand != c.strand { continue; }
+        if !o.ex.iter().any(|y| y.start == share.start && y.end == share.end) { continue; }
+        for x in &o.ex {
+            if x.start < gs || x.end > ge || !test(x) || c.ex.iter().any(|y| y.start <= x.end && x.start <= y.end) { continue; }
+            span = Some(match span { Some((lo, hi)) => (lo.min(x.start), hi.max(x.end)), None => (x.start, x.end) });
+        }
+    }
+    span
+}
+
 /// Every consecutive exon pair; pairs may share a few nodes, but not one inside the other.
 pub fn chain_junctions(cs: &[Chain]) -> Vec<(usize, usize, usize)> {
     let mut j = Vec::new();

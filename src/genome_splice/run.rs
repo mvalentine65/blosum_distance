@@ -5,7 +5,8 @@
 
 use super::chain::{add_exon, sibling_mask, SRC_ALT, SRC_INPUT, SRC_ORF, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
-use super::junction::{junction, JxStatus};
+use super::junction::{junction, Junction, JxStatus};
+use super::sites::translate;
 use super::module::alternatives;
 use super::orf::{orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
@@ -208,6 +209,27 @@ fn copy_to_flank_rows(cs: &mut [Chain]) {
     for (i, x) in add { add_exon(&mut cs[i], &x); }
 }
 
+/// model nodes an intron skips before its sequence is tested as coding
+const FAKE_CUT_SKIP: i64 = 5;
+
+/// The path has an intron skipping FAKE_CUT_SKIP+ nodes whose sequence is a multiple of 3
+/// and reads without a stop in the upstream exon's frame.
+fn fake_cut(jx: &Junction) -> bool {
+    let dna = jx.dna();
+    jx.res.exons.windows(2).any(|w| {
+        let (x, y) = (&w[0], &w[1]);
+        if x.nmatch == 0 || y.nmatch == 0 || y.kf - x.kl - 1 < FAKE_CUT_SKIP { return false; }
+        let (lo, hi) = (x.hi + 1, y.lo - 1);
+        let len = hi - lo + 1;
+        if len < MIN_INTRON as i64 || len % 3 != 0 { return false; }
+        let s = lo - y.phase.max(0) as i64;
+        (0..(len + 2) / 3 + 1).all(|i| {
+            let p = s + 3 * i;
+            p < 0 || p as usize + 3 > dna.len() || p > hi || translate(&dna[p as usize..p as usize + 3]) != b'*'
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &ChainExon, b: &ChainExon, sc: &[u8],
             mask: Option<(i64, i64)>, jid: &str, ci: usize, wo: &mut WinOut) {
@@ -324,6 +346,14 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         // stops costs at least stop_margin; then the stops are real
         // nor when it trades the stops for more frameshifts
         let pj = match &jb { Some(b) if stopfree < o.stop_margin && b.res.nfs <= jx.res.nfs => b, _ => &jx };
+        // a node-skipping intron over clean in-frame sequence is more likely a divergent
+        // stretch of the exon: realign the junction without node-skipping introns
+        let jc = (pj.status == JxStatus::Ok && fake_cut(pj)).then(|| {
+            let mut p2 = if std::ptr::eq(pj, &jx) { prm } else { bar };
+            p2.skip_open = -1.0e6;
+            run(al, &p2)
+        }).filter(|c| c.status == JxStatus::Ok && c.res.nfs <= pj.res.nfs && c.res.nstop <= pj.res.nstop);
+        let pj = jc.as_ref().unwrap_or(pj);
         let sites = junction_sites(pj, lo, o.stop_sites);
         let (mut pseudo, mut dis) = (Pseudo::default(), Vec::new());
         if pj.status == JxStatus::Ok {

@@ -4,7 +4,7 @@
 //! locus A..B. Codons inside an anchor keep its frame; no intron may enter an
 //! anchor deeper than w_in. Introns score exonerate's splice PSSMs, intron open
 //! and non-canonical penalties; phase 1/2 introns score the codon assembled
-//! across them; 1-2 nt frameshifts and node-skipping introns are penalised. Scores are
+//! across them, node-skipping ones included; 1-2 nt frameshifts and node-skipping introns are penalised. Scores are
 //! in half-bits. This is the Viterbi of SAPPHYRE's forced_splice (after
 //! exonerate 2.4.0, GPL-3+, Guy St.C. Slater). The fill stage runs it twice:
 //! free, and with no codon starting inside the gap (beyond ext nt of either
@@ -202,6 +202,8 @@ const B_E: u32 = 15; // 2 bits: e (always set)
 const B_I: u32 = 17; // 2 bits: i + 1
 const B_IL: u32 = 19; // 2 bits: il + 1
 const B_A: u32 = 21; // 2 bits: a + 1
+const B_IL1: u32 = 23; // 2 bits: il1 + 1
+const B_IL2: u32 = 25; // 2 bits: il2 + 1
 
 #[inline(always)]
 fn field(w: u32, at: u32, bits: u32) -> u32 { (w >> at) & ((1 << bits) - 1) }
@@ -325,6 +327,8 @@ fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[
     let (mut h1, mut h2, mut h1dr, mut h2dr) = (vec![neg; nr], vec![neg; nr], vec![-1i32; nr], vec![-1i32; nr]);
     let (mut yr, mut bp, mut ir) = (vec![neg; nr], vec![neg; nr], vec![neg; nr]);
     let (mut e0, mut e1, mut e2) = (vec![neg; nr], vec![neg; nr], vec![neg; nr]);
+    // node-skipping introns after 1 or 2 bases of a split codon
+    let (mut il1, mut il2) = (vec![neg; nr], vec![neg; nr]);
     // open split-codon entries per row: o1, o1d, o2, o2d
     let mut ost = vec![([neg; 4], [-1i32; 4], [neg; 16], [-1i32; 16]); lp + 1];
     // per row, emissions regrouped by the acceptor-side bases: [x*4 + b] then 64 + [y*16 + c]
@@ -417,6 +421,20 @@ fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[
                 }
                 s!(ir, cr + ((k) & RM), icv);
                 s!(il, cr + ((k) & RM), ilv);
+                // phase 1/2 node-skipping introns open from the e1/e2 donors
+                let (mut il1v, mut il2v) = (neg, neg);
+                if z >= 0 {
+                    let dd = ki - ls + 1;
+                    for (ph, st, ev, bit) in [(1usize, &mut il1, &e1, B_IL1), (2usize, &mut il2, &e2, B_IL2)] {
+                        let (mut v, mut pp) = (neg, 0u32);
+                        if ki - 1 >= z && g!(st, cr + ((k - 1) & RM)) > half { v = g!(st, cr + ((k - 1) & RM)); pp = 1; }
+                        if dd >= z && g!(ev, cr + ((dd as usize) & RM)) > half && g!(ev, cr + ((dd as usize) & RM)) + skip_open > v { v = g!(ev, cr + ((dd as usize) & RM)) + skip_open; pp = 2; }
+                        if r > 0 && g!(st, pr + ((k) & RM)) > half && g!(st, pr + ((k) & RM)) > v { v = g!(st, pr + ((k) & RM)); pp = 3; }
+                        if pp > 0 { if ph == 1 { il1v = v; } else { il2v = v; } w |= pp << bit; }
+                    }
+                }
+                s!(il1, cr + ((k) & RM), il1v);
+                s!(il2, cr + ((k) & RM), il2v);
                 if k >= 1 && g!(acc, k - 1) > half {
                     let ak1 = g!(acc, k - 1);
                     let mut pa = 0u32;
@@ -464,6 +482,9 @@ fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[
                         }
                         let y = g!(tb, k + 1) as usize;
                         (h2v, h2d) = fold_any(AVX, &o2, &o2d, ak0, &em12[r][64 + y * 16..]);
+                        // a node-skipping split intron; its codon is unscored, -2 marks it for the traceback
+                        if k + 2 <= d && g!(tb, k + 2) < 4 && il1v > half && il1v + ak0 > h1v { h1v = il1v + ak0; h1d = -2; }
+                        if il2v > half && il2v + ak0 > h2v { h2v = il2v + ak0; h2d = -2; }
                     }
                 }
                 s!(h1, cr + ((k) & RM), h1v); s!(h1dr, cr + ((k) & RM), h1d);
@@ -483,7 +504,7 @@ struct Trace { ev: Vec<Ev>, ins: Vec<usize>, kstart: usize, kend: usize }
 
 fn traceback(t: &Tables, p: &SpliceWork) -> (f64, Trace) {
     #[derive(Clone, Copy, PartialEq)]
-    enum St { Bin, Ml, Bp, E, M, X, Y, F, A, I, Il }
+    enum St { Bin, Ml, Bp, E, M, X, Y, F, A, I, Il, Is }
     let w = p.w;
     let (mut r, mut k) = (t.lp, 0usize);
     let mut best = NEG;
@@ -492,6 +513,7 @@ fn traceback(t: &Tables, p: &SpliceWork) -> (f64, Trace) {
     if best <= HALF { return (best, tr); }
     let mut st = St::Bin;
     let mut a_end: i64 = -1;
+    let (mut sa, mut sph) = (0usize, 0usize);
     let limit = 4 * (t.lp + 2) * w;
     for _ in 0..limit {
         let q = r * w + k;
@@ -517,6 +539,7 @@ fn traceback(t: &Tables, p: &SpliceWork) -> (f64, Trace) {
                     let ph = if v == 5 { 1 } else { 2 };
                     let a = if ph == 1 { k - 3 } else { k - 2 };
                     let d = p.md[q];
+                    if d == -2 { sa = a; sph = ph; r -= 1; k = a; st = St::Is; continue; }
                     if d < 0 { return (NEG, tr); }
                     let d = d as usize;
                     tr.ev.push(Ev::S { d, a, ph });
@@ -539,6 +562,20 @@ fn traceback(t: &Tables, p: &SpliceWork) -> (f64, Trace) {
                 match dec(p.ptr[q], B_IL) {
                     0 => { loop { if k == 0 { return (NEG, tr); } k -= 1; if dec(p.ptr[r * w + k], B_IL) != 0 { break; } } }
                     1 => { let d = k + 1 - SKIP_INTRON; tr.ev.push(Ev::I { d, a: a_end as usize, ph: 0 }); k = d; st = St::E; }
+                    2 => { if r == 0 { return (NEG, tr); } r -= 1; }
+                    _ => return (NEG, tr),
+                }
+            }
+            St::Is => {
+                let bit = if sph == 1 { B_IL1 } else { B_IL2 };
+                match dec(p.ptr[q], bit) {
+                    0 => { loop { if k == 0 { return (NEG, tr); } k -= 1; if dec(p.ptr[r * w + k], bit) != 0 { break; } } }
+                    1 => {
+                        let d = k + 1 - SKIP_INTRON;
+                        tr.ev.push(Ev::S { d, a: sa, ph: sph });
+                        tr.ev.push(Ev::I { d, a: sa, ph: sph });
+                        k = d - sph; st = St::Bin;
+                    }
                     2 => { if r == 0 { return (NEG, tr); } r -= 1; }
                     _ => return (NEG, tr),
                 }

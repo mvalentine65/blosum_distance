@@ -5,6 +5,8 @@
 
 use super::chain::{Chain, ChainExon, SRC_INPUT, SRC_NAME};
 use super::junction::{JxStatus, Junction};
+use super::sites::revcomp;
+use super::splice::MIN_INTRON;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -49,6 +51,22 @@ pub fn junction_sites(jx: &Junction, wlo: i64, anchors: bool) -> JxSites {
 
 /// codons a joined gap may hold beyond the model nodes it skips
 const JOIN_EXTRA: f64 = 5.0;
+/// a gap shorter than this holds no real intron
+const JOIN_NO_INTRON: i64 = 50;
+/// nt an intron may reach past a joined gap into either exon
+const JOIN_SLOP: i64 = 3;
+
+/// A GT..AG intron of at least MIN_INTRON nt fits in scaffold positions lo..=hi
+/// (1-based), read on the gene strand.
+fn intron_fits(sc: &[u8], strand: u8, lo: i64, hi: i64) -> bool {
+    let (lo, hi) = ((lo - JOIN_SLOP).max(1) as usize, (hi + JOIN_SLOP).min(sc.len() as i64) as usize);
+    if hi < lo + MIN_INTRON - 1 { return false; }
+    let mut s: Vec<u8> = sc[lo - 1..hi].iter().map(|x| x.to_ascii_uppercase()).collect();
+    if strand == b'-' { s = revcomp(&s); }
+    let gt = (0..s.len() - 1).find(|&i| s[i] == b'G' && s[i + 1] == b'T');
+    let ag = (1..s.len()).rev().find(|&j| s[j - 1] == b'A' && s[j] == b'G');
+    matches!((gt, ag), (Some(i), Some(j)) if j + 1 >= i + MIN_INTRON)
+}
 
 #[derive(Clone, Debug)]
 pub struct RefExon {
@@ -174,7 +192,7 @@ impl Refine {
     /// Merge exons whose junction path is one exon: the merged exon keeps the
     /// first one's acceptor and the last one's donor. Rows of exonfill.joins.tsv
     /// (gene, merged exon, members start-end:source in gene order).
-    pub fn apply_joins(&mut self, cs: &mut [Chain]) -> String {
+    pub fn apply_joins(&mut self, cs: &mut [Chain], genome: &HashMap<String, Vec<u8>>) -> String {
         let mut rows = String::new();
         for (i, c) in cs.iter_mut().enumerate() {
             if !self.join[i].iter().any(|&x| x) { continue; }
@@ -182,10 +200,14 @@ impl Refine {
             let (mut ex, mut rf) = (Vec::with_capacity(n), Vec::with_capacity(n));
             let mut j = 0;
             // a path through a real intron can also come back as one exon; a split
-            // exon's gap holds at most a few codons beyond the nodes it skips
+            // exon's gap holds at most a few codons beyond the nodes it skips,
+            // unless it is too short for an intron or no GT..AG intron fits in it
+            let (sc, strand) = (genome.get(&c.scaffold), c.strand);
             let fits = |a: &ChainExon, b: &ChainExon| {
-                let gap = a.start.max(b.start) - a.end.min(b.end) - 1;
-                gap as f64 / 3.0 - (b.k1 - a.k2 - 1) as f64 <= JOIN_EXTRA
+                let (lo, hi) = (a.end.min(b.end) + 1, a.start.max(b.start) - 1);
+                (hi - lo + 1) as f64 / 3.0 - (b.k1 - a.k2 - 1) as f64 <= JOIN_EXTRA
+                    || hi - lo + 1 < JOIN_NO_INTRON
+                    || sc.is_some_and(|s| !intron_fits(s, strand, lo, hi))
             };
             while j < n {
                 let mut k = j;

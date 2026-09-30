@@ -585,7 +585,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
         (Some(r), Some(p))
     } else { (None, None) };
     if let (true, true, Some(r)) = (do_refine, o.join, rf.as_mut()) {
-        let s = r.apply_joins(&mut cs);
+        let s = r.apply_joins(&mut cs, &genome);
         out.buf("joins").push_str(&s);
     }
     let mut ps = ps;

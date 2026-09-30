@@ -137,6 +137,52 @@ impl Aligner {
     }
 }
 
+/// A hit this much inside short-period runs (period 1-3, >= PERIOD_RUN residues) may be a repeat,
+const MAX_PERIODIC: f32 = 0.3;
+const PERIOD_RUN: usize = 10;
+/// unless the model's consensus over the hit's nodes is at least this much the runs' residues.
+const REF_UNIT: f32 = 0.35;
+
+/// Share of residues inside runs repeating the residue p back (p = 1..3, best p), and the runs' residues.
+fn periodic(aa: &[u8]) -> (f32, [bool; 21]) {
+    let n = aa.len();
+    let (mut best, mut unit) = (0usize, [false; 21]);
+    for p in 1..=3usize {
+        if n <= p { continue; }
+        let (mut cov, mut u, mut i) = (0usize, [false; 21], 0usize);
+        while i + p < n {
+            if aa[i] != aa[i + p] { i += 1; continue; }
+            let mut j = i;
+            while j + p < n && aa[j] == aa[j + p] { j += 1; }
+            if j - i + p >= PERIOD_RUN {
+                cov += j - i + p;
+                for &c in &aa[i..j + p] { u[residue_code(c) as usize] = true; }
+            }
+            i = j;
+        }
+        if cov > best { best = cov; unit = u; }
+    }
+    (best as f32 / n.max(1) as f32, unit)
+}
+
+/// A short-period repeat (e.g. (TA)n read as IYIY) that the model's consensus at nodes k1..k2 does not share.
+pub fn is_repeat(aa: &[u8], hmm: &Hmm, k1: i64, k2: i64) -> bool {
+    let (share, unit) = periodic(aa);
+    if share < MAX_PERIODIC { return false; }
+    let (a, b) = (k1.max(1) as usize, (k2.max(0) as usize).min(hmm.m));
+    if b < a { return true; }
+    let cons = |k: usize| (0..hmm.mat[k].len()).max_by(|&x, &y| hmm.mat[k][x].total_cmp(&hmm.mat[k][y])).unwrap_or(0);
+    let n = (a..=b).filter(|&k| unit[cons(k)]).count();
+    (n as f32) / ((b - a + 1) as f32) < REF_UNIT
+}
+
+/// is_repeat for an exon (oriented nt) in its frame with the fewest stops.
+pub fn exon_is_repeat(nt: &[u8], hmm: &Hmm, k1: i64, k2: i64) -> bool {
+    (0..3).map(|f| translate_frame(nt, f)).filter(|t| !t.is_empty())
+        .min_by_key(|t| t.iter().filter(|&&c| c == b'*').count())
+        .is_some_and(|t| is_repeat(&t, hmm, k1, k2))
+}
+
 #[derive(Clone, Copy)]
 struct Cand {
     slo: i64,
@@ -148,6 +194,7 @@ struct Cand {
     kept: bool,
     bits: f32,
     margin: f32,
+    rep: bool,
 }
 
 /// One gap/flank window (+ strand sequence). Rows go to `out`; kept exons to `kept`.
@@ -190,7 +237,9 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, o: &OrfOpts, id: &
         let mut d = 1i64 << 30;
         if alo > 0 { d = d.min(if slo > alo { slo - alo } else if alo > shi { alo - shi } else { 0 }); }
         if ahi > 0 { d = d.min(if ahi > shi { ahi - shi } else if slo > ahi { slo - ahi } else { 0 }); }
-        cands.push(Cand { slo, shi, nmatch: fh.nmatch, kf: fh.kf, kl: fh.kl, dist: d, kept: false, bits: fh.bits, margin: fh.bits - rh.bits });
+        let fp: &[u8] = if o.decoy { &ra } else { aa };
+        let rep = fh.nmatch > 0 && is_repeat(&fp[(fh.rf - 1) as usize..fh.rl as usize], hmm, fh.kf as i64, fh.kl as i64);
+        cands.push(Cand { slo, shi, nmatch: fh.nmatch, kf: fh.kf, kl: fh.kl, dist: d, kept: false, bits: fh.bits, margin: fh.bits - rh.bits, rep });
     };
     for f in 0..3usize {
         let mut aa: Vec<u8> = Vec::new();
@@ -217,7 +266,7 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, o: &OrfOpts, id: &
             (1.0 + cands.iter().filter(|x| x.dist < d).count() as f32).log2()
         } else { adj };
         let c = &mut cands[n];
-        c.kept = c.margin >= o.revthr && c.nmatch >= o.minm && (c.bits - a >= o.thr || c.dist <= o.near);
+        c.kept = !c.rep && c.margin >= o.revthr && c.nmatch >= o.minm && (c.bits - a >= o.thr || c.dist <= o.near);
     }
     cands.sort_by(|x, y| y.bits.partial_cmp(&x.bits).unwrap_or(std::cmp::Ordering::Equal));
     for k in 0..cands.len() {

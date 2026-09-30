@@ -8,7 +8,7 @@ use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
 use super::sites::translate;
 use super::module::alternatives;
-use super::orf::{orf_window, Aligner, OrfOpts};
+use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
 use super::refine::{junction_sites, JxSites, Refine};
 use super::gff::write_gff;
@@ -269,6 +269,8 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
         let dn = if x.don >= 0 { lo - 1 + jx.pos(x.don) } else { 0 };
         let asite = if x.acc >= 1 { format!("{}{}", dna[x.acc as usize - 1] as char, dna[x.acc as usize] as char) } else { "--".into() };
         let dsite = if x.don >= 0 && x.don + 1 < jx.d { format!("{}{}", dna[x.don as usize] as char, dna[x.don as usize + 1] as char) } else { "--".into() };
+        // a short-period repeat (e.g. (TA)n read as IYIY) is not an exon
+        let kept = kept && (role != "gap" || !exon_is_repeat(&dna[x.lo as usize..=x.hi as usize], hmm, x.kf, x.kl));
         let _ = writeln!(wo.exons, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, st,
                          jid, i, role, p.min(q), p.max(q), ac, dn, asite, dsite, x.phase, x.nmatch, x.kf, x.kl, kept as i32);
         if kept && i > 0 && i < n - 1 && x.nmatch > 0 && x.hi - x.lo + 1 >= o.min_seg {

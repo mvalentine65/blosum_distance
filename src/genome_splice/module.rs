@@ -8,7 +8,7 @@
 
 use super::chain::{Chain, ChainExon, SRC_ALT};
 use super::hmm::Hmm;
-use super::orf::{translate_frame, Aligner};
+use super::orf::{is_repeat, translate_frame, Aligner};
 use super::sites::revcomp;
 
 /// node overlap of the smaller span (the length ratio and the overlap of the
@@ -93,6 +93,7 @@ pub fn alternatives(al: &mut Aligner, hid: usize, hmm: &Hmm, c: &Chain, j: usize
                 let margin = al.fwd_bits(hit) - al.fwd_bits(&rev);
                 let dens = margin / hlen as f32;
                 if dens < MIN_DENSITY || (margin < MIN_MARGIN && (margin < SHORT_MARGIN || dens < SHORT_DENSITY)) { continue; }
+                if is_repeat(hit, hmm, kf, kl) { continue; }
                 let (o1, o2) = (f as i64 + 3 * hs as i64, f as i64 + 3 * he as i64 + 2);
                 let (gs, ge) = if c.strand == b'-' { (hi - o2, hi - o1) } else { (lo + o1, lo + o2) };
                 let dist = if ge < x.start { x.start - ge - 1 } else { gs - x.end - 1 };

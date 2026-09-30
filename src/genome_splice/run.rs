@@ -348,11 +348,15 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         let pj = match &jb { Some(b) if stopfree < o.stop_margin && b.res.nfs <= jx.res.nfs => b, _ => &jx };
         // a node-skipping intron over clean in-frame sequence is more likely a divergent
         // stretch of the exon: realign the junction without node-skipping introns
-        let jc = (pj.status == JxStatus::Ok && fake_cut(pj)).then(|| {
+        // hits that abut across skipped nodes leave no room for an intron: the species
+        // lacks those nodes, and a skipping intron there cuts the exon (a frameshift may remain)
+        let abut = pj.status == JxStatus::Ok && pj.gap < MIN_INTRON as i64 && b.k1 - a.k2 - 1 >= FAKE_CUT_SKIP
+            && pj.res.exons.windows(2).any(|w| w[1].nmatch > 0 && w[0].nmatch > 0 && w[1].kf - w[0].kl - 1 >= FAKE_CUT_SKIP);
+        let jc = (pj.status == JxStatus::Ok && (abut || fake_cut(pj))).then(|| {
             let mut p2 = if std::ptr::eq(pj, &jx) { prm } else { bar };
             p2.skip_open = -1.0e6;
             run(al, &p2)
-        }).filter(|c| c.status == JxStatus::Ok && c.res.nfs <= pj.res.nfs && c.res.nstop <= pj.res.nstop);
+        }).filter(|c| c.status == JxStatus::Ok && (abut || c.res.nfs <= pj.res.nfs) && c.res.nstop <= pj.res.nstop);
         let pj = jc.as_ref().unwrap_or(pj);
         let sites = junction_sites(pj, lo, o.stop_sites);
         let (mut pseudo, mut dis) = (Pseudo::default(), Vec::new());

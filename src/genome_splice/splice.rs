@@ -28,6 +28,9 @@ const SKIP_INTRON: usize = 60;
 const RING: usize = 64;
 const RM: usize = RING - 1;
 const TILE: usize = 32;
+// cut: spacer columns for a cut-out gap block; no splice site within WALL_SITES of them (past both PSSMs)
+const SPACER: usize = 60;
+const WALL_SITES: i64 = 30;
 
 #[derive(Clone, Copy)]
 pub struct Params {
@@ -58,6 +61,8 @@ pub struct Locus<'a> {
     pub afo: i64, pub bfo: i64, // frame offsets from the anchor starts
     pub k1: usize, pub k2: usize, // model nodes, A's first .. B's last
     pub ak2: usize, pub bk1: usize, // A's last node, B's first
+    /// a block of the gap holding no codon, aligned as (part of) one intron: other isoforms' copies
+    pub cut: Option<(i64, i64)>,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -108,7 +113,7 @@ fn lnhb(p: f32) -> f64 {
     if p > 0.0 { (p as f64).ln() * HALFBITS } else { NEG }
 }
 
-fn tables(hmm: &Hmm, loc: &Locus, prm: &Params) -> Tables {
+fn tables(hmm: &Hmm, loc: &Locus, prm: &Params, wall: Option<(i64, i64)>) -> Tables {
     let lp = loc.k2 - loc.k1 + 1;
     let d = loc.dna.len();
     let mut em = vec![[0f64; 22]; lp];
@@ -162,6 +167,12 @@ fn tables(hmm: &Hmm, loc: &Locus, prm: &Params) -> Tables {
         }
         if core { last_core = k as i64; }
         zstart[k] = if core { -1 } else { last_core + 1 };
+    }
+    if let Some((wlo, whi)) = wall {
+        for k in (wlo - WALL_SITES).max(0)..(whi + WALL_SITES).min(d as i64) {
+            don[k as usize] = NEG;
+            acc[k as usize] = NEG;
+        }
     }
     Tables { lp, d, em, t, codaa, tb, don, acc, zstart, cod64: c64 }
 }
@@ -280,30 +291,31 @@ unsafe fn fold_avx<const N: usize>(o: &[f64; N], od: &[i32; N], a: f64, em: &[f6
 /// at each acceptor the row folds those into h1/h2, scored with the next node.
 /// Every row buffer and pointer word is written once per cell.
 #[allow(clippy::too_many_arguments)]
-fn kernel(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
+fn kernel(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
     #[cfg(target_arch = "x86_64")]
     if super::avx::available() {
         // same code, compiled for AVX2; plain adds and compares, so results match
-        return unsafe { kernel_avx2(t, ok, in_gap, ra, rb, fs, skip_open, ins_stop, p) };
+        return unsafe { kernel_avx2(t, ok, in_gap, wl, ra, rb, fs, skip_open, ins_stop, p) };
     }
-    kernel_body::<false>(t, ok, in_gap, ra, rb, fs, skip_open, ins_stop, p)
+    kernel_body::<false>(t, ok, in_gap, wl, ra, rb, fs, skip_open, ins_stop, p)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn kernel_avx2(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
-    kernel_body::<true>(t, ok, in_gap, ra, rb, fs, skip_open, ins_stop, p)
+unsafe fn kernel_avx2(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
+    kernel_body::<true>(t, ok, in_gap, wl, ra, rb, fs, skip_open, ins_stop, p)
 }
 
+/// wl: bases of the cut wall, which only an intron may consume
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
+fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
     let (lp, d) = (t.lp, t.d);
     let d1 = d + 1;
     let (l_, ls) = (MIN_INTRON as i64, SKIP_INTRON as i64);
     let (neg, half) = (NEG, HALF);
-    assert!(ok.len() == d1 && in_gap.len() == d1 && t.codaa.len() == d1 && t.tb.len() == d1 && t.don.len() == d && t.acc.len() == d);
+    assert!(ok.len() == d1 && in_gap.len() == d1 && wl.len() == d1 && t.codaa.len() == d1 && t.tb.len() == d1 && t.don.len() == d && t.acc.len() == d);
     assert!(p.ptr.len() >= (lp + 1) * d1 && p.md.len() >= (lp + 1) * d1 && p.last.len() >= d1);
     // Row state lives in per-row rings of RING columns; the fill runs in
     // column tiles, all rows per tile, so long loci stay in cache. Every read
@@ -376,10 +388,10 @@ fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], ra: i6
                     }
                 }
                 s!(yr, cr + ((k) & RM), yv);
-                if k >= 1 {
+                if k >= 1 && !g!(wl, k - 1) {
                     let mut fp = 0u32;
                     if g!(bp, cr + ((k - 1) & RM)) > half { fk = g!(bp, cr + ((k - 1) & RM)) + fs; fp = 2; }
-                    if k >= 2 && g!(bp, cr + ((k - 2) & RM)) > half && g!(bp, cr + ((k - 2) & RM)) + fs > fk { fk = g!(bp, cr + ((k - 2) & RM)) + fs; fp = 3; }
+                    if k >= 2 && !g!(wl, k - 2) && g!(bp, cr + ((k - 2) & RM)) > half && g!(bp, cr + ((k - 2) & RM)) + fs > fk { fk = g!(bp, cr + ((k - 2) & RM)) + fs; fp = 3; }
                     w |= fp << B_F;
                 }
                 let (mut e, mut pe) = (mk, 0u32);
@@ -603,20 +615,51 @@ fn summarize(t: &Tables, loc: &Locus, tr: &Trace, res: &mut SpliceResult) {
 pub enum SpliceStatus { Ok, Big, NoPath }
 
 pub fn splice(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work: &mut SpliceWork) -> SpliceStatus {
+    // cut WALL_SITES inside the block and ext + WALL_SITES clear of the anchors, so nearby sites survive
+    let keep = prm.ext + WALL_SITES;
+    let wall = loc.cut.map(|(lo, hi)| ((lo + WALL_SITES).max(loc.axe + keep), (hi - WALL_SITES).min(loc.bxs - keep)));
+    let Some((wlo, whi)) = wall.filter(|&(lo, hi)| hi - lo > SPACER as i64) else {
+        return splice_on(hmm, loc, prm, res, work, None);
+    };
+    // the block is cut out; a spacer wall keeps any path across it one intron
+    let (l, r) = (wlo as usize, whi as usize);
+    let mut dna = Vec::with_capacity(l + SPACER + loc.dna.len() - r);
+    dna.extend_from_slice(&loc.dna[..l]);
+    dna.resize(l + SPACER, b'N');
+    dna.extend_from_slice(&loc.dna[r..]);
+    let sh = whi - wlo - SPACER as i64;
+    let short = Locus { dna: &dna, bxs: loc.bxs - sh, bxe: loc.bxe - sh, cut: None, ..*loc };
+    let st = splice_on(hmm, &short, prm, res, work, Some((wlo, wlo + SPACER as i64)));
+    // back to full-locus coords: everything right of the spacer moves by sh
+    let at = wlo + SPACER as i64;
+    let m = |x: i64| if x >= at { x + sh } else { x };
+    for s in &mut res.segs { *s = (m(s.0), m(s.1)); }
+    for e in &mut res.exons { e.lo = m(e.lo); e.hi = m(e.hi); e.acc = m(e.acc); e.don = m(e.don); }
+    for x in &mut res.dis { x.pos = m(x.pos); }
+    st
+}
+
+/// wall: locus bases [lo, hi) only an intron may cross, with no splice site near
+fn splice_on(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work: &mut SpliceWork, wall: Option<(i64, i64)>) -> SpliceStatus {
     *res = SpliceResult::default();
     let d = loc.dna.len();
     let cells = (loc.k2 - loc.k1 + 2) * (d + 1);
     if cells as i64 > prm.max_cells { return SpliceStatus::Big; }
-    let t = tables(hmm, loc, prm);
+    let t = tables(hmm, loc, prm, wall);
     work.prepare(cells, d);
     let ra = (loc.ak2 as i64 - loc.k1 as i64 + 1) - prm.slack;
     let rb = (loc.bk1 as i64 - loc.k1 as i64 + 1) + prm.slack;
     let in_gap: Vec<bool> = (0..=d as i64).map(|k| k >= 3 && k - 3 >= loc.axe && k - 3 < loc.bxs).collect();
+    let (wlo, whi) = wall.unwrap_or((0, 0));
+    let wl: Vec<bool> = (0..=d as i64).map(|k| k >= wlo && k < whi).collect();
+    // codon ending at k covers bases k-3..k
+    let walled = |ok: &mut Vec<bool>| if whi > wlo { for k in (wlo + 1).max(0)..=(whi + 2).min(d as i64) { ok[k as usize] = false; } };
     let ins_stop = prm.stop > -100.0;
     let flo = loc.axe + prm.ext;
     let fhi = loc.bxs - prm.ext;
-    let ok = frame_ok(loc, 0, 0);
-    kernel(&t, &ok, &in_gap, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
+    let mut ok = frame_ok(loc, 0, 0);
+    walled(&mut ok);
+    kernel(&t, &ok, &in_gap, &wl, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
     let (sc, tr) = traceback(&t, work);
     res.free = sc;
     if prm.null_run {
@@ -628,8 +671,9 @@ pub fn splice(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work
         };
         let uses = tr.ev.iter().any(|e| matches!(*e, Ev::M { k, .. } if barred(k))) || tr.ins.iter().any(|&k| barred(k));
         res.null = if fhi == flo || (sc > HALF && !uses) { sc } else {
-            let ok = frame_ok(loc, flo, fhi);
-            kernel(&t, &ok, &in_gap, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
+            let mut ok = frame_ok(loc, flo, fhi);
+            walled(&mut ok);
+            kernel(&t, &ok, &in_gap, &wl, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
             traceback(&t, work).0
         };
     }

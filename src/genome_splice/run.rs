@@ -3,7 +3,7 @@
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
 //! .pseudo.tsv, .gff3), genomic 1-based coordinates.
 
-use super::chain::{add_exon, SRC_ALT, SRC_INPUT, SRC_ORF, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
+use super::chain::{add_exon, sibling_mask, SRC_ALT, SRC_INPUT, SRC_ORF, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, JxStatus};
 use super::module::alternatives;
@@ -215,7 +215,8 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
     let hi = a.end.max(b.end);
     let seq = masked(&sc[(lo - 1) as usize..hi as usize], lo, mask);
     let jx = junction(al, hid, hmm, &o.prm, o.keep, &seq, c.strand,
-                      a.k1, a.k2, a.start - lo + 1, a.end - lo + 1, b.k1, b.k2, b.start - lo + 1, b.end - lo + 1);
+                      a.k1, a.k2, a.start - lo + 1, a.end - lo + 1, b.k1, b.k2, b.start - lo + 1, b.end - lo + 1,
+                      mask.map(|(x, y)| (x - lo + 1, y - lo + 1)));
     let st = c.strand as char;
     if jx.status != JxStatus::Ok {
         let _ = writeln!(wo.fills, "{}\t{}\t{}\t-\t-\t{}\t{}", c.gene, c.scaffold, st, jx.status.name(), jid);
@@ -309,8 +310,11 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         let lo = a.start.min(b.start);
         let hi = a.end.max(b.end);
         let seq = &sc[(lo - 1) as usize..hi as usize];
+        // other isoforms' alternatives to a or b in the gap are aligned as intron only
+        let (gs, ge) = (a.end.min(b.end) + 1, a.start.max(b.start) - 1);
+        let cut = if o.chain.siblings { sibling_mask(cs, *ci, a, b, gs, ge, true) } else { None }.map(|(x, y)| (x - lo + 1, y - lo + 1));
         let run = |al: &mut Aligner, p: &Params| junction(al, hid, &models[hid], p, o.keep, seq, c.strand,
-                                                          a.k1, a.k2, a.start - lo + 1, a.end - lo + 1, b.k1, b.k2, b.start - lo + 1, b.end - lo + 1);
+                                                          a.k1, a.k2, a.start - lo + 1, a.end - lo + 1, b.k1, b.k2, b.start - lo + 1, b.end - lo + 1, cut);
         let jx = run(al, &prm);
         // a permissive path with no stop is also the best stop-free one
         let has_stop = jx.status == JxStatus::Ok && jx.res.dis.iter().any(|d| d.kind == DIS_STOP);

@@ -171,7 +171,7 @@ pub fn chain_windows(cs: &[Chain], genome: &HashMap<String, Vec<u8>>, o: &ChainO
                 let gs = if a.start < b.start { a.end + 1 } else { b.end + 1 };
                 let ge = if a.start < b.start { b.start - 1 } else { a.start - 1 };
                 if ge < gs || gs < 1 || ge > l { continue; }
-                let mask = if o.siblings { sibling_mask(cs, i, a, b, gs, ge) } else { None };
+                let mask = if o.siblings { sibling_mask(cs, i, a, b, gs, ge, false) } else { None };
                 w.push(Window { kind: GAP, ci: i, ia: j - 1, ib: Some(j), k1: a.k2 + 1, k2: b.k1 - 1, gs, ge, also: Vec::new(), mask });
             }
         }
@@ -211,7 +211,8 @@ pub fn chain_windows(cs: &[Chain], genome: &HashMap<String, Vec<u8>>, o: &ChainO
 /// has a twin (another such exon on the same nodes at another locus). In a
 /// module each alternative's own neighbouring exons sit next to it, outside the
 /// other alternatives' block; constitutive exons past the block stay searched.
-fn sibling_mask(cs: &[Chain], i: usize, a: &ChainExon, b: &ChainExon, gs: i64, ge: i64) -> Option<(i64, i64)> {
+/// alts_only: copies are only alternatives to a or b (half of both node spans), no twins.
+pub fn sibling_mask(cs: &[Chain], i: usize, a: &ChainExon, b: &ChainExon, gs: i64, ge: i64, alts_only: bool) -> Option<(i64, i64)> {
     let c = &cs[i];
     let same_nodes = |x: &ChainExon, e: &ChainExon| {
         let ov = x.k2.min(e.k2) - x.k1.max(e.k1) + 1;
@@ -225,8 +226,13 @@ fn sibling_mask(cs: &[Chain], i: usize, a: &ChainExon, b: &ChainExon, gs: i64, g
             if !sib.iter().any(|y| y.start == x.start && y.end == x.end) { sib.push(*x); }
         }
     }
-    let copy = |x: &ChainExon| same_nodes(x, a) || same_nodes(x, b)
-        || sib.iter().any(|y| (y.end < x.start || x.end < y.start) && same_nodes(x, y));
+    let alt = |x: &ChainExon, e: &ChainExon| {
+        let ov = x.k2.min(e.k2) - x.k1.max(e.k1) + 1;
+        2 * ov >= (x.k2 - x.k1).max(e.k2 - e.k1) + 1
+    };
+    let copy = |x: &ChainExon| if alts_only { alt(x, a) || alt(x, b) } else {
+        same_nodes(x, a) || same_nodes(x, b) || sib.iter().any(|y| (y.end < x.start || x.end < y.start) && same_nodes(x, y))
+    };
     let mut span: Option<(i64, i64)> = None;
     for x in sib.iter().filter(|x| copy(x)) {
         span = Some(match span { Some((lo, hi)) => (lo.min(x.start), hi.max(x.end)), None => (x.start, x.end) });

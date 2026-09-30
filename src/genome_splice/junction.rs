@@ -45,8 +45,10 @@ impl Junction {
 
 /// seq: + strand window; A and B nodes and window + strand extents (1-based).
 #[allow(clippy::too_many_arguments)]
+/// cut: window + strand extents (1-based) of a gap block to align as intron only
 pub fn junction(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, prm: &Params, keep: usize, seq: &[u8], strand: u8,
-                ak1: i64, mut ak2: i64, mut alo: i64, mut ahi: i64, mut bk1: i64, bk2: i64, mut blo: i64, mut bhi: i64) -> Junction {
+                ak1: i64, mut ak2: i64, mut alo: i64, mut ahi: i64, mut bk1: i64, bk2: i64, mut blo: i64, mut bhi: i64,
+                cut: Option<(i64, i64)>) -> Junction {
     let w = seq.len() as i64;
     let mut jx = Junction { status: JxStatus::Ok, s: Vec::new(), w, lo: 0, strand, gap: 0, d: 0, axe: 0, bxs: 0, res: SpliceResult::default() };
     // hits either side of a frameshift often share a node or two: split the overlap
@@ -78,6 +80,9 @@ pub fn junction(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, prm: &Params, keep: 
         dna: &jx.s[jx.lo as usize..(jx.lo + jx.d) as usize],
         axs: 0, axe, bxs, bxe: jx.d, afo, bfo,
         k1: a_k, k2: b_k, ak2: ak2 as usize, bk1: bk1 as usize,
+        // oriented, then locus coords, half-open
+        cut: cut.map(|(c0, c1)| if strand == b'-' { (w - c1 + 1, w - c0 + 1) } else { (c0, c1) })
+            .map(|(o0, o1)| (o0 - 1 - jx.lo, o1 - jx.lo)),
     };
     let mut res = SpliceResult::default();
     jx.status = match splice(hmm, &loc, prm, &mut res, &mut al.sw) {

@@ -19,8 +19,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Map f over 0..n on `threads` workers (each with its own aligner); results in index order.
-fn par_map<T: Send, F: Fn(usize, &mut Aligner) -> T + Sync>(n: usize, threads: usize, f: F) -> Vec<T> {
+/// Map f over 0..n on `threads` workers (each with its own aligner), costliest first; results in index order.
+fn par_map<T: Send, C: Fn(usize) -> i64, F: Fn(usize, &mut Aligner) -> T + Sync>(n: usize, threads: usize, cost: C, f: F) -> Vec<T> {
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(cost(i)));
     let next = AtomicUsize::new(0);
     let mut parts: Vec<Vec<(usize, T)>> = Vec::new();
     std::thread::scope(|sc| {
@@ -31,6 +33,7 @@ fn par_map<T: Send, F: Fn(usize, &mut Aligner) -> T + Sync>(n: usize, threads: u
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i >= n { break; }
+                    let i = order[i];
                     got.push((i, f(i, &mut al)));
                 }
                 got
@@ -291,7 +294,13 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         which.push(Some(idx));
     }
     let todo: Vec<usize> = (0..uniq.len()).filter(|&i| !cache.contains_key(&uniq[i].3)).collect();
-    let res: Vec<JxOut> = par_map(todo.len(), o.threads, |t, al| {
+    // the DP grid is nodes x locus length
+    let jx_cost = |t: usize| {
+        let (ci, ia, ib, _) = &uniq[todo[t]];
+        let (a, b) = (&cs[*ci].ex[*ia], &cs[*ci].ex[*ib]);
+        (b.k2 - a.k1 + 1).max(1) * (a.end.max(b.end) - a.start.min(b.start) + 1)
+    };
+    let res: Vec<JxOut> = par_map(todo.len(), o.threads, jx_cost, |t, al| {
         let (ci, ia, ib, _) = &uniq[todo[t]];
         let c = &cs[*ci];
         let (a, b) = (&c.ex[*ia], &c.ex[*ib]);
@@ -401,7 +410,12 @@ fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, u
             if seen.insert(key, todo.len()).is_none() { todo.push((ci, j)); }
         }
     }
-    let found: Vec<Vec<ChainExon>> = par_map(todo.len(), o.threads, |t, al| {
+    let trio_cost = |t: usize| {
+        let (ci, j) = todo[t];
+        let (p, n) = (&cs[ci].ex[j - 1], &cs[ci].ex[j + 1]);
+        p.end.max(n.end) - p.start.min(n.start) + 1
+    };
+    let found: Vec<Vec<ChainExon>> = par_map(todo.len(), o.threads, trio_cost, |t, al| {
         let (ci, j) = todo[t];
         let c = &cs[ci];
         let hid = mid[&c.model];
@@ -476,7 +490,8 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
         for _round in 0..=o.flank_rounds {
             let wins = chain_windows(&cs, &genome, &o.chain, only.as_ref());
             if wins.is_empty() { break; }
-            let outs: Vec<WinOut> = par_map(wins.len(), o.threads, |i, al| {
+            let win_cost = |i: usize| (wins[i].k2 - wins[i].k1 + 1).max(1) * (wins[i].ge - wins[i].gs + 1);
+            let outs: Vec<WinOut> = par_map(wins.len(), o.threads, win_cost, |i, al| {
                 let mut wo = WinOut::default();
                 let w = &wins[i];
                 let c = &cs[w.ci];
@@ -533,7 +548,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
         // drop internal recovered exons that fit their chain, at refined
         // boundaries, no better than reversed; then refine the new junctions
         let (rf0, _) = refine_all(&models, &mid, o, &cs, &genome, true, false, &mut cache, None);
-        let gated = par_map(cs.len(), o.threads, |i, al| {
+        let gated = par_map(cs.len(), o.threads, |_| 0, |i, al| {
             let c = &cs[i];
             let n = c.ex.len();
             let test = |j: usize| j > 0 && j + 1 < n && c.ex[j].src != SRC_INPUT;
@@ -572,7 +587,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
     let mut ps = ps;
     let mut es: Option<Vec<Vec<ExonScore>>> = do_score.then(|| {
         let rf = if do_refine { rf.as_ref() } else { None };
-        par_map(cs.len(), o.threads, |i, al| {
+        par_map(cs.len(), o.threads, |_| 0, |i, al| {
             let c = &cs[i];
             let spans: Vec<(i64, i64)> = (0..c.ex.len())
                 .map(|j| match rf { Some(r) => r.span(c, i, j), None => (c.ex[j].start, c.ex[j].end) })

@@ -5,7 +5,7 @@
 //!   E  gene  start  end  k1  k2
 //! Per chain, exons in model order. A gap window lies between consecutive
 //! exons missing min_gap..max_gap-1 nodes; a flank window lies beyond the
-//! first/last exon when k_lo/k_hi leave that many nodes uncovered, reaching up
+//! first/last exon when k_lo/k_hi leave min_gap..max_end-1 nodes uncovered, reaching up
 //! to `flank` nt out and stopping at the nearest other exon on the scaffold.
 
 use flate2::read::MultiGzDecoder;
@@ -128,6 +128,8 @@ pub struct Window {
 pub struct ChainOpts {
     pub min_gap: i64,
     pub max_gap: i64,
+    /// most missing nodes past a chain end for a lead/trail window
+    pub max_end: i64,
     pub flank: i64,
     /// chains sharing a flank window all get its exons (off: the first only, as the C version)
     pub share: bool,
@@ -178,7 +180,7 @@ pub fn chain_windows(cs: &[Chain], genome: &HashMap<String, Vec<u8>>, o: &ChainO
         for side in 0..2 {
             let e = if side == 0 { &c.ex[0] } else { &c.ex[c.ex.len() - 1] };
             let miss = if side == 0 { e.k1 - c.klo } else { c.khi - e.k2 };
-            if miss < o.min_gap || miss >= o.max_gap { continue; }
+            if miss < o.min_gap || miss >= o.max_end { continue; }
             let left = (side == 0) == (c.strand == b'+');
             let (mut gs, mut ge) = if left {
                 (left_bound(ivs, e.start).max(e.start - 1 - o.flank) + 1, e.start - 1)

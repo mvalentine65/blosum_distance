@@ -1,13 +1,13 @@
 //! Driver: chains in, the fill / refine / pseudo stages, the same output files
 //! as the C bathfill (<prefix>.windows.tsv, .segments.tsv, .fills.tsv,
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
-//! .pseudo.tsv, .gff3), genomic 1-based coordinates.
+//! .pseudo.tsv, .gff3) plus .rebase.tsv, genomic 1-based coordinates.
 
-use super::chain::{add_exon, module_block, sibling_mask, SRC_ALT, SRC_INPUT, SRC_ORF, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
+use super::chain::{add_exon, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_INPUT, SRC_ORF, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
 use super::sites::translate;
-use super::module::alternatives;
+use super::module::{alternatives, copies};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
 use super::refine::{junction_sites, JxSites, Refine};
@@ -208,6 +208,134 @@ fn copy_to_flank_rows(cs: &mut [Chain]) {
         }
     }
     for (i, x) in add { add_exon(&mut cs[i], &x); }
+}
+
+/// tail exons, from the first, that need a copy for a rebase (or all of a shorter tail)
+const TAIL_MIN: usize = 2;
+
+/// Longest in-order run taking one copy per exon from the first on; ties to the higher total margin.
+fn best_run(cand: &[Vec<(ChainExon, f32)>], plus: bool) -> Vec<(ChainExon, f32)> {
+    let n = cand.len();
+    if n == 0 { return Vec::new(); }
+    // per copy: run length from it, its total margin, the next exon's copy
+    let mut st: Vec<Vec<(usize, f32, Option<usize>)>> = cand.iter().map(|v| vec![(1, 0.0, None); v.len()]).collect();
+    for j in (0..n).rev() {
+        for i in 0..cand[j].len() {
+            let (e, m) = &cand[j][i];
+            let mut b = (1usize, *m, None);
+            if j + 1 < n {
+                for (k, (f, _)) in cand[j + 1].iter().enumerate() {
+                    if if plus { f.start <= e.end } else { f.end >= e.start } { continue; }
+                    let t = st[j + 1][k];
+                    if t.0 + 1 > b.0 || (t.0 + 1 == b.0 && t.1 + m > b.1) { b = (t.0 + 1, t.1 + m, Some(k)); }
+                }
+            }
+            st[j][i] = b;
+        }
+    }
+    let rank = |i: usize| (st[0][i].0, st[0][i].1);
+    let mut cur = (0..cand[0].len()).max_by(|&a, &b| rank(a).partial_cmp(&rank(b)).unwrap_or(std::cmp::Ordering::Equal));
+    let (mut out, mut j) = (Vec::new(), 0);
+    while let Some(i) = cur {
+        out.push(cand[j][i]);
+        cur = st[j][i].2;
+        j += 1;
+    }
+    out
+}
+
+/// An N-terminal row: its own start exons, then a tail of a base row's exons.
+struct TailRow {
+    ci: usize,
+    /// its own exons, before the tail
+    own: usize,
+    /// from its last own exon to the next clustered exon of the model
+    lo: i64,
+    hi: i64,
+    /// larger: nearer the tail
+    pos: i64,
+}
+
+/// A tail found again between an N-terminal row and the next N-terminal is that row's
+/// own: it takes the copies and stops being an N-terminal row, and the N-terminal rows
+/// upstream of it, which cannot splice past them, take them too. Returns the log rows.
+fn rebase_tails(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usize>, genome: &HashMap<String, Vec<u8>>, o: &Opts) -> String {
+    let mut rows: Vec<TailRow> = Vec::new();
+    let mut groups: HashMap<(String, String, u8, Vec<(i64, i64)>), Vec<usize>> = HashMap::new();
+    let found: Vec<Option<Vec<(ChainExon, f32)>>> = {
+        let key = |c: &Chain, e: &ChainExon| (c.model.clone(), c.scaffold.clone(), c.strand, e.start, e.end);
+        let mut base: HashSet<(String, String, u8, i64, i64)> = HashSet::new();
+        let mut taken: HashMap<(&str, u8), Vec<(i64, i64, &str)>> = HashMap::new();
+        for c in cs.iter().filter(|c| !c.passive) {
+            let v = taken.entry((c.scaffold.as_str(), c.strand)).or_default();
+            for e in &c.ex {
+                v.push((e.start, e.end, c.model.as_str()));
+                if !c.flank_only { base.insert(key(c, e)); }
+            }
+        }
+        for (ci, c) in cs.iter().enumerate() {
+            // a row split over scaffolds (name@n) is left alone
+            if !c.flank_only || c.passive || c.gene.contains('@') || !mid.contains_key(&c.model) || !genome.contains_key(&c.scaffold) { continue; }
+            let own = c.ex.iter().take_while(|e| !base.contains(&key(c, e))).count();
+            if own == 0 || own == c.ex.len() || c.ex[own..].iter().any(|e| !base.contains(&key(c, e))) { continue; }
+            let plus = c.strand == b'+';
+            let olo = c.ex[..own].iter().map(|e| e.start).min().unwrap();
+            let ohi = c.ex[..own].iter().map(|e| e.end).max().unwrap();
+            if c.ex[own..].iter().any(|e| if plus { e.start <= ohi } else { e.end >= olo }) { continue; }
+            let near = taken[&(c.scaffold.as_str(), c.strand)].iter().filter(|x| x.2 == c.model);
+            let (lo, hi) = if plus {
+                (ohi + 1, near.filter(|x| x.0 > ohi).map(|x| x.0).min().unwrap_or(ohi + 1) - 1)
+            } else {
+                (near.filter(|x| x.1 < olo).map(|x| x.1).max().unwrap_or(olo - 1) + 1, olo - 1)
+            };
+            let tail: Vec<(i64, i64)> = c.ex[own..].iter().map(|e| (e.start, e.end)).collect();
+            groups.entry((c.model.clone(), c.scaffold.clone(), c.strand, tail)).or_default().push(rows.len());
+            rows.push(TailRow { ci, own, lo, hi, pos: if plus { ohi } else { -olo } });
+        }
+        par_map(rows.len(), o.threads, |i| rows[i].hi - rows[i].lo, |i, al| {
+            let r = &rows[i];
+            let c = &cs[r.ci];
+            let hid = mid[&c.model];
+            let other = &taken[&(c.scaffold.as_str(), c.strand)];
+            let mut cand: Vec<Vec<(ChainExon, f32)>> = Vec::new();
+            for x in &c.ex[r.own..] {
+                let mut v = copies(al, hid, &models[hid], c.strand, x, &genome[&c.scaffold], r.lo, r.hi, o.alt_size, o.alt_nodes_large);
+                v.retain(|(e, _)| !other.iter().any(|y| e.start <= y.1 && y.0 <= e.end));
+                if v.is_empty() { break; }
+                cand.push(v);
+            }
+            let run = best_run(&cand, c.strand == b'+');
+            (!run.is_empty() && run.len() >= TAIL_MIN.min(c.ex.len() - r.own)).then_some(run)
+        })
+    };
+    // from the row nearest the tail outward: a row takes its own find, else the nearest one downstream
+    let mut plan: Vec<(usize, usize)> = Vec::new(); // row, owner row
+    for idx in groups.values() {
+        let mut idx = idx.clone();
+        idx.sort_by_key(|&i| std::cmp::Reverse(rows[i].pos));
+        let mut cur: Option<usize> = None;
+        for i in idx {
+            if found[i].is_some() { cur = Some(i); }
+            if let Some(oi) = cur { plan.push((i, oi)); }
+        }
+    }
+    plan.sort();
+    let mut log = String::new();
+    for (i, oi) in plan {
+        let (r, run) = (&rows[i], found[oi].as_ref().unwrap());
+        let owner = cs[rows[oi].ci].gene.clone();
+        let c = &mut cs[r.ci];
+        let old: Vec<String> = c.ex[r.own..].iter().map(|e| format!("{}-{}", e.start, e.end)).collect();
+        let new: Vec<String> = run.iter().map(|(e, m)| format!("{}-{}:{}-{}:{:.1}", e.start, e.end, e.k1, e.k2, m)).collect();
+        let _ = writeln!(log, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, owner, c.scaffold, c.strand as char, r.lo, r.hi,
+                         old.len(), run.len(), old.join(";"), new.join(";"));
+        c.ex.truncate(r.own);
+        c.ex.extend(run.iter().map(|(e, _)| ChainExon { src: SRC_TAIL, ..*e }));
+        sort_exons(&mut c.ex);
+        if i == oi { c.flank_only = false; }
+        c.rebased = Some(owner);
+    }
+    log
 }
 
 /// model nodes an intron skips before its sequence is tested as coding
@@ -490,6 +618,7 @@ fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, u
             let mut alt = c.clone();
             alt.gene = format!("{}~m{}", c.gene, n);
             alt.alt_of = Some(format!("{}:{}-{}", c.gene, c.ex[*j].start, c.ex[*j].end));
+            alt.rebased = None;
             alt.ex[*j] = e;
             // An N-terminal row's recovered start pieces belong to the exon being
             // replaced, not to its alternative, which starts the row itself.
@@ -533,6 +662,11 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
     if do_pseudo { out.buf("disablements"); out.buf("pseudo"); }
     if do_score { out.buf("exonscores"); }
 
+    if do_fill {
+        let s = rebase_tails(&mut cs, &models, &mid, &genome, o);
+        out.buf("rebase").push_str("# row owner scaffold strand lo hi tail found replaced copies(start-end:k1-k2:margin)\n");
+        out.buf("rebase").push_str(&s);
+    }
     if do_fill {
         // a chain that gains exons is searched again: its gaps, or past the end that grew
         let (mut base, mut only): (usize, Option<HashSet<(usize, u8)>>) = (0, None);

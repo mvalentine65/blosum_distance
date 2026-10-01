@@ -4,7 +4,8 @@
 //! pseudogene stage, not held against it. A hit is an alternative by
 //! exonfinder's module rule (similar length, the same model nodes) when it
 //! beats its own reversal clearly and per residue: repeats give long hits
-//! whose score is spread thin.
+//! whose score is spread thin. The same scan finds the copies of an
+//! N-terminal row's tail for the rebase step.
 
 use super::chain::{Chain, ChainExon, SRC_ALT};
 use super::hmm::Hmm;
@@ -34,6 +35,64 @@ fn oriented(sc: &[u8], lo: i64, hi: i64, strand: u8) -> Vec<u8> {
     if strand == b'-' { revcomp(s) } else { s.to_vec() }
 }
 
+/// Residues of exon x in its best frame (aligner set to its nodes).
+fn exon_len(al: &mut Aligner, sc: &[u8], x: &ChainExon, strand: u8) -> usize {
+    let xnt = oriented(sc, x.start, x.end, strand);
+    let (mut xb, mut xlen) = (f32::NEG_INFINITY, 0usize);
+    for f in 0..3 {
+        let t: Vec<u8> = translate_frame(&xnt, f).into_iter().map(|q| if q == b'*' { b'X' } else { q }).collect();
+        if t.is_empty() { continue; }
+        let bits = al.fwd_bits(&t);
+        if bits > xb { xb = bits; xlen = t.len(); }
+    }
+    xlen
+}
+
+/// Copies of exon x (xlen residues) in lo..hi, each with its bits over its reversal (aligner set to x's nodes).
+#[allow(clippy::too_many_arguments)]
+fn scan(al: &mut Aligner, hmm: &Hmm, strand: u8, x: &ChainExon, xlen: usize, sc: &[u8], lo: i64, hi: i64, size: f64, nodes_large: f64,
+        out: &mut Vec<(ChainExon, f32)>) {
+    if hi - lo + 1 < 3 * (size * xlen as f64) as i64 || hi as usize > sc.len() || lo < 1 { return; }
+    let xspan = x.k2 - x.k1 + 1;
+    let s = oriented(sc, lo, hi, strand);
+    for f in 0..3usize {
+        let raw = translate_frame(&s, f);
+        let aa: Vec<u8> = raw.iter().map(|&q| if q == b'*' { b'X' } else { q }).collect();
+        let mut todo = vec![(0usize, aa.len())];
+        let mut tried = 0;
+        while let Some((s0, e0)) = todo.pop() {
+            if tried >= MAX_HITS || ((e0 - s0) as f64) < size * xlen as f64 { continue; }
+            tried += 1;
+            // Forward alone settles most stretches (the bits a full run reports)
+            if al.fwd_bits(&aa[s0..e0]) < MIN_BITS { continue; }
+            let h = al.one(&aa[s0..e0]);
+            if h.nmatch == 0 || h.bits < MIN_BITS { continue; }
+            let (hs, he) = (s0 + h.rf as usize - 1, s0 + h.rl as usize - 1);
+            if hs > s0 { todo.push((s0, hs)); }
+            if he + 1 < e0 { todo.push((he + 1, e0)); }
+            let hlen = he + 1 - hs;
+            let (kf, kl) = (h.kf as i64, h.kl as i64);
+            let span = kl - kf + 1;
+            let ov = kl.min(x.k2) - kf.max(x.k1) + 1;
+            let ratio = hlen.min(xlen) as f64 / hlen.max(xlen) as f64;
+            if ratio < size || (ov as f64) < NODES_SMALL * span.min(xspan) as f64 || (ov as f64) < nodes_large * span.max(xspan) as f64 {
+                continue;
+            }
+            let hit = &aa[hs..=he];
+            let rev: Vec<u8> = hit.iter().rev().copied().collect();
+            let margin = al.fwd_bits(hit) - al.fwd_bits(&rev);
+            let dens = margin / hlen as f32;
+            if dens < MIN_DENSITY || (margin < MIN_MARGIN && (margin < SHORT_MARGIN || dens < SHORT_DENSITY)) { continue; }
+            if is_repeat(hit, hmm, kf, kl) { continue; }
+            let (o1, o2) = (f as i64 + 3 * hs as i64, f as i64 + 3 * he as i64 + 2);
+            let (gs, ge) = if strand == b'-' { (hi - o2, hi - o1) } else { (lo + o1, lo + o2) };
+            let dist = if ge < x.start { x.start - ge - 1 } else { gs - x.end - 1 };
+            if dist < MIN_DIST { continue; }
+            out.push((ChainExon { start: gs, end: ge, k1: kf, k2: kl, src: SRC_ALT }, margin));
+        }
+    }
+}
+
 /// Alternatives of exon j (0 < j < last) of chain c.
 /// size: least length ratio of hit to exon; nodes_large: least node overlap of the larger span.
 /// stop: other modules' block in the intron before and after the exon; each scan ends there.
@@ -45,17 +104,8 @@ pub fn alternatives(al: &mut Aligner, hid: usize, hmm: &Hmm, c: &Chain, j: usize
     let (a, b) = (1.max(x.k1 - MARGIN), m.min(x.k2 + MARGIN));
     if x.start < 1 || x.end as usize > sc.len() || b < a { return Vec::new(); }
     al.set(hid, hmm, a as usize, b as usize);
-    // the exon itself: its length in its best frame
-    let xnt = oriented(sc, x.start, x.end, c.strand);
-    let (mut xb, mut xlen) = (f32::NEG_INFINITY, 0usize);
-    for f in 0..3 {
-        let t: Vec<u8> = translate_frame(&xnt, f).into_iter().map(|q| if q == b'*' { b'X' } else { q }).collect();
-        if t.is_empty() { continue; }
-        let bits = al.fwd_bits(&t);
-        if bits > xb { xb = bits; xlen = t.len(); }
-    }
+    let xlen = exon_len(al, sc, &x, c.strand);
     if xlen == 0 { return Vec::new(); }
-    let xspan = x.k2 - x.k1 + 1;
     let mut out = Vec::new();
     for (nb, stop) in [(j - 1, stop[0]), (j + 1, stop[1])] {
         let p = c.ex[nb];
@@ -63,44 +113,20 @@ pub fn alternatives(al: &mut Aligner, hid: usize, hmm: &Hmm, c: &Chain, j: usize
         if let Some((s0, s1)) = stop {
             if p.end < x.start { lo = lo.max(s1 + 1); } else { hi = hi.min(s0 - 1); }
         }
-        if hi - lo + 1 < 3 * (size * xlen as f64) as i64 || hi as usize > sc.len() || lo < 1 { continue; }
-        let s = oriented(sc, lo, hi, c.strand);
-        for f in 0..3usize {
-            let raw = translate_frame(&s, f);
-            let aa: Vec<u8> = raw.iter().map(|&q| if q == b'*' { b'X' } else { q }).collect();
-            let mut todo = vec![(0usize, aa.len())];
-            let mut tried = 0;
-            while let Some((s0, e0)) = todo.pop() {
-                if tried >= MAX_HITS || ((e0 - s0) as f64) < size * xlen as f64 { continue; }
-                tried += 1;
-                // Forward alone settles most stretches (the bits a full run reports)
-                if al.fwd_bits(&aa[s0..e0]) < MIN_BITS { continue; }
-                let h = al.one(&aa[s0..e0]);
-                if h.nmatch == 0 || h.bits < MIN_BITS { continue; }
-                let (hs, he) = (s0 + h.rf as usize - 1, s0 + h.rl as usize - 1);
-                if hs > s0 { todo.push((s0, hs)); }
-                if he + 1 < e0 { todo.push((he + 1, e0)); }
-                let hlen = he + 1 - hs;
-                let (kf, kl) = (h.kf as i64, h.kl as i64);
-                let span = kl - kf + 1;
-                let ov = kl.min(x.k2) - kf.max(x.k1) + 1;
-                let ratio = hlen.min(xlen) as f64 / hlen.max(xlen) as f64;
-                if ratio < size || (ov as f64) < NODES_SMALL * span.min(xspan) as f64 || (ov as f64) < nodes_large * span.max(xspan) as f64 {
-                    continue;
-                }
-                let hit = &aa[hs..=he];
-                let rev: Vec<u8> = hit.iter().rev().copied().collect();
-                let margin = al.fwd_bits(hit) - al.fwd_bits(&rev);
-                let dens = margin / hlen as f32;
-                if dens < MIN_DENSITY || (margin < MIN_MARGIN && (margin < SHORT_MARGIN || dens < SHORT_DENSITY)) { continue; }
-                if is_repeat(hit, hmm, kf, kl) { continue; }
-                let (o1, o2) = (f as i64 + 3 * hs as i64, f as i64 + 3 * he as i64 + 2);
-                let (gs, ge) = if c.strand == b'-' { (hi - o2, hi - o1) } else { (lo + o1, lo + o2) };
-                let dist = if ge < x.start { x.start - ge - 1 } else { gs - x.end - 1 };
-                if dist < MIN_DIST { continue; }
-                out.push(ChainExon { start: gs, end: ge, k1: kf, k2: kl, src: SRC_ALT });
-            }
-        }
+        scan(al, hmm, c.strand, &x, xlen, sc, lo, hi, size, nodes_large, &mut out);
     }
+    out.into_iter().map(|(e, _)| e).collect()
+}
+
+/// Copies of exon x anywhere in lo..hi, each with its bits over its reversal.
+#[allow(clippy::too_many_arguments)]
+pub fn copies(al: &mut Aligner, hid: usize, hmm: &Hmm, strand: u8, x: &ChainExon, sc: &[u8], lo: i64, hi: i64,
+              size: f64, nodes_large: f64) -> Vec<(ChainExon, f32)> {
+    let (a, b) = (1.max(x.k1 - MARGIN), (hmm.m as i64).min(x.k2 + MARGIN));
+    let mut out = Vec::new();
+    if x.start < 1 || x.end as usize > sc.len() || b < a { return out; }
+    al.set(hid, hmm, a as usize, b as usize);
+    let xlen = exon_len(al, sc, x, strand);
+    if xlen > 0 { scan(al, hmm, strand, x, xlen, sc, lo, hi, size, nodes_large, &mut out); }
     out
 }

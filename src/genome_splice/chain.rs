@@ -7,6 +7,7 @@
 //! exons missing min_gap..max_gap-1 nodes; a flank window lies beyond the
 //! first/last exon when k_lo/k_hi leave min_gap..max_end-1 nodes uncovered, reaching up
 //! to `flank` nt out and stopping at the nearest other exon on the scaffold.
+//! Chains out carry each exon's source and the tags alt_of= and rebased=.
 
 use flate2::read::MultiGzDecoder;
 use std::collections::{HashMap, HashSet};
@@ -18,7 +19,8 @@ pub const SRC_INPUT: u8 = 0;
 pub const SRC_ORF: u8 = 1;
 pub const SRC_SPLICE: u8 = 2;
 pub const SRC_ALT: u8 = 3;
-pub const SRC_NAME: [&str; 4] = ["input", "orf", "splice", "alt"];
+pub const SRC_TAIL: u8 = 4;
+pub const SRC_NAME: [&str; 5] = ["input", "orf", "splice", "alt", "tail"];
 
 #[derive(Clone, Copy, Debug)]
 pub struct ChainExon {
@@ -43,10 +45,12 @@ pub struct Chain {
     pub imx: bool,
     /// an alternative isoform: parent chain and the start-end of the exon it replaces
     pub alt_of: Option<String>,
+    /// rebased onto a recovered tail: the chain that owns it
+    pub rebased: Option<String>,
     pub ex: Vec<ChainExon>,
 }
 
-fn sort_exons(ex: &mut [ChainExon]) {
+pub fn sort_exons(ex: &mut [ChainExon]) {
     ex.sort_by(|a, b| (a.k1, a.start).cmp(&(b.k1, b.start)));
 }
 
@@ -65,7 +69,7 @@ pub fn read_chains(path: &str) -> Result<Vec<Chain>, String> {
                 gene: f[1].into(), model: f[2].into(), scaffold: f[3].into(), strand: f[4].as_bytes()[0],
                 klo: f[5].parse().unwrap_or(0), khi: f[6].parse().unwrap_or(0),
                 flank_only: f.len() >= 8 && f[7] == "flank_only", passive: f.len() >= 8 && f[7] == "passive",
-                imx: f.len() >= 8 && f[7] == "imx", alt_of: None, ex: Vec::new(),
+                imx: f.len() >= 8 && f[7] == "imx", alt_of: None, rebased: None, ex: Vec::new(),
             });
         } else if f[0].starts_with('E') && f.len() >= 6 {
             if let Some(&i) = idx.get(f[1]) {
@@ -284,11 +288,14 @@ pub fn add_exon(c: &mut Chain, e: &ChainExon) -> bool {
 }
 
 pub fn write_chains(cs: &[Chain]) -> String {
-    let mut s = String::from("# G gene model scaffold strand k_lo k_hi [flag] [alt_of=parent:start-end]\n# E gene start end k1 k2 source\n");
+    let mut s = String::from("# G gene model scaffold strand k_lo k_hi [flag] [alt_of=parent:start-end] [rebased=owner]\n# E gene start end k1 k2 source\n");
     for c in cs {
         let flag = if c.flank_only { "\tflank_only" } else if c.passive { "\tpassive" } else if c.imx { "\timx" } else { "" };
-        let alt = c.alt_of.as_ref().map_or(String::new(), |a| format!("{}\talt_of={a}", if flag.is_empty() { "\t-" } else { "" }));
-        let _ = writeln!(s, "G\t{}\t{}\t{}\t{}\t{}\t{}{}{}", c.gene, c.model, c.scaffold, c.strand as char, c.klo, c.khi, flag, alt);
+        let mut tags = String::new();
+        if let Some(a) = &c.alt_of { let _ = write!(tags, "\talt_of={a}"); }
+        if let Some(r) = &c.rebased { let _ = write!(tags, "\trebased={r}"); }
+        let pad = if flag.is_empty() && !tags.is_empty() { "\t-" } else { "" };
+        let _ = writeln!(s, "G\t{}\t{}\t{}\t{}\t{}\t{}{}{}{}", c.gene, c.model, c.scaffold, c.strand as char, c.klo, c.khi, flag, pad, tags);
         for e in &c.ex {
             let _ = writeln!(s, "E\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, e.start, e.end, e.k1, e.k2, SRC_NAME[e.src as usize]);
         }

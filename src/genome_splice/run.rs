@@ -385,20 +385,21 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
     let mut written = vec![false; uniq.len()];
     for (n, &(ci, ia, ib)) in pairs.iter().enumerate() {
         let Some(idx) = which[n] else { continue };
-        if written[idx] { continue; }
-        written[idx] = true;
         let (c, r) = (&cs[ci], &cache[&uniq[idx].3]);
-        let _ = write!(out.buf("junctions"), "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tx{}\n", c.gene, c.scaffold, c.strand as char, ia, ib,
-                       r.status, r.gap, r.sites.n_inner, String::from_utf8_lossy(&r.sites.acc_site),
-                       String::from_utf8_lossy(&r.sites.don_site), r.sites.phase, idx);
-        if o.stop_sites && !r.stopfree.is_nan() {
-            let _ = writeln!(out.buf("stopfree"), "{}\t{}\t{}\tx{}\t{:.2}", c.gene, c.scaffold, c.strand as char, idx, r.stopfree);
-        }
+        // every chain with the junction lists its disablements
         if do_pseudo {
             for &(kind, pos, len, tight) in &r.dis {
                 let _ = writeln!(out.buf("disablements"), "{}\t{}\t{}\tx{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, c.strand as char, idx,
                                  DIS[kind], pos, len, tight as i32);
             }
+        }
+        if written[idx] { continue; }
+        written[idx] = true;
+        let _ = write!(out.buf("junctions"), "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tx{}\n", c.gene, c.scaffold, c.strand as char, ia, ib,
+                       r.status, r.gap, r.sites.n_inner, String::from_utf8_lossy(&r.sites.acc_site),
+                       String::from_utf8_lossy(&r.sites.don_site), r.sites.phase, idx);
+        if o.stop_sites && !r.stopfree.is_nan() {
+            let _ = writeln!(out.buf("stopfree"), "{}\t{}\t{}\tx{}\t{:.2}", c.gene, c.scaffold, c.strand as char, idx, r.stopfree);
         }
     }
     if do_pseudo {

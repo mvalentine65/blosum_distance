@@ -1,12 +1,12 @@
 //! Driver: chains in, the fill / refine / pseudo stages, the same output files
 //! as the C bathfill (<prefix>.windows.tsv, .segments.tsv, .fills.tsv,
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
-//! .pseudo.tsv, .gff3) plus .cut.tsv and .rebase.tsv, genomic 1-based coordinates.
+//! .pseudo.tsv, .gff3) plus .acceptor.tsv, .cut.tsv and .rebase.tsv, genomic 1-based coordinates.
 
 use super::chain::{add_exon, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_ORF, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
-use super::sites::{base, revcomp, splice_scores, translate};
+use super::sites::{base, learn_acceptor, revcomp, splice_scores, translate, AccTable, SS3_LAST};
 use super::module::{alternatives, copies};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
@@ -210,6 +210,54 @@ fn copy_to_flank_rows(cs: &mut [Chain]) {
     for (i, x) in add { add_exon(&mut cs[i], &x); }
 }
 
+/// junctions the acceptor matrix is learned from, and the nt either side read for false sites
+const LEARN_MAX: usize = 300;
+const LEARN_FLANK: i64 = 60;
+/// missing nodes (negative: shared) between the two exons of such a junction
+const LEARN_GAP: (i64, i64) = (-5, 0);
+
+/// The acceptor matrix of this genome: learned from junctions between search-stage exons whose
+/// nodes meet, refined first under the starting matrix and kept in cache. Also the log rows.
+fn learn_sites(cs: &[Chain], models: &[Hmm], mid: &HashMap<String, usize>, genome: &HashMap<String, Vec<u8>>, o: &Opts,
+               cache: &mut HashMap<String, JxOut>) -> Option<(AccTable, String)> {
+    let mut seen = HashSet::new();
+    let mut tight: Vec<(usize, usize, usize)> = Vec::new();
+    for (ci, ia, ib) in chain_junctions(cs) {
+        let c = &cs[ci];
+        let (a, b) = (&c.ex[ia], &c.ex[ib]);
+        let gap = b.k1 - a.k2 - 1;
+        if c.passive || a.src != SRC_INPUT || b.src != SRC_INPUT || gap < LEARN_GAP.0 || gap > LEARN_GAP.1 { continue; }
+        if !genome.contains_key(&c.scaffold) || !mid.contains_key(&c.model) { continue; }
+        if seen.insert(jx_key(c, a, b)) { tight.push((ci, ia, ib)); }
+    }
+    // spread over the run
+    let step = (tight.len() / LEARN_MAX).max(1);
+    let pick: Vec<(usize, usize, usize)> = tight.into_iter().step_by(step).take(LEARN_MAX).collect();
+    refine_all(models, mid, o, cs, genome, true, false, cache, None, Some(&pick));
+    let (fl, last) = (LEARN_FLANK, SS3_LAST);
+    let mut wins: Vec<Vec<u8>> = Vec::new();
+    for &(ci, ia, ib) in &pick {
+        let c = &cs[ci];
+        let Some(r) = cache.get(&jx_key(c, &c.ex[ia], &c.ex[ib])) else { continue };
+        let s = &r.sites;
+        if !s.ok || !s.acc_site.eq_ignore_ascii_case(b"AG") || !s.don_site.eq_ignore_ascii_case(b"GT") { continue; }
+        let sc = &genome[&c.scaffold];
+        // the acceptor's G, and the window around it on the gene strand
+        let (lo, hi) = if c.strand == b'-' { (s.acc_g - fl, s.acc_g + 1 + last + fl) } else { (s.acc_g - 1 - last - fl, s.acc_g + fl) };
+        if lo < 1 || hi > sc.len() as i64 { continue; }
+        let fwd = &sc[(lo - 1) as usize..hi as usize];
+        let nt = if c.strand == b'-' { revcomp(fwd) } else { fwd.to_vec() };
+        let w: Vec<u8> = nt.iter().map(|&x| base(x)).collect();
+        if w[(fl + last - 1) as usize] == 0 && w[(fl + last) as usize] == 2 { wins.push(w); }
+    }
+    let t = learn_acceptor(&wins, fl as usize)?;
+    let mut log = format!("# acceptor log-odds learned from {} junctions; position A C G T\n", wins.len());
+    for (i, r) in t.iter().enumerate() {
+        let _ = writeln!(log, "{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}", i as i64 - last, r[0], r[1], r[2], r[3]);
+    }
+    Some((t, log))
+}
+
 /// splice score (donor + acceptor) an intron read through by an exon must reach
 const CUT_SCORE: f64 = 12.0;
 /// share of that intron's residues sitting on no model node
@@ -224,14 +272,14 @@ const CUT_SURPLUS: i64 = 5;
 
 /// The best in-frame GT/GC..AG pair inside exon e, when it scores CUT_SCORE and leaves two
 /// pieces: (score, donor G, acceptor G) as offsets on the gene strand.
-fn cut_sites(sc: &[u8], strand: u8, e: &ChainExon) -> Option<(f64, usize, usize)> {
+fn cut_sites(sc: &[u8], strand: u8, e: &ChainExon, acc: &AccTable) -> Option<(f64, usize, usize)> {
     let n = (e.end - e.start + 1) as usize;
     if e.start < 1 || e.end as usize > sc.len() { return None; }
     let fwd = &sc[(e.start - 1) as usize..e.end as usize];
     let nt = if strand == b'-' { revcomp(fwd) } else { fwd.to_vec() };
     let t: Vec<u8> = nt.iter().map(|&b| base(b)).collect();
     let (mut ss5, mut ss3) = (vec![0f64; n], vec![0f64; n]);
-    splice_scores(&t, &mut ss5, &mut ss3);
+    splice_scores(&t, acc, &mut ss5, &mut ss3);
     let mut best: Option<(f64, usize, usize)> = None;
     for i in 3..n.saturating_sub(6) {
         if t[i] != 2 || (t[i + 1] != 3 && t[i + 1] != 1) || ss5[i] < 2.0 { continue; }
@@ -286,7 +334,7 @@ fn cut_read_through(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usiz
     let found: Vec<Option<Cut>> = par_map(todo.len(), o.threads, |t| cs[todo[t].0].ex[todo[t].1].end - cs[todo[t].0].ex[todo[t].1].start, |t, al| {
         let (c, e) = (&cs[todo[t].0], &cs[todo[t].0].ex[todo[t].1]);
         let (hid, sc) = (mid[&c.model], &genome[&c.scaffold]);
-        let site = cut_sites(sc, c.strand, e)?;
+        let site = cut_sites(sc, c.strand, e, &o.prm.acc)?;
         let one = Chain { ex: vec![*e], ..c.clone() };
         let es = score_chain(al, hid, &models[hid], &one, &[(e.start, e.end)], sc, true, false, |_| false);
         find_cut(c.strand, e, &es[0], site)
@@ -533,11 +581,16 @@ struct JxOut {
     stopfree: f64,
 }
 
-/// Refine every junction of the chains. Junctions already in `cache` are not
-/// aligned again. Rows go to `out` when given.
+fn jx_key(c: &Chain, a: &ChainExon, b: &ChainExon) -> String {
+    format!("{}|{}|{}|{}|{}|{}|{}", c.model, c.scaffold, c.strand as char, a.start, a.end, b.start, b.end)
+}
+
+/// Refine every junction of the chains, or only those of `subset`. Junctions already
+/// in `cache` are not aligned again. Rows go to `out` when given.
 #[allow(clippy::too_many_arguments)]
 fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chain], genome: &HashMap<String, Vec<u8>>,
-              _do_refine: bool, do_pseudo: bool, cache: &mut HashMap<String, JxOut>, out: Option<&mut Out>) -> (Refine, Vec<Pseudo>) {
+              _do_refine: bool, do_pseudo: bool, cache: &mut HashMap<String, JxOut>, out: Option<&mut Out>,
+              subset: Option<&[(usize, usize, usize)]>) -> (Refine, Vec<Pseudo>) {
     let mut prm = o.prm;
     prm.stop = o.refine_stop; if !o.refine_fs.is_nan() { prm.fs = o.refine_fs; } prm.xsc = 0.0; prm.null_run = false; prm.min_gap_nt = 0; // annotate, as forced_splice
     // stop-free path for splice sites (inserts may not hold stops either)
@@ -545,7 +598,7 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
     bar.stop = -1000.0;
     const DIS: [&str; 3] = ["fs", "stop", "noncanonical"];
     // distinct junctions, in order of first appearance
-    let pairs = chain_junctions(cs);
+    let pairs = subset.map_or_else(|| chain_junctions(cs), |x| x.to_vec());
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut uniq: Vec<(usize, usize, usize, String)> = Vec::new();
     let mut which: Vec<Option<usize>> = Vec::with_capacity(pairs.len());
@@ -553,7 +606,7 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         let c = &cs[ci];
         let (a, b) = (&c.ex[ia], &c.ex[ib]);
         if !genome.contains_key(&c.scaffold) || !mid.contains_key(&c.model) { which.push(None); continue; }
-        let key = format!("{}|{}|{}|{}|{}|{}|{}", c.model, c.scaffold, c.strand as char, a.start, a.end, b.start, b.end);
+        let key = jx_key(c, a, b);
         let n = uniq.len();
         let idx = *seen.entry(key.clone()).or_insert(n);
         if idx == n { uniq.push((ci, ia, ib, key)); }
@@ -618,7 +671,7 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         rf.add(ci, ia, ib, &r.sites);
         ps[ci].merge(&r.pseudo);
     }
-    if o.ends {
+    if o.ends && subset.is_none() {
         rf.extend_ends(cs, genome, |c| mid.get(&c.model).map(|&h| models[h].m));
     }
     let Some(out) = out else { return (rf, ps) };
@@ -749,7 +802,7 @@ pub enum GenomeSrc {
     Seqs(HashMap<String, Vec<u8>>),
 }
 
-pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: &str, o: &Opts, stages: &str) -> Result<(), String> {
+pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: &str, o: &mut Opts, stages: &str) -> Result<(), String> {
     let mut cs = read_chains(chains_path)?;
     let (models, genome) = std::thread::scope(|sc| {
         let m = sc.spawn(|| read_hmms(models_path, o.threads));
@@ -774,6 +827,14 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
     if do_pseudo { out.buf("disablements"); out.buf("pseudo"); }
     if do_score { out.buf("exonscores"); }
 
+    let mut cache: HashMap<String, JxOut> = HashMap::new();
+    if do_fill || do_refine {
+        if let Some((t, log)) = learn_sites(&cs, &models, &mid, &genome, o, &mut cache) {
+            o.prm.acc = t;
+            out.buf("acceptor").push_str(&log);
+        }
+    }
+    let o: &Opts = o;
     if do_fill {
         let s = cut_read_through(&mut cs, &models, &mid, &genome, o);
         out.buf("cut").push_str("# model scaffold strand start end intron_start intron_end score free nodes_first nodes_second rows kept\n");
@@ -843,11 +904,10 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
         }
         copy_to_flank_rows(&mut cs);
     }
-    let mut cache: HashMap<String, JxOut> = HashMap::new();
     if do_fill && do_refine && o.min_rev.is_finite() {
         // drop internal recovered exons that fit their chain, at refined
         // boundaries, no better than reversed; then refine the new junctions
-        let (rf0, _) = refine_all(&models, &mid, o, &cs, &genome, true, false, &mut cache, None);
+        let (rf0, _) = refine_all(&models, &mid, o, &cs, &genome, true, false, &mut cache, None, None);
         let gated = par_map(cs.len(), o.threads, |_| 0, |i, al| {
             let c = &cs[i];
             let n = c.ex.len();
@@ -877,7 +937,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
         add_alternatives(&mut cs, &models, &mid, &genome, o);
     }
     let (mut rf, ps) = if do_refine || do_pseudo {
-        let (r, p) = refine_all(&models, &mid, o, &cs, &genome, do_refine, do_pseudo, &mut cache, Some(&mut out));
+        let (r, p) = refine_all(&models, &mid, o, &cs, &genome, do_refine, do_pseudo, &mut cache, Some(&mut out), None);
         (Some(r), Some(p))
     } else { (None, None) };
     if let (true, true, Some(r)) = (do_refine, o.join, rf.as_mut()) {
@@ -976,5 +1036,5 @@ pub fn exonfill_run(py: Python<'_>, models: &str, chains: &str, genome: &Bound<'
             GenomeSrc::Seqs(m)
         }
     };
-    py.detach(|| run(models, chains, src, prefix, &o, stages)).map_err(PyRuntimeError::new_err)
+    py.detach(|| run(models, chains, src, prefix, &mut o, stages)).map_err(PyRuntimeError::new_err)
 }

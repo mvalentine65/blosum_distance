@@ -14,7 +14,7 @@
 //! in it.
 
 use super::hmm::{Hmm, DD, DM, MD, MM};
-use super::sites::{base, cod64, splice_scores, translate, RES_STOP, RES_X};
+use super::sites::{acceptor_default, base, cod64, splice_scores, translate, AccTable, RES_STOP, RES_X};
 
 pub const NEG: f64 = -1e18; // anything above HALF is a real score
 pub const HALF: f64 = -1e17;
@@ -45,11 +45,13 @@ pub struct Params {
     pub slack: i64,
     pub null_run: bool,
     pub min_gap_nt: i64,
+    /// acceptor log-odds
+    pub acc: AccTable,
 }
 
 impl Default for Params {
     fn default() -> Self {
-        Params { stop: -1000.0, fs: -28.0, skip_open: -20.0, w_in: 60, ext: 45, max_cells: 40_000_000, xsc: -4.0, slack: 15, null_run: true, min_gap_nt: 30 }
+        Params { stop: -1000.0, fs: -28.0, skip_open: -20.0, w_in: 60, ext: 45, max_cells: 40_000_000, xsc: -4.0, slack: 15, null_run: true, min_gap_nt: 30, acc: acceptor_default() }
     }
 }
 
@@ -150,7 +152,7 @@ fn tables(hmm: &Hmm, loc: &Locus, prm: &Params, wall: Option<(i64, i64)>) -> Tab
     if bcs >= loc.bxe { bcs = (loc.bxs + loc.bxe) / 2; }
     let mut ss5 = vec![0f64; d];
     let mut ss3 = vec![0f64; d];
-    splice_scores(&tb[..d], &mut ss5, &mut ss3);
+    splice_scores(&tb[..d], &prm.acc, &mut ss5, &mut ss3);
     let mut don = vec![NEG; d];
     let mut acc = vec![NEG; d];
     let mut zstart = vec![-1i64; d];

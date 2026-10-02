@@ -5,7 +5,7 @@
 
 use super::chain::{Chain, ChainExon, SRC_CUT, SRC_INPUT, SRC_NAME};
 use super::junction::{JxStatus, Junction};
-use super::sites::{base, revcomp, splice_scores};
+use super::sites::{acceptor_default, base, revcomp, splice_scores};
 use super::splice::MIN_INTRON;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -82,7 +82,7 @@ fn donor_ahead(sq: &[u8], plus: bool, ce: i64, p: i64) -> bool {
     let s: Vec<u8> = if plus { sq[(lo - 1) as usize..hi as usize].to_vec() } else { revcomp(&sq[(lo - 1) as usize..hi as usize]) };
     let t: Vec<u8> = s.iter().map(|&x| base(x)).collect();
     let (mut ss5, mut ss3) = (vec![0f64; t.len()], vec![0f64; t.len()]);
-    splice_scores(&t, &mut ss5, &mut ss3);
+    splice_scores(&t, &acceptor_default(), &mut ss5, &mut ss3);
     // first base past the exon, and the stop codon's first base, in t
     let (off, end) = if plus { (ce - lo + 1, p - lo) } else { (hi - ce + 1, hi - p) };
     ((off - STOP_DONOR_IN).max(0)..=end).any(|k| {

@@ -3,7 +3,7 @@
 //! acceptor from the junction before it and its donor from the junction after
 //! it; gene ends keep their input coordinates.
 
-use super::chain::{Chain, ChainExon, SRC_INPUT, SRC_NAME};
+use super::chain::{Chain, ChainExon, SRC_CUT, SRC_INPUT, SRC_NAME};
 use super::junction::{JxStatus, Junction};
 use super::sites::{base, revcomp, splice_scores};
 use super::splice::MIN_INTRON;
@@ -238,7 +238,8 @@ impl Refine {
             };
             while j < n {
                 let mut k = j;
-                while k + 1 < n && self.join[i][k] && fits(&c.ex[k], &c.ex[k + 1]) { k += 1; }
+                // the two pieces of a cut exon stay apart
+                while k + 1 < n && self.join[i][k] && c.ex[k].src != SRC_CUT && c.ex[k + 1].src != SRC_CUT && fits(&c.ex[k], &c.ex[k + 1]) { k += 1; }
                 if k == j {
                     ex.push(c.ex[j]);
                     rf.push(self.ex[i][j].clone());

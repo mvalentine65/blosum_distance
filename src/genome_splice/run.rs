@@ -1,12 +1,12 @@
 //! Driver: chains in, the fill / refine / pseudo stages, the same output files
 //! as the C bathfill (<prefix>.windows.tsv, .segments.tsv, .fills.tsv,
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
-//! .pseudo.tsv, .gff3) plus .rebase.tsv, genomic 1-based coordinates.
+//! .pseudo.tsv, .gff3) plus .cut.tsv and .rebase.tsv, genomic 1-based coordinates.
 
-use super::chain::{add_exon, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_INPUT, SRC_ORF, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
+use super::chain::{add_exon, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_ORF, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
-use super::sites::translate;
+use super::sites::{base, revcomp, splice_scores, translate};
 use super::module::{alternatives, copies};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
@@ -208,6 +208,118 @@ fn copy_to_flank_rows(cs: &mut [Chain]) {
         }
     }
     for (i, x) in add { add_exon(&mut cs[i], &x); }
+}
+
+/// splice score (donor + acceptor) an intron read through by an exon must reach
+const CUT_SCORE: f64 = 12.0;
+/// share of that intron's residues sitting on no model node
+const CUT_FREE: f64 = 0.8;
+/// nt of an intron an exon may have read through
+const CUT_NT: (usize, usize) = (30, 250);
+/// shortest exon tested, shortest piece a cut may leave
+const CUT_EXON: i64 = 90;
+const CUT_PIECE: usize = 30;
+/// residues an exon must hold beyond the nodes it spans to be tested
+const CUT_SURPLUS: i64 = 5;
+
+/// The best in-frame GT/GC..AG pair inside exon e, when it scores CUT_SCORE and leaves two
+/// pieces: (score, donor G, acceptor G) as offsets on the gene strand.
+fn cut_sites(sc: &[u8], strand: u8, e: &ChainExon) -> Option<(f64, usize, usize)> {
+    let n = (e.end - e.start + 1) as usize;
+    if e.start < 1 || e.end as usize > sc.len() { return None; }
+    let fwd = &sc[(e.start - 1) as usize..e.end as usize];
+    let nt = if strand == b'-' { revcomp(fwd) } else { fwd.to_vec() };
+    let t: Vec<u8> = nt.iter().map(|&b| base(b)).collect();
+    let (mut ss5, mut ss3) = (vec![0f64; n], vec![0f64; n]);
+    splice_scores(&t, &mut ss5, &mut ss3);
+    let mut best: Option<(f64, usize, usize)> = None;
+    for i in 3..n.saturating_sub(6) {
+        if t[i] != 2 || (t[i + 1] != 3 && t[i + 1] != 1) || ss5[i] < 2.0 { continue; }
+        // the acceptor's G at j: the stretch i..=j is a multiple of 3
+        let mut j = i + CUT_NT.0 - 1;
+        while j + 1 < n && j < i + CUT_NT.1 {
+            if j >= 14 && t[j - 1] == 0 && t[j] == 2 && best.is_none_or(|b| ss5[i] + ss3[j] > b.0) { best = Some((ss5[i] + ss3[j], i, j)); }
+            j += 3;
+        }
+    }
+    best.filter(|&(s, i, j)| s >= CUT_SCORE && i >= CUT_PIECE && n - 1 - j >= CUT_PIECE)
+}
+
+/// Where exon e reads through an intron, at cut_sites' pair (s, i, j): (genomic stretch,
+/// score, free share, nodes of the coding-first piece, nodes of the second), when the
+/// residues between the sites sit off the model.
+fn find_cut(strand: u8, e: &ChainExon, x: &ExonScore, (s, i, j): (f64, usize, usize)) -> Option<(i64, i64, f64, f64, (i64, i64), (i64, i64))> {
+    if x.frame < 0 || x.nodes.is_empty() { return None; }
+    let fr = x.frame as usize;
+    let (r0, r1) = ((i - fr) / 3, ((j - fr) / 3 + 1).min(x.nodes.len()));
+    if r1 <= r0 { return None; }
+    let free = x.nodes[r0..r1].iter().filter(|&&k| k == 0).count() as f64 / (r1 - r0) as f64;
+    if free < CUT_FREE { return None; }
+    let span = |v: &[u32]| -> Option<(i64, i64)> {
+        let (lo, hi) = (v.iter().filter(|&&k| k > 0).min()?, v.iter().filter(|&&k| k > 0).max()?);
+        Some((*lo as i64, *hi as i64))
+    };
+    let (ka, kb) = (span(&x.nodes[..r0])?, span(&x.nodes[r1..])?);
+    if kb.0 <= ka.0 || kb.1 <= ka.1 { return None; }
+    let (lo, hi) = if strand == b'-' { (e.end - j as i64, e.end - i as i64) } else { (e.start + i as i64, e.start + j as i64) };
+    Some((lo, hi, s, free, ka, kb))
+}
+
+/// The genomic low piece of exon s..e cut at lo..hi is the one that stays: the longer.
+fn keep_low(s: i64, e: i64, lo: i64, hi: i64) -> bool { lo - s >= e - hi }
+
+/// A search-stage exon that reads through a short in-frame intron (find_cut) is cut in two
+/// in every chain that holds it: the longer piece stays, the other is a cut exon. Returns the log rows.
+fn cut_read_through(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usize>, genome: &HashMap<String, Vec<u8>>, o: &Opts) -> String {
+    type Cut = (i64, i64, f64, f64, (i64, i64), (i64, i64));
+    let key = |c: &Chain, e: &ChainExon| (c.model.clone(), c.scaffold.clone(), c.strand, e.start, e.end);
+    // each exon with residues to spare is tested once, aligned on its own
+    let mut seen = HashSet::new();
+    let mut todo: Vec<(usize, usize)> = Vec::new();
+    for (i, c) in cs.iter().enumerate() {
+        if c.passive || !mid.contains_key(&c.model) || !genome.contains_key(&c.scaffold) { continue; }
+        for (j, e) in c.ex.iter().enumerate() {
+            let n = e.end - e.start + 1;
+            if e.src == SRC_INPUT && n >= CUT_EXON && n / 3 - (e.k2 - e.k1 + 1) >= CUT_SURPLUS && seen.insert(key(c, e)) { todo.push((i, j)); }
+        }
+    }
+    let found: Vec<Option<Cut>> = par_map(todo.len(), o.threads, |t| cs[todo[t].0].ex[todo[t].1].end - cs[todo[t].0].ex[todo[t].1].start, |t, al| {
+        let (c, e) = (&cs[todo[t].0], &cs[todo[t].0].ex[todo[t].1]);
+        let (hid, sc) = (mid[&c.model], &genome[&c.scaffold]);
+        let site = cut_sites(sc, c.strand, e)?;
+        let one = Chain { ex: vec![*e], ..c.clone() };
+        let es = score_chain(al, hid, &models[hid], &one, &[(e.start, e.end)], sc, true, false, |_| false);
+        find_cut(c.strand, e, &es[0], site)
+    });
+    let cuts: HashMap<(String, String, u8, i64, i64), Cut> = todo.iter().zip(found)
+        .filter_map(|(&(i, j), k)| Some((key(&cs[i], &cs[i].ex[j]), k?))).collect();
+    let mut rows: HashMap<(String, String, u8, i64, i64), usize> = HashMap::new();
+    for c in cs.iter_mut().filter(|c| !c.passive) {
+        let mut ex = Vec::with_capacity(c.ex.len() + 1);
+        for e in &c.ex {
+            let k = key(c, e);
+            let Some(&(lo, hi, _, _, ka, kb)) = (e.src == SRC_INPUT).then(|| cuts.get(&k)).flatten() else { ex.push(*e); continue };
+            *rows.entry(k).or_default() += 1;
+            // the exon's own first and last node stay; the cut's two ends come from the alignment
+            let (ka, kb) = ((e.k1.min(ka.1), ka.1), (kb.0, e.k2.max(kb.0)));
+            // genomic low and high piece; the coding-first one takes ka
+            let (kl, kh) = if c.strand == b'-' { (kb, ka) } else { (ka, kb) };
+            let low = keep_low(e.start, e.end, lo, hi);
+            ex.push(ChainExon { start: e.start, end: lo - 1, k1: kl.0, k2: kl.1, src: if low { SRC_INPUT } else { SRC_CUT } });
+            ex.push(ChainExon { start: hi + 1, end: e.end, k1: kh.0, k2: kh.1, src: if low { SRC_CUT } else { SRC_INPUT } });
+        }
+        c.ex = ex;
+        sort_exons(&mut c.ex);
+    }
+    let mut keys: Vec<_> = cuts.iter().collect();
+    keys.sort_by(|a, b| (&a.0.1, a.0.3).cmp(&(&b.0.1, b.0.3)));
+    let mut log = String::new();
+    for (k, &(lo, hi, s, free, ka, kb)) in keys {
+        let kept = if keep_low(k.3, k.4, lo, hi) { (k.3, lo - 1) } else { (hi + 1, k.4) };
+        let _ = writeln!(log, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{:.2}\t{}-{}\t{}-{}\t{}\t{}-{}", k.0, k.1, k.2 as char, k.3, k.4, lo, hi, s, free,
+                         ka.0, ka.1, kb.0, kb.1, rows.get(k).copied().unwrap_or(0), kept.0, kept.1);
+    }
+    log
 }
 
 /// tail exons, from the first, that need a copy for a rebase (or all of a shorter tail)
@@ -663,6 +775,11 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
     if do_score { out.buf("exonscores"); }
 
     if do_fill {
+        let s = cut_read_through(&mut cs, &models, &mid, &genome, o);
+        out.buf("cut").push_str("# model scaffold strand start end intron_start intron_end score free nodes_first nodes_second rows kept\n");
+        out.buf("cut").push_str(&s);
+    }
+    if do_fill {
         let s = rebase_tails(&mut cs, &models, &mid, &genome, o);
         out.buf("rebase").push_str("# row owner scaffold strand lo hi tail found replaced copies(start-end:k1-k2:margin)\n");
         out.buf("rebase").push_str(&s);
@@ -734,7 +851,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
         let gated = par_map(cs.len(), o.threads, |_| 0, |i, al| {
             let c = &cs[i];
             let n = c.ex.len();
-            let test = |j: usize| j > 0 && j + 1 < n && c.ex[j].src != SRC_INPUT;
+            let test = |j: usize| j > 0 && j + 1 < n && c.ex[j].src != SRC_INPUT && c.ex[j].src != SRC_CUT;
             if !(0..n).any(test) { return Vec::new(); }
             let (Some(&hid), Some(sc)) = (mid.get(&c.model), genome.get(&c.scaffold)) else { return Vec::new() };
             let spans: Vec<(i64, i64)> = (0..n).map(|j| rf0.span(c, i, j)).collect();

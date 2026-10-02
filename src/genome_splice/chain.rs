@@ -20,7 +20,8 @@ pub const SRC_ORF: u8 = 1;
 pub const SRC_SPLICE: u8 = 2;
 pub const SRC_ALT: u8 = 3;
 pub const SRC_TAIL: u8 = 4;
-pub const SRC_NAME: [&str; 5] = ["input", "orf", "splice", "alt", "tail"];
+pub const SRC_CUT: u8 = 5;
+pub const SRC_NAME: [&str; 6] = ["input", "orf", "splice", "alt", "tail", "cut"];
 
 #[derive(Clone, Copy, Debug)]
 pub struct ChainExon {

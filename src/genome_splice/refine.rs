@@ -5,7 +5,7 @@
 
 use super::chain::{Chain, ChainExon, SRC_INPUT, SRC_NAME};
 use super::junction::{JxStatus, Junction};
-use super::sites::revcomp;
+use super::sites::{base, revcomp, splice_scores};
 use super::splice::MIN_INTRON;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -66,6 +66,29 @@ fn intron_fits(sc: &[u8], strand: u8, lo: i64, hi: i64) -> bool {
     let gt = (0..s.len() - 1).find(|&i| s[i] == b'G' && s[i + 1] == b'T');
     let ag = (1..s.len()).rev().find(|&j| s[j - 1] == b'A' && s[j] == b'G');
     matches!((gt, ag), (Some(i), Some(j)) if j + 1 >= i + MIN_INTRON)
+}
+
+/// donor score that marks a further exon past a chain's last one
+const STOP_DONOR: f64 = 6.0;
+/// nt inside the last exon where that donor may already lie
+const STOP_DONOR_IN: i64 = 15;
+
+/// A GT/GC donor scoring STOP_DONOR or more lies between STOP_DONOR_IN nt before the
+/// exon end ce and the stop codon starting at p (1-based, read on the gene strand).
+fn donor_ahead(sq: &[u8], plus: bool, ce: i64, p: i64) -> bool {
+    let l = sq.len() as i64;
+    // three exon bases before the first donor tried, six past the last
+    let (lo, hi) = if plus { ((ce - STOP_DONOR_IN - 2).max(1), (p + 8).min(l)) } else { ((p - 8).max(1), (ce + STOP_DONOR_IN + 2).min(l)) };
+    let s: Vec<u8> = if plus { sq[(lo - 1) as usize..hi as usize].to_vec() } else { revcomp(&sq[(lo - 1) as usize..hi as usize]) };
+    let t: Vec<u8> = s.iter().map(|&x| base(x)).collect();
+    let (mut ss5, mut ss3) = (vec![0f64; t.len()], vec![0f64; t.len()]);
+    splice_scores(&t, &mut ss5, &mut ss3);
+    // first base past the exon, and the stop codon's first base, in t
+    let (off, end) = if plus { (ce - lo + 1, p - lo) } else { (hi - ce + 1, hi - p) };
+    ((off - STOP_DONOR_IN).max(0)..=end).any(|k| {
+        let k = k as usize;
+        k + 1 < t.len() && t[k] == 2 && (t[k + 1] == 3 || t[k + 1] == 1) && ss5[k] >= STOP_DONOR
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -139,12 +162,15 @@ impl Refine {
     /// the model's first node, extends to the farthest in-frame ATG upstream
     /// before a stop (within START_NT); its last exon, when it ends within
     /// STOP_NODES of the last node, extends through the first in-frame stop
-    /// within STOP_NT. Alignments fade a few codons short of both.
+    /// within STOP_NT. Alignments fade a few codons short of both. A last exon
+    /// further from the model's end still reads on to a stop within STOP_FAR_NT
+    /// unless a donor lies on the way (donor_ahead): a further exon.
     pub fn extend_ends(&mut self, cs: &[Chain], genome: &HashMap<String, Vec<u8>>, m_of: impl Fn(&Chain) -> Option<usize>) {
         const START_NODES: i64 = 30;
         const START_NT: i64 = 300;
         const STOP_NODES: i64 = 20;
         const STOP_NT: i64 = 90;
+        const STOP_FAR_NT: i64 = 1500;
         for (i, c) in cs.iter().enumerate() {
             let (Some(m), Some(sq)) = (m_of(c), genome.get(&c.scaffold)) else { continue };
             let n = c.ex.len();
@@ -171,19 +197,20 @@ impl Refine {
                 }
                 if let Some(p) = atg { if p != cs0 { self.ex[i][0].start_g = p; } }
             }
-            if m as i64 - c.ex[n - 1].k2 <= STOP_NODES {
-                let (a, b) = self.span(c, i, n - 1);
-                let ce = if plus { b } else { a };
-                let step = if plus { 3 } else { -3 };
-                let mut p = ce + step / 3;
-                while (p - ce).abs() <= STOP_NT {
-                    let Some(x) = codon(p) else { break };
-                    if stop(&x) {
+            let near = m as i64 - c.ex[n - 1].k2 <= STOP_NODES;
+            let (a, b) = self.span(c, i, n - 1);
+            let ce = if plus { b } else { a };
+            let step = if plus { 3 } else { -3 };
+            let mut p = ce + step / 3;
+            while (p - ce).abs() <= STOP_FAR_NT {
+                let Some(x) = codon(p) else { break };
+                if stop(&x) {
+                    if (near && (p - ce).abs() <= STOP_NT) || !donor_ahead(sq, plus, ce, p) {
                         self.ex[i][n - 1].stop_g = if plus { p + 2 } else { p - 2 };
-                        break;
                     }
-                    p += step;
+                    break;
                 }
+                p += step;
             }
         }
     }

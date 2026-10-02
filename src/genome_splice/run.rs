@@ -6,7 +6,7 @@
 use super::chain::{add_exon, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_ORF, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
-use super::sites::{base, learn_acceptor, revcomp, splice_scores, translate, AccTable, SS3_LAST};
+use super::sites::{acceptor_default, base, learn_acceptor, revcomp, splice_scores, translate, AccTable, SS3_LAST};
 use super::module::{alternatives, copies};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
@@ -210,16 +210,18 @@ fn copy_to_flank_rows(cs: &mut [Chain]) {
     for (i, x) in add { add_exon(&mut cs[i], &x); }
 }
 
-/// junctions the acceptor matrix is learned from, and the nt either side read for false sites
+/// most and fewest junctions the acceptor matrix is learned from, and the nt either side read for false sites
 const LEARN_MAX: usize = 300;
+const LEARN_MIN: usize = 50;
 const LEARN_FLANK: i64 = 60;
 /// missing nodes (negative: shared) between the two exons of such a junction
 const LEARN_GAP: (i64, i64) = (-5, 0);
 
 /// The acceptor matrix of this genome: learned from junctions between search-stage exons whose
-/// nodes meet, refined first under the starting matrix and kept in cache. Also the log rows.
+/// nodes meet, refined first under the pooled matrix and kept in cache; the pooled matrix when
+/// fewer than LEARN_MIN are found. Also the log rows.
 fn learn_sites(cs: &[Chain], models: &[Hmm], mid: &HashMap<String, usize>, genome: &HashMap<String, Vec<u8>>, o: &Opts,
-               cache: &mut HashMap<String, JxOut>) -> Option<(AccTable, String)> {
+               cache: &mut HashMap<String, JxOut>) -> (AccTable, String) {
     let mut seen = HashSet::new();
     let mut tight: Vec<(usize, usize, usize)> = Vec::new();
     for (ci, ia, ib) in chain_junctions(cs) {
@@ -250,12 +252,14 @@ fn learn_sites(cs: &[Chain], models: &[Hmm], mid: &HashMap<String, usize>, genom
         let w: Vec<u8> = nt.iter().map(|&x| base(x)).collect();
         if w[(fl + last - 1) as usize] == 0 && w[(fl + last) as usize] == 2 { wins.push(w); }
     }
-    let t = learn_acceptor(&wins, fl as usize)?;
-    let mut log = format!("# acceptor log-odds learned from {} junctions; position A C G T\n", wins.len());
+    let (t, mut log) = match (wins.len() >= LEARN_MIN).then(|| learn_acceptor(&wins, fl as usize)).flatten() {
+        Some(t) => (t, format!("# acceptor log-odds learned from {} junctions; position A C G T\n", wins.len())),
+        None => (acceptor_default(), format!("# pooled acceptor log-odds kept: {} junctions, {} needed; position A C G T\n", wins.len(), LEARN_MIN)),
+    };
     for (i, r) in t.iter().enumerate() {
         let _ = writeln!(log, "{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}", i as i64 - last, r[0], r[1], r[2], r[3]);
     }
-    Some((t, log))
+    (t, log)
 }
 
 /// splice score (donor + acceptor) an intron read through by an exon must reach
@@ -829,10 +833,9 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
 
     let mut cache: HashMap<String, JxOut> = HashMap::new();
     if do_fill || do_refine {
-        if let Some((t, log)) = learn_sites(&cs, &models, &mid, &genome, o, &mut cache) {
-            o.prm.acc = t;
-            out.buf("acceptor").push_str(&log);
-        }
+        let (t, log) = learn_sites(&cs, &models, &mid, &genome, o, &mut cache);
+        o.prm.acc = t;
+        out.buf("acceptor").push_str(&log);
     }
     let o: &Opts = o;
     if do_fill {

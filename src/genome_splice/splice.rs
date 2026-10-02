@@ -2,7 +2,7 @@
 //!
 //! Nodes k1..k2 (anchor A's first to anchor B's last) are aligned through the
 //! locus A..B. Codons inside an anchor keep its frame; no intron may enter an
-//! anchor deeper than w_in. Introns score exonerate's splice PSSMs, intron open
+//! anchor deeper than w_in. Introns score the splice PSSMs of sites, intron open
 //! and non-canonical penalties; phase 1/2 introns score the codon assembled
 //! across them, node-skipping ones included; 1-2 nt frameshifts and node-skipping introns are penalised. Scores are
 //! in half-bits. This is the Viterbi of SAPPHYRE's forced_splice (after

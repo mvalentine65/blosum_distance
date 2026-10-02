@@ -1,7 +1,8 @@
 //! Base codes, codons and splice-site scores.
 //!
-//! Splice PSSMs are exonerate 2.4.0's (splice.c; Senapathy et al. 1990 primate
-//! frequencies), log-odds scaled as exonerate does, rounded to integers.
+//! The donor PSSM is exonerate 2.4.0's (splice.c; Senapathy et al. 1990 primate
+//! frequencies); the acceptor's is pooled from 12 arthropod genomes. Both are
+//! log-odds scaled as exonerate does, rounded to integers.
 
 pub const HMM_AA: &[u8; 20] = b"ACDEFGHIKLMNPQRSTVWY";
 const CODE: &[u8; 64] = b"FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG"; // TCAG order
@@ -17,11 +18,11 @@ const SS5: [[i32; 4]; 9] = [
 ];
 const SS5_AFTER: i64 = 3;
 const SS3: [[i32; 4]; 15] = [
-    [10, 31, 14, 44], [8, 36, 14, 43], [6, 34, 12, 48], [6, 34, 8, 52],
-    [9, 37, 9, 45], [9, 38, 10, 44], [8, 44, 9, 40], [9, 41, 8, 41],
-    [6, 44, 6, 45], [6, 40, 6, 48], [23, 28, 26, 23], [2, 79, 1, 18],
+    [24, 16, 11, 48], [24, 16, 11, 50], [22, 16, 11, 52], [20, 16, 10, 54],
+    [20, 18, 9, 53], [19, 19, 10, 51], [21, 19, 11, 49], [21, 17, 12, 50],
+    [10, 14, 6, 70], [9, 14, 4, 73], [27, 13, 21, 39], [4, 58, 0, 38],
     [100, 0, 0, 0], [0, 0, 100, 0],
-    [28, 14, 47, 11],
+    [31, 14, 41, 14],
 ];
 const SS3_LAST: i64 = 13;
 

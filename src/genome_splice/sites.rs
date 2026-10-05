@@ -7,7 +7,14 @@
 //! integers.
 
 pub const HMM_AA: &[u8; 20] = b"ACDEFGHIKLMNPQRSTVWY";
-const CODE: &[u8; 64] = b"FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG"; // TCAG order
+/// A genetic code: the residue of each codon in TCAG order, as NCBI writes its tables.
+pub type Code = &'static [u8; 64];
+pub const STANDARD: Code = crate::translate::TABLE_1;
+
+/// The NCBI table with this id.
+pub fn code(table: u8) -> Option<Code> {
+    crate::translate::genetic_code_table(table)
+}
 
 pub const RES_X: usize = 20;
 pub const RES_STOP: usize = 21;
@@ -51,14 +58,14 @@ fn tcag(c: u8) -> i32 {
     }
 }
 
-/// Standard code; 'X' for a codon with an N.
+/// 'X' for a codon with an N.
 #[inline]
-pub fn translate(c: &[u8]) -> u8 {
+pub fn translate(code: Code, c: &[u8]) -> u8 {
     let (a, b, d) = (tcag(c[0]), tcag(c[1]), tcag(c[2]));
     if a < 0 || b < 0 || d < 0 {
         return b'X';
     }
-    CODE[(a * 16 + b * 4 + d) as usize]
+    code[(a * 16 + b * 4 + d) as usize]
 }
 
 /// 0..19 HMMER order, X 20, stop 21.
@@ -70,12 +77,12 @@ pub fn residue(aa: u8) -> usize {
 }
 
 /// ACGT codon index -> residue.
-pub fn cod64() -> [usize; 64] {
+pub fn cod64(code: Code) -> [usize; 64] {
     const ACGT: &[u8; 4] = b"ACGT";
     let mut out = [0usize; 64];
     for i in 0..64 {
         let c = [ACGT[i >> 4], ACGT[(i >> 2) & 3], ACGT[i & 3]];
-        out[i] = residue(translate(&c));
+        out[i] = residue(translate(code, &c));
     }
     out
 }

@@ -6,7 +6,7 @@
 use super::chain::{add_exon, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_ORF, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
-use super::sites::{acceptor_default, base, learn_acceptor, revcomp, splice_scores, translate, AccTable, SS3_LAST};
+use super::sites::{acceptor_default, base, code, learn_acceptor, revcomp, splice_scores, translate, AccTable, Code, SS3_LAST};
 use super::module::{alternatives, copies};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
@@ -145,6 +145,7 @@ impl Opts {
             "refine_fs" => self.refine_fs = v,
             "skip_open" => self.prm.skip_open = v,
             "cpu" => self.threads = (v as usize).max(1),
+            "table" => self.prm.code = code(v as u8).ok_or_else(|| format!("unknown NCBI table {v}"))?,
             _ => return Err(format!("unknown option '{k}'")),
         }
         Ok(())
@@ -340,7 +341,7 @@ fn cut_read_through(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usiz
         let (hid, sc) = (mid[&c.model], &genome[&c.scaffold]);
         let site = cut_sites(sc, c.strand, e, &o.prm.acc)?;
         let one = Chain { ex: vec![*e], ..c.clone() };
-        let es = score_chain(al, hid, &models[hid], &one, &[(e.start, e.end)], sc, true, false, |_| false);
+        let es = score_chain(al, hid, &models[hid], o.prm.code, &one, &[(e.start, e.end)], sc, true, false, |_| false);
         find_cut(c.strand, e, &es[0], site)
     });
     let cuts: HashMap<(String, String, u8, i64, i64), Cut> = todo.iter().zip(found)
@@ -463,7 +464,7 @@ fn rebase_tails(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usize>, 
             let other = &taken[&(c.scaffold.as_str(), c.strand)];
             let mut cand: Vec<Vec<(ChainExon, f32)>> = Vec::new();
             for x in &c.ex[r.own..] {
-                let mut v = copies(al, hid, &models[hid], c.strand, x, &genome[&c.scaffold], r.lo, r.hi, o.alt_size, o.alt_nodes_large);
+                let mut v = copies(al, hid, &models[hid], o.prm.code, c.strand, x, &genome[&c.scaffold], r.lo, r.hi, o.alt_size, o.alt_nodes_large);
                 v.retain(|(e, _)| !other.iter().any(|y| e.start <= y.1 && y.0 <= e.end));
                 if v.is_empty() { break; }
                 cand.push(v);
@@ -507,7 +508,7 @@ const FAKE_CUT_SKIP: i64 = 5;
 
 /// The path has an intron skipping FAKE_CUT_SKIP+ nodes whose sequence is a multiple of 3
 /// and reads without a stop in the upstream exon's frame.
-fn fake_cut(jx: &Junction) -> bool {
+fn fake_cut(code: Code, jx: &Junction) -> bool {
     let dna = jx.dna();
     jx.res.exons.windows(2).any(|w| {
         let (x, y) = (&w[0], &w[1]);
@@ -518,7 +519,7 @@ fn fake_cut(jx: &Junction) -> bool {
         let s = lo - y.phase.max(0) as i64;
         (0..(len + 2) / 3 + 1).all(|i| {
             let p = s + 3 * i;
-            p < 0 || p as usize + 3 > dna.len() || p > hi || translate(&dna[p as usize..p as usize + 3]) != b'*'
+            p < 0 || p as usize + 3 > dna.len() || p > hi || translate(code, &dna[p as usize..p as usize + 3]) != b'*'
         })
     })
 }
@@ -563,7 +564,7 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
         let asite = if x.acc >= 1 { format!("{}{}", dna[x.acc as usize - 1] as char, dna[x.acc as usize] as char) } else { "--".into() };
         let dsite = if x.don >= 0 && x.don + 1 < jx.d { format!("{}{}", dna[x.don as usize] as char, dna[x.don as usize + 1] as char) } else { "--".into() };
         // a short-period repeat (e.g. (TA)n read as IYIY) is not an exon
-        let kept = kept && (role != "gap" || !exon_is_repeat(&dna[x.lo as usize..=x.hi as usize], hmm, x.kf, x.kl));
+        let kept = kept && (role != "gap" || !exon_is_repeat(o.prm.code, &dna[x.lo as usize..=x.hi as usize], hmm, x.kf, x.kl));
         let _ = writeln!(wo.exons, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, st,
                          jid, i, role, p.min(q), p.max(q), ac, dn, asite, dsite, x.phase, x.nmatch, x.kf, x.kl, kept as i32);
         if kept && i > 0 && i < n - 1 && x.nmatch > 0 && x.hi - x.lo + 1 >= o.min_seg {
@@ -652,7 +653,7 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         // lacks those nodes, and a skipping intron there cuts the exon (a frameshift may remain)
         let abut = pj.status == JxStatus::Ok && pj.gap < MIN_INTRON as i64 && b.k1 - a.k2 - 1 >= FAKE_CUT_SKIP
             && pj.res.exons.windows(2).any(|w| w[1].nmatch > 0 && w[0].nmatch > 0 && w[1].kf - w[0].kl - 1 >= FAKE_CUT_SKIP);
-        let jc = (pj.status == JxStatus::Ok && (abut || fake_cut(pj))).then(|| {
+        let jc = (pj.status == JxStatus::Ok && (abut || fake_cut(o.prm.code, pj))).then(|| {
             let mut p2 = if std::ptr::eq(pj, &jx) { prm } else { bar };
             p2.skip_open = -1.0e6;
             run(al, &p2)
@@ -676,7 +677,7 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         ps[ci].merge(&r.pseudo);
     }
     if o.ends && subset.is_none() {
-        rf.extend_ends(cs, genome, |c| mid.get(&c.model).map(|&h| models[h].m));
+        rf.extend_ends(o.prm.code, cs, genome, |c| mid.get(&c.model).map(|&h| models[h].m));
     }
     let Some(out) = out else { return (rf, ps) };
     let mut written = vec![false; uniq.len()];
@@ -767,7 +768,7 @@ fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, u
             let ((ps, pe), (ns, ne)) = (gap(p, x), gap(x, n));
             [module_block(cs, ci, p, ps, pe, |y| y.k2 >= n.k1), module_block(cs, ci, n, ns, ne, |y| y.k1 <= p.k2)]
         } else { [None, None] };
-        alternatives(al, hid, &models[hid], c, j, &genome[&c.scaffold], size, large, stop)
+        alternatives(al, hid, &models[hid], o.prm.code, c, j, &genome[&c.scaffold], size, large, stop)
     });
     let mut taken: HashMap<(String, u8), Vec<(i64, i64)>> = HashMap::new();
     for c in cs.iter() {
@@ -876,7 +877,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 // a gap part that belongs to other isoforms reads as N
                 let seg: Vec<u8> = masked(&sc[(w.gs - 1) as usize..w.ge as usize], w.gs, w.mask);
                 let mut kept: Vec<ChainExon> = Vec::new();
-                orf_window(al, hid, hmm, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, &mut wo.segments, &mut kept);
+                orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, &mut wo.segments, &mut kept);
                 for k in kept {
                     wo.pend.push((w.ci, k, w.kind));
                     for &c2 in &w.also { wo.pend.push((c2, k, w.kind)); }
@@ -918,7 +919,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             if !(0..n).any(test) { return Vec::new(); }
             let (Some(&hid), Some(sc)) = (mid.get(&c.model), genome.get(&c.scaffold)) else { return Vec::new() };
             let spans: Vec<(i64, i64)> = (0..n).map(|j| rf0.span(c, i, j)).collect();
-            score_chain(al, hid, &models[hid], c, &spans, sc, false, false, test)
+            score_chain(al, hid, &models[hid], o.prm.code, c, &spans, sc, false, false, test)
         });
         let d = out.buf("dropped");
         for (c, v) in cs.iter_mut().zip(&gated) {
@@ -956,7 +957,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 .map(|j| match rf { Some(r) => r.span(c, i, j), None => (c.ex[j].start, c.ex[j].end) })
                 .collect();
             match (mid.get(&c.model), genome.get(&c.scaffold)) {
-                (Some(&hid), Some(sc)) if !c.ex.is_empty() => score_chain(al, hid, &models[hid], c, &spans, sc, true, o.score_full, |_| o.score_full),
+                (Some(&hid), Some(sc)) if !c.ex.is_empty() => score_chain(al, hid, &models[hid], o.prm.code, c, &spans, sc, true, o.score_full, |_| o.score_full),
                 _ => vec![ExonScore::default(); c.ex.len()],
             }
         })

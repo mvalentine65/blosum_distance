@@ -14,7 +14,7 @@
 //! in it.
 
 use super::hmm::{Hmm, DD, DM, MD, MM};
-use super::sites::{acceptor_default, base, cod64, splice_scores, translate, AccTable, RES_STOP, RES_X};
+use super::sites::{acceptor_default, base, cod64, splice_scores, translate, AccTable, Code, RES_STOP, RES_X, STANDARD};
 
 pub const NEG: f64 = -1e18; // anything above HALF is a real score
 pub const HALF: f64 = -1e17;
@@ -47,11 +47,13 @@ pub struct Params {
     pub min_gap_nt: i64,
     /// acceptor log-odds
     pub acc: AccTable,
+    /// genetic code the locus is translated with
+    pub code: Code,
 }
 
 impl Default for Params {
     fn default() -> Self {
-        Params { stop: -1000.0, fs: -28.0, skip_open: -20.0, w_in: 60, ext: 45, max_cells: 40_000_000, xsc: -4.0, slack: 15, null_run: true, min_gap_nt: 30, acc: acceptor_default() }
+        Params { stop: -1000.0, fs: -28.0, skip_open: -20.0, w_in: 60, ext: 45, max_cells: 40_000_000, xsc: -4.0, slack: 15, null_run: true, min_gap_nt: 30, acc: acceptor_default(), code: STANDARD }
     }
 }
 
@@ -109,6 +111,7 @@ struct Tables {
     acc: Vec<f64>,
     zstart: Vec<i64>,
     cod64: [usize; 64],
+    code: Code,
 }
 
 fn lnhb(p: f32) -> f64 {
@@ -138,7 +141,7 @@ fn tables(hmm: &Hmm, loc: &Locus, prm: &Params, wall: Option<(i64, i64)>) -> Tab
     }
     t[MM][lp] = 0.0;
     t[DM][lp] = 0.0;
-    let c64 = cod64();
+    let c64 = cod64(prm.code);
     let mut tb: Vec<u8> = loc.dna.iter().map(|&c| base(c)).collect();
     tb.push(4);
     let mut codaa = vec![-1i32; d + 1];
@@ -176,7 +179,7 @@ fn tables(hmm: &Hmm, loc: &Locus, prm: &Params, wall: Option<(i64, i64)>) -> Tab
             acc[k as usize] = NEG;
         }
     }
-    Tables { lp, d, em, t, codaa, tb, don, acc, zstart, cod64: c64 }
+    Tables { lp, d, em, t, codaa, tb, don, acc, zstart, cod64: c64, code: prm.code }
 }
 
 fn frame_ok(loc: &Locus, flo: i64, fhi: i64) -> Vec<bool> {
@@ -624,7 +627,7 @@ fn summarize(t: &Tables, loc: &Locus, tr: &Trace, res: &mut SpliceResult) {
                 for q in d - ph..d { c[j] = dna[q]; j += 1; }
                 let mut q = a + 1;
                 while j < 3 { c[j] = dna[q]; j += 1; q += 1; }
-                if translate(&c) == b'*' { res.nstop += 1; add(res, DIS_STOP, a as i64 + 1, 0); }
+                if translate(t.code, &c) == b'*' { res.nstop += 1; add(res, DIS_STOP, a as i64 + 1, 0); }
             }
             Ev::F { k, n } => { res.nfs += 1; add(res, DIS_FS, (k - n) as i64, n as i64); }
             Ev::I { d, a, ph } => {

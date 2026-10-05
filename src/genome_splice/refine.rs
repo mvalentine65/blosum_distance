@@ -5,7 +5,7 @@
 
 use super::chain::{Chain, ChainExon, SRC_CUT, SRC_INPUT, SRC_NAME};
 use super::junction::{JxStatus, Junction};
-use super::sites::{acceptor_default, base, revcomp, splice_scores};
+use super::sites::{acceptor_default, base, revcomp, splice_scores, translate, Code};
 use super::splice::MIN_INTRON;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -165,7 +165,7 @@ impl Refine {
     /// within STOP_NT. Alignments fade a few codons short of both. A last exon
     /// further from the model's end still reads on to a stop within STOP_FAR_NT
     /// unless a donor lies on the way (donor_ahead): a further exon.
-    pub fn extend_ends(&mut self, cs: &[Chain], genome: &HashMap<String, Vec<u8>>, m_of: impl Fn(&Chain) -> Option<usize>) {
+    pub fn extend_ends(&mut self, code: Code, cs: &[Chain], genome: &HashMap<String, Vec<u8>>, m_of: impl Fn(&Chain) -> Option<usize>) {
         const START_NODES: i64 = 30;
         const START_NT: i64 = 300;
         const STOP_NODES: i64 = 20;
@@ -183,7 +183,7 @@ impl Refine {
                 let t = &sq[(lo - 1) as usize..hi as usize];
                 Some(if plus { [t[0], t[1], t[2]] } else { [comp(t[2]), comp(t[1]), comp(t[0])] })
             };
-            let stop = |x: &[u8; 3]| matches!(x, b"TAA" | b"TAG" | b"TGA");
+            let stop = |x: &[u8; 3]| translate(code, x) == b'*';
             if c.ex[0].k1 <= START_NODES {
                 let (a, b) = self.span(c, i, 0);
                 let cs0 = if plus { a } else { b };

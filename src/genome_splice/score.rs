@@ -13,7 +13,7 @@
 use super::chain::Chain;
 use super::hmm::Hmm;
 use super::orf::{translate_frame, Aligner};
-use super::sites::revcomp;
+use super::sites::{revcomp, Code};
 
 #[derive(Clone, Debug)]
 pub struct ExonScore {
@@ -34,7 +34,7 @@ impl Default for ExonScore {
 /// for exons where `want_rev` holds; residue nodes when `nodes` is set; bits
 /// for all when `bits` is set. Frames are always found.
 #[allow(clippy::too_many_arguments)]
-pub fn score_chain(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, c: &Chain, spans: &[(i64, i64)], sc: &[u8],
+pub fn score_chain(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, c: &Chain, spans: &[(i64, i64)], sc: &[u8],
                    nodes: bool, bits: bool, want_rev: impl Fn(usize) -> bool) -> Vec<ExonScore> {
     let m = hmm.m as i64;
     let mut out = vec![ExonScore::default(); c.ex.len()];
@@ -53,7 +53,7 @@ pub fn score_chain(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, c: &Chain, spans:
             let (mut f, mut best) = (0i64, f32::NEG_INFINITY);
             let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
             for fr in 0..3 {
-                let t: Vec<u8> = translate_frame(&nt, fr).into_iter().map(|x| if x == b'*' { b'X' } else { x }).collect();
+                let t: Vec<u8> = translate_frame(code, &nt, fr).into_iter().map(|x| if x == b'*' { b'X' } else { x }).collect();
                 if !t.is_empty() {
                     let b = al.fwd_bits(&t);
                     if b > best { best = b; f = fr as i64; }
@@ -63,7 +63,7 @@ pub fn score_chain(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, c: &Chain, spans:
             // in-frame stops, as genomic positions of the codon's first base;
             // the gene's own stop (the last codon of the chain's last exon) is not one
             let last = j + 1 == c.ex.len();
-            for (i, &x) in translate_frame(&nt, f as usize).iter().enumerate() {
+            for (i, &x) in translate_frame(code, &nt, f as usize).iter().enumerate() {
                 if x == b'*' {
                     let o = f + 3 * i as i64; // offset in coding orientation
                     if last && o + 3 + 2 >= nt.len() as i64 { continue; }

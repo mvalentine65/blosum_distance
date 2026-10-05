@@ -65,8 +65,8 @@ pub fn junction(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, prm: &Params, keep: 
     if ahi >= blo && alo < blo && ahi < bhi { let m = (ahi + blo) / 2; ahi = m; blo = m + 1; }
     if ahi >= blo || alo > ahi || blo > bhi { jx.status = JxStatus::Order; return jx; }
 
-    let (afo, a_lo, _a_hi, a_k) = anchor_frame(al, hmm_id, hmm, &jx.s[(alo - 1) as usize..ahi as usize], ak1 as usize, ak2 as usize, 0, keep, 30);
-    let (bfo, _b_lo, b_hi, b_k) = anchor_frame(al, hmm_id, hmm, &jx.s[(blo - 1) as usize..bhi as usize], bk1 as usize, bk2 as usize, 1, keep, 30);
+    let (afo, a_lo, _a_hi, a_k) = anchor_frame(al, hmm_id, hmm, prm.code, &jx.s[(alo - 1) as usize..ahi as usize], ak1 as usize, ak2 as usize, 0, keep, 30);
+    let (bfo, _b_lo, b_hi, b_k) = anchor_frame(al, hmm_id, hmm, prm.code, &jx.s[(blo - 1) as usize..bhi as usize], bk1 as usize, bk2 as usize, 1, keep, 30);
 
     jx.lo = alo - 1 + a_lo;
     jx.d = (blo - 1 + b_hi) - jx.lo;

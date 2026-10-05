@@ -4,7 +4,7 @@
 use super::align::{residue_code, AlnHit, Dp, Profile};
 use super::chain::{ChainExon, SRC_ORF};
 use super::hmm::Hmm;
-use super::sites::{revcomp, translate};
+use super::sites::{revcomp, translate, Code};
 use std::fmt::Write as _;
 
 #[cfg(target_arch = "x86_64")]
@@ -116,11 +116,11 @@ impl Aligner {
     }
 }
 
-pub fn translate_frame(nt: &[u8], f: usize) -> Vec<u8> {
+pub fn translate_frame(code: Code, nt: &[u8], f: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(nt.len() / 3 + 1);
     let mut i = f;
     while i + 2 < nt.len() {
-        out.push(translate(&nt[i..i + 3]));
+        out.push(translate(code, &nt[i..i + 3]));
         i += 3;
     }
     out
@@ -130,7 +130,7 @@ pub fn translate_frame(nt: &[u8], f: usize) -> Vec<u8> {
 /// nodes k1..k2; stops read as X. With keep > 0, also the kept span next to
 /// the junction (side 0: A keeps its tail; side 1: B keeps its head) and the
 /// node the cut falls at. Returns (frame relative to lo, lo, hi, k).
-pub fn anchor_frame(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, nt: &[u8], k1: usize, k2: usize,
+pub fn anchor_frame(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, nt: &[u8], k1: usize, k2: usize,
                     side: i32, keep: usize, pad: i64) -> (i64, i64, i64, usize) {
     let n = nt.len() as i64;
     let (mut lo, mut hi) = (0i64, n);
@@ -138,7 +138,7 @@ pub fn anchor_frame(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, nt: &[u8], k1: u
     al.set(hmm_id, hmm, k1, k2);
     let (mut best, mut bsc) = (0usize, f32::NEG_INFINITY);
     let frames: Vec<Vec<u8>> = (0..3)
-        .map(|f| translate_frame(nt, f).into_iter().map(|c| if c == b'*' { b'X' } else { c }).collect())
+        .map(|f| translate_frame(code, nt, f).into_iter().map(|c| if c == b'*' { b'X' } else { c }).collect())
         .collect();
     // frame by Forward alone (the bits a full run reports); only the best one is decoded
     for f in 0..3 {
@@ -235,8 +235,8 @@ pub fn is_repeat(aa: &[u8], hmm: &Hmm, k1: i64, k2: i64) -> bool {
 }
 
 /// is_repeat for an exon (oriented nt) in its frame with the fewest stops.
-pub fn exon_is_repeat(nt: &[u8], hmm: &Hmm, k1: i64, k2: i64) -> bool {
-    (0..3).map(|f| translate_frame(nt, f)).filter(|t| !t.is_empty())
+pub fn exon_is_repeat(code: Code, nt: &[u8], hmm: &Hmm, k1: i64, k2: i64) -> bool {
+    (0..3).map(|f| translate_frame(code, nt, f)).filter(|t| !t.is_empty())
         .min_by_key(|t| t.iter().filter(|&&c| c == b'*').count())
         .is_some_and(|t| is_repeat(&t, hmm, k1, k2))
 }
@@ -257,7 +257,7 @@ struct Cand {
 
 /// One gap/flank window (+ strand sequence). Rows go to `out`; kept exons to `kept`.
 #[allow(clippy::too_many_arguments)]
-pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, o: &OrfOpts, id: &str, lead: &str, goff: i64,
+pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &OrfOpts, id: &str, lead: &str, goff: i64,
                   strand: u8, a0: i64, b0: i64, mut alo: i64, mut ahi: i64, wseq: &[u8],
                   out: &mut String, kept: &mut Vec<ChainExon>) {
     let w = wseq.len() as i64;
@@ -304,7 +304,7 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, o: &OrfOpts, id: &
         let mut start = f as i64;
         let mut i = f;
         while i + 2 < s.len() {
-            let c = translate(&s[i..i + 3]);
+            let c = translate(code, &s[i..i + 3]);
             if c != b'*' {
                 aa.push(c);
             } else {

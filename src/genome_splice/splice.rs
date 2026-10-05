@@ -122,7 +122,7 @@ fn tables(hmm: &Hmm, loc: &Locus, prm: &Params, wall: Option<(i64, i64)>) -> Tab
     for r in 0..lp {
         let node = loc.k1 + r;
         for a in 0..20 {
-            let (mv, iv) = (hmm.mat[node][a], hmm.ins[node][a]);
+            let (mv, iv) = (hmm.mat[node][a], hmm.ins(node)[a]);
             em[r][a] = if mv > 0.0 && iv > 0.0 { ((mv / iv) as f64).ln() * HALFBITS } else { NEG };
         }
         em[r][RES_X] = prm.xsc;

@@ -4,6 +4,7 @@
 //! converted to f32 the way HMMER's reader does (expf). MAP gives each match node's
 //! column in the alignment the model was built from.
 
+use std::collections::HashMap;
 
 pub const K: usize = 20; // residues, HMMER order ACDEFGHIKLMNPQRSTVWY
 
@@ -21,10 +22,16 @@ pub struct Hmm {
     pub m: usize,
     /// Node 0..=m; node 0 holds the begin node's insert emissions and transitions.
     pub mat: Vec<[f32; K]>,
-    pub ins: Vec<[f32; K]>,
+    /// Insert emissions: the distinct rows and each node's row (most nodes share one).
+    ins_rows: Vec<[f32; K]>,
+    ins_at: Vec<u32>,
     pub t: Vec<[f32; 7]>,
     /// 1-based alignment column of each match node (0 if the file has none).
     pub map: Vec<usize>,
+}
+
+impl Hmm {
+    pub fn ins(&self, k: usize) -> &[f32; K] { &self.ins_rows[self.ins_at[k] as usize] }
 }
 
 fn prob(tok: &str) -> Result<f32, String> {
@@ -99,11 +106,16 @@ fn parse_hmms(text: &str) -> Result<Vec<Hmm>, String> {
             name,
             m,
             mat: vec![[0f32; K]; m + 1],
-            ins: vec![[0f32; K]; m + 1],
+            ins_rows: Vec::new(),
+            ins_at: vec![0; m + 1],
             t: vec![[0f32; 7]; m + 1],
             map: vec![0; m + 1],
         };
-        h.ins[0] = fields::<K>(lines[i])?;
+        let mut seen: HashMap<[u32; K], u32> = HashMap::new();
+        let mut ins_row = |h: &mut Hmm, row: [f32; K]| -> u32 {
+            *seen.entry(row.map(f32::to_bits)).or_insert_with(|| { h.ins_rows.push(row); h.ins_rows.len() as u32 - 1 })
+        };
+        h.ins_at[0] = ins_row(&mut h, fields::<K>(lines[i])?);
         h.t[0] = fields::<7>(lines[i + 1])?;
         i += 2;
         for k in 1..=m {
@@ -112,7 +124,7 @@ fn parse_hmms(text: &str) -> Result<Vec<Hmm>, String> {
             let rest = ml.find(char::is_whitespace).map_or("", |p| &ml[p..]);
             h.mat[k] = fields::<K>(rest)?;
             h.map[k] = rest.split_whitespace().nth(K).and_then(|s| s.parse().ok()).unwrap_or(0);
-            h.ins[k] = fields::<K>(lines[i + 1])?;
+            h.ins_at[k] = ins_row(&mut h, fields::<K>(lines[i + 1])?);
             h.t[k] = fields::<7>(lines[i + 2])?;
             i += 3;
         }

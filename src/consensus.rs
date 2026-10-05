@@ -1,181 +1,56 @@
 use pyo3::pyfunction;
 use crate::find_indices;
 
-fn enumerate<I: IntoIterator>(iterable: I) -> std::iter::Enumerate<I::IntoIter> {
-    iterable.into_iter().enumerate()
-}
-
 #[pyfunction]
 pub fn dumb_consensus(sequences: Vec<String>, threshold: f64, min_depth: u32) -> String {
-    match min_depth {
-    0 => _dumb_consensus1(sequences,threshold),
-    _ => _dumb_consensus2(sequences, threshold, min_depth),
-    }
+    consensus(sequences[0].len(), sequences.iter().map(|s| (s.as_str(), 1)), threshold, min_depth)
 }
+
 #[pyfunction]
 pub fn dumb_consensus_dupe(sequences: Vec<(String, u32)>, threshold: f64, min_depth: u32) -> String {
-    match min_depth {
-        0 => _dumb_consensus_dupe1(sequences, threshold),
-        _ => _dumb_consensus_dupe2(sequences, threshold, min_depth),
-    }
+    consensus(sequences[0].0.len(), sequences.iter().map(|(s, n)| (s.as_str(), *n)), threshold, min_depth)
 }
-fn _dumb_consensus1(sequences: Vec<String>, threshold: f64) -> String {
-    let first = &sequences[0];
-    let mut total_at_position = vec![0_u32; first.len()];
-    let mut counts_at_position = vec![[0_u32; 27]; first.len()];
+
+/// The residue of each column that holds more than `threshold` of the column's
+/// weight ('-' for gaps and stops), else X; X too where the weight is zero or
+/// under `min_depth`. A sequence counts `weight` times from its first to its
+/// last non-gap column.
+fn consensus<'a>(
+    len: usize,
+    sequences: impl Iterator<Item = (&'a str, u32)>,
+    threshold: f64,
+    min_depth: u32,
+) -> String {
     const ASCII_OFFSET: u8 = 65;
     const HYPHEN: u8 = 45;
     const ASTERISK: u8 = 42;
-    let mut min = usize::MAX;
-    let mut max: usize = 0;
-    for sequence in sequences.iter() {
+    let mut total_at_position = vec![0_u32; len];
+    let mut counts_at_position = vec![[0_u32; 27]; len];
+    for (sequence, weight) in sequences {
         let seq = sequence.as_bytes();
         let (start, end) = find_indices(seq, b'-');
-        if start < min {
-            min = start;
-        }
-        if end > max {
-            max = end;
-        }
-        // let seq = &seq[..];
         for index in start..end {
             if index == seq.len() {
                 continue;
             }
-            total_at_position[index] += 1;
+            total_at_position[index] += weight;
             if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
-                // if seq[index]-ASCII_OFFSET == 233 {println!("{}",seq[index]);}
-                counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += 1;
-                // total_at_position[index] += 1;
+                counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += weight;
             } else {
-                counts_at_position[index][26] += 1;
+                counts_at_position[index][26] += weight;
             }
         }
     }
-    let mut output = Vec::<u8>::with_capacity(total_at_position.len());
-    for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
-        if total == 0 {
-            output.push(b'X');
-            continue;
-        } // if no characters at position, continue
-        let mut max_count: u32 = 0;
-        let mut winner = b'X'; // default to X if no winner found
-        for (index, count) in enumerate(counts) {
-            if *count as f64 / total as f64 > threshold {
-                if *count > max_count {
-                    max_count = *count;
-                    if index != 26 {
-                        winner = index as u8 + ASCII_OFFSET;
-                    } else {
-                        winner = HYPHEN;
-                    }
-                }
-            }
-        }
-
-        output.push(winner);
-    }
-
-    String::from_utf8(output).unwrap()
-}
-
-fn _dumb_consensus2(sequences: Vec<String>, threshold: f64, min_depth: u32) -> String {
-    let first = &sequences[0];
-    let mut total_at_position = vec![0_u32; first.len()];
-    let mut counts_at_position = vec![[0_u32; 27]; first.len()];
-    const ASCII_OFFSET: u8 = 65;
-    const HYPHEN: u8 = 45;
-    const ASTERISK: u8 = 42;
-    let mut min = usize::MAX;
-    let mut max: usize = 0;
-    for sequence in sequences.iter() {
-        let seq = sequence.as_bytes();
-        let (start, end) = find_indices(seq, b'-');
-        if start < min {
-            min = start;
-        }
-        if end > max {
-            max = end;
-        }
-        for index in start..end {
-            if index == seq.len() {
-                continue;
-            }
-            total_at_position[index] += 1;
-            if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
-                counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += 1;
-            } else {
-                counts_at_position[index][26] += 1;
-            }
-        }
-    }
-    let mut output = Vec::<u8>::with_capacity(total_at_position.len());
-    for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
+    let min_depth = min_depth.max(1);
+    let mut output = Vec::<u8>::with_capacity(len);
+    for (total, counts) in total_at_position.into_iter().zip(counts_at_position.iter()) {
         if total < min_depth {
             output.push(b'X');
             continue;
-        } // if no characters at position, continue
+        }
         let mut max_count: u32 = 0;
-        let mut winner = b'X'; // default to X if no winner found
-        for (index, count) in enumerate(counts) {
-            if *count as f64 / total as f64 > threshold {
-                if *count > max_count {
-                    max_count = *count;
-                    if index != 26 {
-                        winner = index as u8 + ASCII_OFFSET;
-                    } else {
-                        winner = HYPHEN;
-                    }
-                }
-            }
-        }
-
-        output.push(winner);
-    }
-
-    String::from_utf8(output).unwrap()
-}
-
-fn _dumb_consensus_dupe1(sequences: Vec<(String, u32)>, threshold: f64) -> String {
-    let (first, _) = &sequences[0];
-    let mut total_at_position = vec![0_u32; first.len()];
-    let mut counts_at_position = vec![[0_u32; 27]; first.len()];
-    const ASCII_OFFSET: u8 = 65;
-    const HYPHEN: u8 = 45;
-    const ASTERISK: u8 = 42;
-    let mut min = usize::MAX;
-    let mut max: usize = 0;
-    for (sequence, count) in sequences.iter() {
-        let seq = sequence.as_bytes();
-        let (start, end) = find_indices(seq, b'-');
-        if start < min {
-            min = start;
-        }
-        if end > max {
-            max = end;
-        }
-        // let seq = &seq[..];
-        for index in start..end {
-            if index == seq.len() {
-                continue;
-            }
-            total_at_position[index] += count;
-            if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
-                counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += count;
-            } else {
-                counts_at_position[index][26] += count;
-            }
-        }
-    }
-    let mut output = Vec::<u8>::with_capacity(total_at_position.len());
-    for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
-        if total == 0 {
-            output.push(b'X');
-            continue;
-        } // if no characters at position, continue
-        let mut max_count: u32 = 0;
-        let mut winner = b'X'; // default to X if no winner found
-        for (index, count) in enumerate(counts) {
+        let mut winner = b'X'; // no residue over the threshold
+        for (index, count) in counts.iter().enumerate() {
             if *count as f64 / total as f64 > threshold {
                 if *count > max_count {
                     max_count = *count;
@@ -191,62 +66,6 @@ fn _dumb_consensus_dupe1(sequences: Vec<(String, u32)>, threshold: f64) -> Strin
     }
     String::from_utf8(output).unwrap()
 }
-fn _dumb_consensus_dupe2(sequences: Vec<(String, u32)>, threshold: f64, min_depth: u32) -> String {
-    let (first, _) = &sequences[0];
-    let mut total_at_position = vec![0_u32; first.len()];
-    let mut counts_at_position = vec![[0_u32; 27]; first.len()];
-    const ASCII_OFFSET: u8 = 65;
-    const HYPHEN: u8 = 45;
-    const ASTERISK: u8 = 42;
-    let mut min = usize::MAX;
-    let mut max: usize = 0;
-    for (sequence, count) in sequences.iter() {
-        let seq = sequence.as_bytes();
-        let (start, end) = find_indices(seq, b'-');
-        if start < min {
-            min = start;
-        }
-        if end > max {
-            max = end;
-        }
-        // let seq = &seq[..];
-        for index in start..end {
-            if index == seq.len() {
-                continue;
-            }
-            total_at_position[index] += count;
-            if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
-                counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += count;
-            } else {
-                counts_at_position[index][26] += count;
-            }
-        }
-    }
-    let mut output = Vec::<u8>::with_capacity(total_at_position.len());
-    for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
-        if total < min_depth {
-            output.push(b'X');
-            continue;
-        } // if no characters at position, continue
-        let mut max_count: u32 = 0;
-        let mut winner = b'X'; // default to X if no winner found
-        for (index, count) in enumerate(counts) {
-            if *count as f64 / total as f64 > threshold {
-                if *count > max_count {
-                    max_count = *count;
-                    if index != 26 {
-                        winner = index as u8 + ASCII_OFFSET;
-                    } else {
-                        winner = HYPHEN;
-                    }
-                }
-            }
-        }
-        output.push(winner);
-    }
-    String::from_utf8(output).unwrap()
-}
-
 
 fn _mask_small_regions(sequence: &str, min_length: usize) -> String {
     let sequence = sequence.as_bytes();
@@ -344,73 +163,3 @@ pub fn consensus_distance(consensus: String, candidate: String, min_length: usiz
     }
     (total_distance, total_length)
 }
-// #[pyfunction]
-// fn dumb_consensus_with_excise(
-//     sequences: Vec<&str>,
-//     consensus_threshold: f64,
-//     min_depth: u32,
-//     excise_threshold: f64,
-// ) -> (String, usize, String) {
-//     let first = &sequences[0];
-//     let mut total_at_position = vec![0_u32; first.len()];
-//     let mut counts_at_position = vec![[0_u32; 27]; first.len()];
-//     const ASCII_OFFSET: u8 = 65;
-//     const HYPHEN: u8 = 45;
-//     const ASTERISK: u8 = 42;
-//     let mut min = usize::MAX;
-//     let mut max: usize = 0;
-//     for sequence in sequences.iter() {
-//         let seq = sequence.as_bytes();
-//         let (start, end) = find_indices(seq, b'-');
-//         if start < min {
-//             min = start;
-//         }
-//         if end > max {
-//             max = end;
-//         }
-//         // let seq = &seq[..];
-//         for index in start..end {
-//             if index == seq.len() {
-//                 continue;
-//             }
-//             if !(seq[index] == HYPHEN || seq[index] == ASTERISK) {
-//                 // if seq[index]-ASCII_OFFSET == 233 {println!("{}",seq[index]);}
-//                 counts_at_position[index][(seq[index] - ASCII_OFFSET) as usize] += 1;
-//                 total_at_position[index] += 1;
-//             } else {
-//                 counts_at_position[index][26] += 1;
-//             }
-//         }
-//     }
-//     let mut output = Vec::<u8>::with_capacity(total_at_position.len());
-//     // let mut ratios = Vec::<u8>::with_capacity(total_at_position.len());
-//     // let mut ratio = Vec::<u8>::with_capacity(to)
-//     for ((_, total), counts) in enumerate(total_at_position).zip(counts_at_position.iter()) {
-//         if total < min_depth {
-//             output.push(b'X');
-//             continue;
-//         } // if no characters at position, continue
-//         let mut max_count: u32 = 0;
-//         let mut winner = b'X'; // default to X if no winner found
-//         for (index, count) in enumerate(counts) {
-//             if *count as f64 / total as f64 > consensus_threshold {
-//                 if *count > max_count {
-//                     max_count = *count;
-//                     if index != 26 {
-//                         winner = index as u8 + ASCII_OFFSET;
-//                     } else {
-//                         winner = HYPHEN;
-//                     }
-//                 }
-//             }
-//         }
-//
-//         output.push(winner);
-//     }
-//     // let locations: Vec<LocationData> = counts_at_position.iter()
-//     //     .map(|letters| weigh_winner(letters))
-//     //     .collect();
-//     let consensus = String::from_utf8(output).unwrap();
-//     let (excised, cut_length) = _excise_consensus_tail(&consensus, excise_threshold);
-//     (excised, cut_length, consensus)
-// }

@@ -95,7 +95,7 @@ pub fn score_chain(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, c: &Chain, spans:
     }
     if !nodes && !bits { return out; }
     for (j, &(lo, hi)) in res.iter().enumerate() { out[j].nodes = vec![0; hi - lo]; }
-    for (node, i) in al.one_trace(&pep) {
+    for (node, i) in al.chain_trace(&pep) {
         if i == 0 || i > n { continue; }
         if let Some(j) = res.iter().position(|&(lo, hi)| i > lo && i <= hi) { out[j].nodes[i - 1 - res[j].0] = node as u32; }
     }

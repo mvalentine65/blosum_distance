@@ -196,6 +196,8 @@ impl Omx {
 pub struct AvxDp {
     fwd: Omx,
     bck: Omx,
+    /// Backward's score of the last alignment, in bits as `AlnHit::bits` is.
+    pub bck_bits: f32,
 }
 
 /// A matrix above this is dropped after its alignment, so no worker holds its largest to the end.
@@ -669,6 +671,8 @@ pub fn align(p: &Profile, om: &OProfile, seq: &[u8], dp: &mut AvxDp) -> Option<(
         let p1 = l as f32 / (l as f32 + 1.0);
         let nullsc = ((l as f32) as f64 * (p1 as f64).ln() + (1.0 - p1 as f64).ln()) as f32;
         let bits = ((fwdsc - nullsc) as f64 / std::f64::consts::LN_2) as f32;
+        let bcksc = (dp.bck.totscale + (dp.bck.xmx[SN] as f64).ln()) as f32;
+        dp.bck_bits = ((bcksc - nullsc) as f64 / std::f64::consts::LN_2) as f32;
         if !decode_optacc(l, om, &xf, &mut dp.fwd, &mut dp.bck) { return None; }
         let tr = oatrace(l, om, &xf, &dp.bck, &dp.fwd);
         let mut h = AlnHit { bits, ..Default::default() };

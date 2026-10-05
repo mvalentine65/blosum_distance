@@ -12,6 +12,9 @@ pub use super::avx::XRow as ChainRow;
 #[cfg(not(target_arch = "x86_64"))]
 pub struct ChainRow;
 
+/// Bits by which the fast aligner's scores of a chain may differ from the exact Forward.
+const CHAIN_TOL: f32 = 0.005;
+
 pub struct OrfOpts {
     pub margin: i64,
     pub min_aa: usize,
@@ -169,6 +172,26 @@ impl Aligner {
     /// Matched (node, residue) pairs of the optimal-accuracy path.
     pub fn one_trace(&mut self, pep: &[u8]) -> Vec<(usize, usize)> {
         self.run(pep).1
+    }
+    /// The same for a whole chain. The fast aligner's path stands only if its Forward
+    /// and Backward scores both match the exact Forward: then neither lost a path.
+    pub fn chain_trace(&mut self, pep: &[u8]) -> Vec<(usize, usize)> {
+        let seq: Vec<u8> = pep.iter().map(|&c| residue_code(c)).collect();
+        let p = self.prof.as_ref().unwrap();
+        #[cfg(target_arch = "x86_64")]
+        if let Some(om) = self.oprof.as_ref() {
+            let r = super::avx::align(p, om, &seq, &mut self.avxdp);
+            let bck = self.avxdp.bck_bits;
+            self.avxdp.trim();
+            if let Some((h, tr)) = r {
+                let exact = super::avx::fwd_bits_x(om, &seq, 0, None, &[], &mut Vec::new());
+                if (h.bits - exact).abs() <= CHAIN_TOL && (bck - exact).abs() <= CHAIN_TOL { return tr; }
+            }
+            let r = super::align::align_both(p, &seq, &mut self.dp);
+            self.dp = Dp::default();
+            return r.1;
+        }
+        super::align::align_both(p, &seq, &mut self.dp).1
     }
 }
 

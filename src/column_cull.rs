@@ -151,8 +151,8 @@ fn mask_stop_blosum(
         return (seqs.to_vec(), masked_cols);
     }
 
-    // Build PSSM once for all sequences.
-    let pssm = build_blosum_pssm(&ref_seqs, n_refs, aln_len);
+    // Built once, when the first stop near a data edge needs scoring: most genes have none.
+    let mut pssm: Option<Vec<Option<([f64; 20], f64)>>> = None;
 
     let mut stop_log: Vec<(String, usize, usize, usize, f64, f64, String)> = Vec::new();
     let mut result: Vec<Vec<u8>> = Vec::with_capacity(seqs.len());
@@ -200,8 +200,9 @@ fn mask_stop_blosum(
             }
 
             // Score both fragments.
-            let (left_score, _left_scored) = score_fragment(seq, &pssm, data_start, star);
-            let (right_score, _right_scored) = score_fragment(seq, &pssm, star + 1, data_end);
+            let pssm = pssm.get_or_insert_with(|| build_blosum_pssm(&ref_seqs, n_refs, aln_len));
+            let (left_score, _left_scored) = score_fragment(seq, pssm, data_start, star);
+            let (right_score, _right_scored) = score_fragment(seq, pssm, star + 1, data_end);
 
             // Determine smaller/larger.
             let (smaller_score, larger_score, trim_side) = if aa_right <= aa_left {

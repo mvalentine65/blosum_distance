@@ -27,8 +27,6 @@ memchr = "2"
 libc = "0.2"
 seq_io = "0.3"
 flate2 = { version = "1", features = ["zlib-ng"] }
-# Must cover every codec --nt-compression can select; exon_dp opens the nt DB.
-rust-rocksdb = { version = "0.52", default-features = false, features = ["zstd", "lz4", "snappy", "bindgen-runtime"] }
 
 
 [features]

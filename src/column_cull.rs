@@ -26,7 +26,7 @@ const STOP_TRIM_BAD_THRESHOLD: f64 = 0.50;
 const STOP_TRIM_GOOD_THRESHOLD: f64 = 0.60;
 
 /// Minimum fraction of refs that must have data at a column for it
-/// to enter the PSSM (matches exonfinder.py _compute_ref_data_cols).
+/// to enter the PSSM.
 const STOP_TRIM_MIN_REF_OCC: f64 = 0.30;
 
 /// Map an amino-acid byte to a dense 0..19 index (20 = unknown / sentinel).

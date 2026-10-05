@@ -2,8 +2,6 @@ mod aligner;
 mod column_cull;
 mod consensus;
 mod dedupe;
-mod exon_dp;
-mod exonfinder_post;
 mod genome_splice;
 mod flexcull;
 mod identity;
@@ -468,7 +466,6 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(identity::filter_nt, m)?)?;
     m.add_function(wrap_pyfunction!(delete_empty_columns_pairs, m)?)?;
     m.add_function(wrap_pyfunction!(is_low_complexity_nt, m)?)?;
-    m.add_function(wrap_pyfunction!(exon_dp::exon_dp, m)?)?;
     m.add_function(wrap_pyfunction!(join_with_exclusions, m)?)?;
     m.add_function(wrap_pyfunction!(join_triplets_with_exclusions_many, m)?)?;
     m.add_function(wrap_pyfunction!(get_overlap, m)?)?;
@@ -478,7 +475,6 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aligner::hmm_align, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::cull_columns, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::apply_gff_culls, m)?)?;
-    m.add_function(wrap_pyfunction!(exonfinder_post::exonfinder_process_gene, m)?)?;
     m.add_function(wrap_pyfunction!(genome_splice::run::exonfill_run, m)?)?;
     m.add_function(wrap_pyfunction!(genome_splice::run::exonfill_model_cols, m)?)?;
 

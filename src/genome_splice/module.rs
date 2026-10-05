@@ -2,7 +2,7 @@
 //! introns on either side. Each intron is translated in three frames with stops
 //! read as X, so a degraded copy aligns as one piece; its stops are left to the
 //! pseudogene stage, not held against it. A hit is an alternative by
-//! exonfinder's module rule (similar length, the same model nodes) when it
+//! the module rule (similar length, the same model nodes) when it
 //! beats its own reversal clearly and per residue: repeats give long hits
 //! whose score is spread thin. The same scan finds the copies of an
 //! N-terminal row's tail for the rebase step.

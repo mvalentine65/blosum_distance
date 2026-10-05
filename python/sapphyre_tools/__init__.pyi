@@ -115,25 +115,3 @@ def hmm_align(
     cached_hmm: Optional[str] = ...,
     cached_template: Optional[str] = ...,
 ) -> List[Tuple[str, str]]: ...
-def exon_dp(folder: str, sub_dir: str, taxa_path: str) -> Any: ...
-# flank_inputs, gap_inputs and gff_nodes are extracted by attribute name
-# (FlankInput / GapInput / GffEntryInput), so any object with the right
-# attributes is accepted.
-def exonfinder_process_gene(
-    gene_key: str,
-    aa_file: str,
-    refs_aa: List[Tuple[str, str]],
-    natives_aa: List[Tuple[str, str]],
-    flank_inputs: List[Any],
-    gap_inputs: List[Any],
-    nt_seqs: Dict[str, str],
-    gff_nodes: Dict[str, Any],
-    clusters_for_gene: Dict[str, List[str]],
-    taxa: Optional[str],
-    tmpdir: Optional[str],
-    debug_level: int,
-    skip_exon_split: bool,
-    disable_column_cull: bool,
-    log_dir: Optional[str],
-    disable_score_filter: bool,
-) -> Dict[str, Any]: ...

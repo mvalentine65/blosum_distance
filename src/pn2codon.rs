@@ -961,8 +961,13 @@ pub fn pn2codon(
         }
     };
 
+    // In input order: a hash map's order, and with it the record an error names,
+    // differs from call to call.
+    let mut records: Vec<_> = seqs.into_iter().collect();
+    records.sort_by(|a, b| a.1.1.0.cmp(&b.1.1.0).then_with(|| a.0.cmp(&b.0)));
+
     let mut file = String::new();
-    for (index, (header, ((aa_header, aa), (_, nt_header, nt)))) in seqs.into_iter().enumerate() {
+    for (index, (header, ((aa_header, aa), (_, nt_header, nt)))) in records.into_iter().enumerate() {
         let codon = translate_record_with_signature(
             signature,
             index + 1,
@@ -993,8 +998,12 @@ pub fn pn2codon_original_args(
     let aa_source_label: Arc<str> = source_label_from_path(&aa_path, "aa.fa").into();
     let nt_source_label: Arc<str> = source_label_from_path(&nt_path, "nt.fa").into();
 
+    // By header: these records carry no input position.
+    let mut records: Vec<_> = seqs.into_iter().collect();
+    records.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut file = String::new();
-    for (index, (header, ((aa_header, aa), (nt_header, nt)))) in seqs.into_iter().enumerate() {
+    for (index, (header, ((aa_header, aa), (nt_header, nt)))) in records.into_iter().enumerate() {
         let codon = translate_record_with_table(
             &gene_table,
             index + 1,

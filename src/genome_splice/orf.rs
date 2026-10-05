@@ -53,7 +53,13 @@ impl Aligner {
         let p = self.prof.as_ref().unwrap();
         #[cfg(target_arch = "x86_64")]
         if let Some(om) = self.oprof.as_ref() {
-            if let Some(r) = super::avx::align(p, om, &seq, &mut self.avxdp) { return r; }
+            let r = super::avx::align(p, om, &seq, &mut self.avxdp);
+            self.avxdp.trim();
+            if let Some(r) = r { return r; }
+            // rare: a worker does not keep the generic matrices
+            let r = super::align::align_both(p, &seq, &mut self.dp);
+            self.dp = Dp::default();
+            return r;
         }
         super::align::align_both(p, &seq, &mut self.dp)
     }

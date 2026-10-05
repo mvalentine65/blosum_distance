@@ -198,6 +198,17 @@ pub struct AvxDp {
     bck: Omx,
 }
 
+/// A matrix above this is dropped after its alignment, so no worker holds its largest to the end.
+const KEEP_BYTES: usize = 32 << 20;
+
+impl AvxDp {
+    pub fn trim(&mut self) {
+        for ox in [&mut self.fwd, &mut self.bck] {
+            if ox.dp.capacity() * std::mem::size_of::<__m256>() > KEEP_BYTES { ox.dp = Vec::new(); }
+        }
+    }
+}
+
 struct Xf { n: [f32; 2], c: [f32; 2], j: [f32; 2], e: [f32; 2] }
 
 fn xf_for(om: &OProfile, l: usize) -> Xf {

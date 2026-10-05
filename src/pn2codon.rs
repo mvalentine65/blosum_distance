@@ -10,11 +10,9 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-
-type GeneTable = HashMap<char, Vec<String>>;
 
 const VALID_PEPS: &[char] = &[
     'A', 'L', 'W', 'Q', 'Y', 'E', 'C', 'D', 'F', 'G', 'H', 'I', 'M', 'K', 'P', 'R', 'S', 'V',
@@ -30,23 +28,6 @@ fn normalize_base(base: u8) -> u8 {
     match base.to_ascii_uppercase() {
         b'U' => b'T',
         normalized => normalized,
-    }
-}
-
-fn iupac_expansions(base: u8) -> &'static [u8] {
-    match normalize_base(base) {
-        b'R' => b"AG",
-        b'Y' => b"CT",
-        b'S' => b"GC",
-        b'W' => b"AT",
-        b'K' => b"GT",
-        b'M' => b"AC",
-        b'B' => b"CGT",
-        b'D' => b"AGT",
-        b'H' => b"ACT",
-        b'V' => b"ACG",
-        b'N' => b"ACGT",
-        _ => b"",
     }
 }
 
@@ -206,86 +187,6 @@ fn ambiguous_triplet_matches_signature(signature: &str, aa: char, triplet: &str)
     false
 }
 
-fn recurse(triplet: &[u8], working: &mut [u8], index: usize, output: &mut HashSet<String>) {
-    if index == triplet.len() {
-        output.insert(String::from_utf8(working.to_vec()).unwrap_or_default());
-        return;
-    }
-
-    let this_char = normalize_base(triplet[index]);
-    working[index] = this_char;
-    recurse(triplet, working, index + 1, output);
-
-    for replacement in iupac_expansions(this_char) {
-        working[index] = *replacement;
-        recurse(triplet, working, index + 1, output);
-    }
-}
-
-pub fn make_iupac_set(triplet: &[u8]) -> HashSet<String> {
-    let mut output = HashSet::new();
-    let mut working = vec![0_u8; triplet.len()];
-    recurse(triplet, &mut working, 0, &mut output);
-    output
-}
-
-fn iupac_matches(pattern_base: u8, concrete_base: u8) -> bool {
-    let pattern = normalize_base(pattern_base);
-    let concrete = normalize_base(concrete_base);
-    match pattern {
-        b'A' | b'C' | b'G' | b'T' => concrete == pattern,
-        b'R' => concrete == b'A' || concrete == b'G',
-        b'Y' => concrete == b'C' || concrete == b'T',
-        b'S' => concrete == b'G' || concrete == b'C',
-        b'W' => concrete == b'A' || concrete == b'T',
-        b'K' => concrete == b'G' || concrete == b'T',
-        b'M' => concrete == b'A' || concrete == b'C',
-        b'B' => concrete == b'C' || concrete == b'G' || concrete == b'T',
-        b'D' => concrete == b'A' || concrete == b'G' || concrete == b'T',
-        b'H' => concrete == b'A' || concrete == b'C' || concrete == b'T',
-        b'V' => concrete == b'A' || concrete == b'C' || concrete == b'G',
-        b'N' => matches!(concrete, b'A' | b'C' | b'G' | b'T'),
-        _ => false,
-    }
-}
-
-fn has_iupac_match<'a, I>(original_triplet: &str, taxa: I) -> bool
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    let pattern = original_triplet.as_bytes();
-    if pattern.len() != 3 {
-        return false;
-    }
-
-    for triplet in taxa {
-        let candidate = triplet.as_bytes();
-        if candidate.len() != 3 {
-            continue;
-        }
-
-        if pattern
-            .iter()
-            .zip(candidate.iter())
-            .all(|(pattern_base, concrete_base)| iupac_matches(*pattern_base, *concrete_base))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-#[pyfunction]
-pub fn attempt_iupac_substitution(original_triplet: &str, taxa: Vec<String>) -> Option<String> {
-    let possible_subs = make_iupac_set(original_triplet.as_bytes());
-    for triplet in taxa {
-        if possible_subs.contains(triplet.as_str()) {
-            return Some(original_triplet.to_string());
-        }
-    }
-    None
-}
-
 #[derive(Clone)]
 struct AminoAcidTranslator {
     sequence_index: usize,
@@ -355,7 +256,6 @@ fn clamp_window(len: usize, center: usize, radius: usize) -> (usize, usize) {
 enum NtTrackMode<'a> {
     None,
     Signature(&'a str),
-    Table(&'a GeneTable),
 }
 
 fn spaced_aa_track(aas: &str) -> String {
@@ -390,40 +290,6 @@ fn translate_nt_window_with_signature(signature: &str, nt_window: &str) -> Strin
     out
 }
 
-fn translate_nt_window_with_table(gene_table: &GeneTable, nt_window: &str) -> String {
-    let mut aa_keys: Vec<char> = gene_table.keys().copied().collect();
-    aa_keys.sort_unstable();
-
-    let mut out = String::new();
-    for chunk in nt_window.as_bytes().chunks(3) {
-        if chunk.len() != 3 {
-            break;
-        }
-
-        let codon = match std::str::from_utf8(chunk) {
-            Ok(value) => value,
-            Err(_) => {
-                out.push('X');
-                continue;
-            }
-        };
-
-        let mut mapped = 'X';
-        for aa in aa_keys.iter() {
-            if let Some(codons) = gene_table.get(aa) {
-                if codons.iter().any(|triplet| triplet == codon)
-                    || has_iupac_match(codon, codons.iter().map(String::as_str))
-                {
-                    mapped = *aa;
-                    break;
-                }
-            }
-        }
-        out.push(mapped);
-    }
-    out
-}
-
 fn codon_matches_expected_in_mode(nt_track_mode: NtTrackMode<'_>, expected_aa: char, codon: &str) -> bool {
     match nt_track_mode {
         NtTrackMode::None => true,
@@ -431,13 +297,6 @@ fn codon_matches_expected_in_mode(nt_track_mode: NtTrackMode<'_>, expected_aa: c
             codon_matches_signature(signature, expected_aa, codon)
                 || ambiguous_triplet_matches_signature(signature, expected_aa, codon)
         }
-        NtTrackMode::Table(gene_table) => match gene_table.get(&expected_aa) {
-            Some(taxa) => {
-                taxa.iter().any(|triplet| triplet == codon)
-                    || has_iupac_match(codon, taxa.iter().map(String::as_str))
-            }
-            None => false,
-        },
     }
 }
 
@@ -529,7 +388,6 @@ fn format_seq_inconsistency_details(
         let translated_nt_aas = match nt_track_mode {
             NtTrackMode::None => String::new(),
             NtTrackMode::Signature(signature) => translate_nt_window_with_signature(signature, nt_window),
-            NtTrackMode::Table(gene_table) => translate_nt_window_with_table(gene_table, nt_window),
         };
 
         let nt_track = spaced_aa_track(&translated_nt_aas);
@@ -716,88 +574,6 @@ impl AminoAcidTranslator {
         ));
     }
 
-    fn reverse_translate_and_compare_with_table(&self, gene_table: &GeneTable) -> String {
-        let mut compare_triplets = self.nucleotide.as_bytes().chunks(3);
-        let mut nt_triplet_index = 0_usize;
-        let mut output = String::with_capacity(self.nucleotide.len());
-
-        for (aa_index, aa) in self.amino_acid.chars().enumerate() {
-            if aa == '-' {
-                output.push_str("---");
-                continue;
-            }
-
-            if aa.is_ascii_digit() {
-                if let Some(digit) = aa.to_digit(10) {
-                    output.push_str(&".".repeat(digit as usize));
-                }
-                continue;
-            }
-
-            let taxa = match gene_table.get(&aa) {
-                Some(codons) => codons,
-                None => {
-                    let mut supported: Vec<char> = gene_table.keys().copied().collect();
-                    supported.sort_unstable();
-                    let supported_list = supported
-                        .iter()
-                        .map(char::to_string)
-                        .collect::<Vec<String>>()
-                        .join(", ");
-                    let details = format!(
-                        "Amino acid         : '{}'\nAlignment position : {}\nValid symbols      : {}",
-                        aa,
-                        aa_index + 1,
-                        supported_list
-                    );
-                    self.report_error(format_error_block(
-                        "Amino acid is missing from custom codon table.",
-                        &details,
-                    ));
-                    return String::new();
-                }
-            };
-
-            let nt_base_index = nt_triplet_index * 3;
-            let original_triplet = match compare_triplets.next() {
-                Some(chunk) if chunk.len() == 3 => match std::str::from_utf8(chunk) {
-                    Ok(triplet) => {
-                        nt_triplet_index += 1;
-                        triplet
-                    }
-                    Err(_) => {
-                        self.error_out_mismatch(
-                            aa_index,
-                            nt_base_index,
-                            NtTrackMode::Table(gene_table),
-                        );
-                        return String::new();
-                    }
-                },
-                _ => {
-                    self.error_out_mismatch(aa_index, nt_base_index, NtTrackMode::Table(gene_table));
-                    return String::new();
-                }
-            };
-
-            if original_triplet.contains('N') || aa == 'X' {
-                output.push_str(original_triplet);
-                continue;
-            }
-
-            if taxa.iter().any(|triplet| triplet == original_triplet)
-                || has_iupac_match(original_triplet, taxa.iter().map(String::as_str))
-            {
-                output.push_str(original_triplet);
-            } else {
-                self.error_out_mismatch(aa_index, nt_base_index, NtTrackMode::Table(gene_table));
-                return String::new();
-            }
-        }
-
-        output
-    }
-
     fn reverse_translate_and_compare_with_signature(&self, signature: &str) -> String {
         let mut compare_triplets = self.nucleotide.as_bytes().chunks(3);
         let mut nt_triplet_index = 0_usize;
@@ -863,41 +639,6 @@ impl AminoAcidTranslator {
 
         output
     }
-}
-
-fn translate_record_with_table(
-    gene_table: &GeneTable,
-    sequence_index: usize,
-    aa_source_label: &Arc<str>,
-    nt_source_label: &Arc<str>,
-    aa_header: String,
-    aa: String,
-    nt_header: String,
-    nt: String,
-) -> Result<String, String> {
-    let mut translator = AminoAcidTranslator::new(
-        sequence_index,
-        Arc::clone(aa_source_label),
-        aa_header,
-        aa,
-        Arc::clone(nt_source_label),
-        nt_header,
-        nt,
-    );
-    translator.streamline();
-    translator.do_checks();
-    if translator.has_reported_error.get() {
-        return Err(translator.get_error_message().unwrap_or_else(|| {
-            format_error_block("Peptide and nucleotide sequences are inconsistent.", "")
-        }));
-    }
-    let codon = translator.reverse_translate_and_compare_with_table(gene_table);
-    if translator.has_reported_error.get() {
-        return Err(translator.get_error_message().unwrap_or_else(|| {
-            format_error_block("Peptide and nucleotide sequences are inconsistent.", "")
-        }));
-    }
-    Ok(codon)
 }
 
 fn translate_record_with_signature(
@@ -970,42 +711,6 @@ pub fn pn2codon(
     for (index, (header, ((aa_header, aa), (_, nt_header, nt)))) in records.into_iter().enumerate() {
         let codon = translate_record_with_signature(
             signature,
-            index + 1,
-            &aa_source_label,
-            &nt_source_label,
-            aa_header,
-            aa,
-            nt_header,
-            nt,
-        )
-        .map_err(PyValueError::new_err)?;
-        file.push_str(&header);
-        file.push('\n');
-        file.push_str(&codon);
-        file.push('\n');
-    }
-    Ok(file)
-}
-
-#[pyfunction]
-pub fn pn2codon_original_args(
-    _file_steem: String,
-    aa_path: String,
-    nt_path: String,
-    gene_table: HashMap<char, Vec<String>>,
-    seqs: HashMap<String, ((String, String), (String, String))>,
-) -> PyResult<String> {
-    let aa_source_label: Arc<str> = source_label_from_path(&aa_path, "aa.fa").into();
-    let nt_source_label: Arc<str> = source_label_from_path(&nt_path, "nt.fa").into();
-
-    // By header: these records carry no input position.
-    let mut records: Vec<_> = seqs.into_iter().collect();
-    records.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut file = String::new();
-    for (index, (header, ((aa_header, aa), (nt_header, nt)))) in records.into_iter().enumerate() {
-        let codon = translate_record_with_table(
-            &gene_table,
             index + 1,
             &aa_source_label,
             &nt_source_label,

@@ -4,8 +4,6 @@ mod consensus;
 mod dedupe;
 mod genome_splice;
 mod flexcull;
-mod identity;
-mod interval_tree;
 mod ntbatch;
 mod pn2codon;
 mod reads;
@@ -499,7 +497,6 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(consensus::consensus_distance, m)?)?;
     m.add_function(wrap_pyfunction!(find_index_pair, m)?)?;
     m.add_function(wrap_pyfunction!(blosum62_candidate_to_reference, m)?)?;
-    m.add_function(wrap_pyfunction!(identity::filter_nt, m)?)?;
     m.add_function(wrap_pyfunction!(delete_empty_columns_pairs, m)?)?;
     m.add_function(wrap_pyfunction!(is_low_complexity_nt, m)?)?;
     m.add_function(wrap_pyfunction!(join_with_exclusions, m)?)?;
@@ -507,15 +504,12 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_overlap, m)?)?;
     m.add_function(wrap_pyfunction!(is_same_kmer, m)?)?;
     m.add_function(wrap_pyfunction!(translate::translate, m)?)?;
-    m.add_function(wrap_pyfunction!(interval_tree::del_cols, m)?)?;
     m.add_function(wrap_pyfunction!(aligner::hmm_align, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::cull_columns, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::apply_gff_culls, m)?)?;
     m.add_function(wrap_pyfunction!(genome_splice::run::exonfill_run, m)?)?;
     m.add_function(wrap_pyfunction!(genome_splice::run::exonfill_model_cols, m)?)?;
     m.add_function(wrap_pyfunction!(pn2codon::pn2codon, m)?)?;
-    m.add_function(wrap_pyfunction!(pn2codon::pn2codon_original_args, m)?)?;
-    m.add_function(wrap_pyfunction!(pn2codon::attempt_iupac_substitution, m)?)?;
 
     m.add_class::<CullTables>()?;
     m.add_class::<ntbatch::NtBatchScanner>()?;

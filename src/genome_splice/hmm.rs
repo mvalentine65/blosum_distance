@@ -52,17 +52,49 @@ fn fields<const N: usize>(line: &str) -> Result<[f32; N], String> {
     Ok(out)
 }
 
+/// A file mapped read-only, so the text is parsed without a copy in memory.
+#[cfg(unix)]
+struct Mapped { ptr: *mut libc::c_void, len: usize }
+
+#[cfg(unix)]
+impl Mapped {
+    fn open(path: &str) -> std::io::Result<Mapped> {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::File::open(path)?;
+        let len = f.metadata()?.len() as usize;
+        if len == 0 { return Ok(Mapped { ptr: std::ptr::null_mut(), len }); }
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
+        if ptr == libc::MAP_FAILED { return Err(std::io::Error::last_os_error()); }
+        Ok(Mapped { ptr, len })
+    }
+    fn bytes(&self) -> &[u8] {
+        if self.len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) } }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Mapped {
+    fn drop(&mut self) { if self.len > 0 { unsafe { libc::munmap(self.ptr, self.len); } } }
+}
+
 /// Every model in the file, in file order. Chunks of whole records parse on
 /// `threads` threads.
 pub fn read_hmms(path: &str, threads: usize) -> Result<Vec<Hmm>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    #[cfg(unix)]
+    let file = Mapped::open(path).map_err(|e| format!("{path}: {e}"))?;
+    #[cfg(unix)]
+    let text: &[u8] = file.bytes();
+    #[cfg(not(unix))]
+    let file = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    #[cfg(not(unix))]
+    let text: &[u8] = &file;
     let n = threads.max(1);
     let mut cuts = vec![0usize];
     for c in 1..n {
         let want = (text.len() * c / n).max(*cuts.last().unwrap());
-        match text[want..].find("\n//") {
+        match memchr::memmem::find(&text[want..], b"\n//") {
             Some(p) => {
-                let at = text[want + p + 1..].find('\n').map_or(text.len(), |q| want + p + 1 + q + 1);
+                let at = memchr::memchr(b'\n', &text[want + p + 1..]).map_or(text.len(), |q| want + p + 1 + q + 1);
                 if at > *cuts.last().unwrap() { cuts.push(at); }
             }
             None => break,
@@ -71,7 +103,10 @@ pub fn read_hmms(path: &str, threads: usize) -> Result<Vec<Hmm>, String> {
     cuts.push(text.len());
     cuts.dedup();
     let parts: Vec<Result<Vec<Hmm>, String>> = std::thread::scope(|sc| {
-        let hs: Vec<_> = cuts.windows(2).map(|w| { let t = &text[w[0]..w[1]]; sc.spawn(move || parse_hmms(t)) }).collect();
+        let hs: Vec<_> = cuts.windows(2).map(|w| {
+            let t = &text[w[0]..w[1]];
+            sc.spawn(move || parse_hmms(std::str::from_utf8(t).map_err(|e| format!("{path}: {e}"))?))
+        }).collect();
         hs.into_iter().map(|h| h.join().expect("model parser panicked")).collect()
     });
     let mut out = Vec::new();

@@ -31,7 +31,7 @@ const TABLE_31: &[u8; 64] = b"FFLLSSSSYYEECCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVV
 const TABLE_32: &[u8; 64] = b"FFLLSSSSYY*WCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG";
 const TABLE_33: &[u8; 64] = b"FFLLSSSSYYY*CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSSKVVVVAAAADDEEGGGG";
 
-fn genetic_code_table(table: u8) -> Option<&'static [u8; 64]> {
+pub(crate) fn genetic_code_table(table: u8) -> Option<&'static [u8; 64]> {
     match table {
         1 => Some(TABLE_1),
         2 => Some(TABLE_2),

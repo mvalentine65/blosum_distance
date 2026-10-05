@@ -301,8 +301,18 @@ unsafe fn forward<const ROLL: bool>(dsq: &[u8], om: &OProfile, xf: &Xf, ox: &mut
     (ox.totscale + ((xc * xf.c[MOVE]) as f64).ln()) as f32
 }
 
+/// Forward's row times Backward's (M and I): all that decoding needs of the two.
 #[target_feature(enable = "avx2")]
-unsafe fn backward(dsq: &[u8], om: &OProfile, xf: &Xf, fwd: &Omx, bck: &mut Omx) {
+unsafe fn fold_row(f: &mut [__m256], b: &[__m256], q_: usize) {
+    for q in 0..q_ {
+        f[q * 3 + XM] = _mm256_mul_ps(f[q * 3 + XM], b[q * 3 + XM]);
+        f[q * 3 + XI] = _mm256_mul_ps(f[q * 3 + XI], b[q * 3 + XI]);
+    }
+}
+
+/// Backward keeps two dp rows (row i in slot i & 1); each finished row is folded into Forward's.
+#[target_feature(enable = "avx2")]
+unsafe fn backward(dsq: &[u8], om: &OProfile, xf: &Xf, fwd: &mut Omx, bck: &mut Omx) {
     let l = dsq.len() - 1;
     let q_ = om.q;
     let row = q_ * 3;
@@ -311,13 +321,13 @@ unsafe fn backward(dsq: &[u8], om: &OProfile, xf: &Xf, fwd: &Omx, bck: &mut Omx)
     bck.has_own_scales = false;
     let dp = &mut bck.dp;
     let x = &mut bck.xmx;
-    let fx = &fwd.xmx;
+    let (fx, fdp) = (&fwd.xmx, &mut fwd.dp);
     let mut xj = 0.0f32; let mut xb = 0.0f32; let mut xn = 0.0f32;
     let mut xc = xf.c[MOVE];
     let mut xe = xc * xf.e[MOVE];
     let mut xev = _mm256_set1_ps(xe);
     let mut dcv = zerov;
-    let pc = l * row;
+    let pc = (l & 1) * row;
     for q in 0..q_ { dp[pc + q * 3 + XM] = xev; dp[pc + q * 3 + XD] = xev; }
     for q in 0..q_ { dp[pc + q * 3 + XI] = zerov; }
     // L row DD paths
@@ -354,13 +364,14 @@ unsafe fn backward(dsq: &[u8], om: &OProfile, xf: &Xf, fwd: &Omx, bck: &mut Omx)
             dp[pc + q * 3 + XI] = _mm256_mul_ps(dp[pc + q * 3 + XI], xev);
         }
     }
+    fold_row(&mut fdp[l * row..(l + 1) * row], &dp[pc..pc + row], q_);
     x[lr + SSCALE] = fx[lr + SSCALE];
     bck.totscale = (x[lr + SSCALE] as f64).ln();
     x[lr + SE] = xe; x[lr + SN] = xn; x[lr + SJ] = xj; x[lr + SB] = xb; x[lr + SC] = xc;
 
     for i in (1..l).rev() {
-        let pc = i * row;
-        let pp = (i + 1) * row;
+        let pc = (i & 1) * row;
+        let pp = ((i + 1) & 1) * row;
         let rbase = dsq[i + 1] as usize * q_;
         let mut rp = rbase + q_ - 1;
         let mut tp: isize = 7 * q_ as isize - 1;
@@ -425,6 +436,7 @@ unsafe fn backward(dsq: &[u8], om: &OProfile, xf: &Xf, fwd: &Omx, bck: &mut Omx)
             }
             bck.totscale += (sc as f64).ln();
         }
+        fold_row(&mut fdp[i * row..(i + 1) * row], &dp[pc..pc + row], q_);
         x[xr + SE] = xe; x[xr + SN] = xn; x[xr + SJ] = xj; x[xr + SB] = xb; x[xr + SC] = xc;
     }
     // i = 0
@@ -441,16 +453,14 @@ unsafe fn backward(dsq: &[u8], om: &OProfile, xf: &Xf, fwd: &Omx, bck: &mut Omx)
     x[SB] = xb; x[SC] = 0.0; x[SJ] = 0.0; x[SN] = xn; x[SE] = 0.0; x[SSCALE] = 1.0;
 }
 
-/// Posterior decoding into bck (in place, as bathfill calls it), and the optimal
-/// accuracy fill into fwd, one row at a time: row i is decoded and then filled
-/// while it is still in cache. false on overflow.
+/// Posterior decoding and the optimal accuracy fill, in place in fwd (Forward
+/// times Backward), one row at a time. false on overflow.
 #[target_feature(enable = "avx2")]
 unsafe fn decode_optacc(l: usize, om: &OProfile, xf: &Xf, fwd: &mut Omx, bck: &mut Omx) -> bool {
     let q_ = om.q;
     let row = q_ * 3;
     let mut scaleproduct: f32 = (1.0f64 / bck.xmx[SN] as f64) as f32;
     let has_own = bck.has_own_scales;
-    for q in 0..q_ * 3 { bck.dp[q] = _mm256_setzero_ps(); }
     for s in 0..5 { bck.xmx[s] = 0.0; }
     // Forward's N, J, C of the previous row: the fill overwrites them
     let mut fprev = [fwd.xmx[SN], fwd.xmx[SJ], fwd.xmx[SC]];
@@ -470,9 +480,8 @@ unsafe fn decode_optacc(l: usize, om: &OProfile, xf: &Xf, fwd: &mut Omx, bck: &m
         let base = i * row;
         for q in 0..q_ {
             let mi = base + q * 3;
-            pp.dp[mi + XM] = _mm256_mul_ps(_mm256_mul_ps(ox.dp[mi + XM], pp.dp[mi + XM]), totrv);
-            pp.dp[mi + XD] = _mm256_setzero_ps();
-            pp.dp[mi + XI] = _mm256_mul_ps(_mm256_mul_ps(ox.dp[mi + XI], pp.dp[mi + XI]), totrv);
+            ox.dp[mi + XM] = _mm256_mul_ps(ox.dp[mi + XM], totrv);
+            ox.dp[mi + XI] = _mm256_mul_ps(ox.dp[mi + XI], totrv);
         }
         pp.xmx[xr + SE] = 0.0;
         pp.xmx[xr + SN] = fprev[0] * pp.xmx[xr + SN] * xf.n[LOOP] * scaleproduct;
@@ -496,7 +505,7 @@ unsafe fn decode_optacc(l: usize, om: &OProfile, xf: &Xf, fwd: &mut Omx, bck: &m
             sv = _mm256_max_ps(sv, _mm256_and_ps(gt(t[tp]), mpv)); tp += 1;
             sv = _mm256_max_ps(sv, _mm256_and_ps(gt(t[tp]), ipv)); tp += 1;
             sv = _mm256_max_ps(sv, _mm256_and_ps(gt(t[tp]), dpv)); tp += 1;
-            sv = _mm256_add_ps(sv, pp.dp[pc + q * 3 + XM]);
+            sv = _mm256_add_ps(sv, ox.dp[pc + q * 3 + XM]);
             xev = _mm256_max_ps(xev, sv);
             mpv = ox.dp[pv + q * 3 + XM];
             dpv = ox.dp[pv + q * 3 + XD];
@@ -506,7 +515,7 @@ unsafe fn decode_optacc(l: usize, om: &OProfile, xf: &Xf, fwd: &mut Omx, bck: &m
             dcv = _mm256_and_ps(gt(t[tp]), sv); tp += 1;
             let mut s2 = _mm256_and_ps(gt(t[tp]), mpv); tp += 1;
             s2 = _mm256_max_ps(s2, _mm256_and_ps(gt(t[tp]), ipv)); tp += 1;
-            ox.dp[pc + q * 3 + XI] = _mm256_add_ps(s2, pp.dp[pc + q * 3 + XI]);
+            ox.dp[pc + q * 3 + XI] = _mm256_add_ps(s2, ox.dp[pc + q * 3 + XI]);
         }
         dcv = rs(dcv);
         let dd0 = 7 * q_;
@@ -642,10 +651,10 @@ pub fn align(p: &Profile, om: &OProfile, seq: &[u8], dp: &mut AvxDp) -> Option<(
     dsq.extend_from_slice(seq);
     let xf = xf_for(om, l);
     dp.fwd.grow(l + 1, om.q);
-    dp.bck.grow(l + 1, om.q);
+    dp.bck.grow2(2, l + 1, om.q);
     unsafe {
         let fwdsc = forward::<false>(&dsq, om, &xf, &mut dp.fwd);
-        backward(&dsq, om, &xf, &dp.fwd, &mut dp.bck);
+        backward(&dsq, om, &xf, &mut dp.fwd, &mut dp.bck);
         let p1 = l as f32 / (l as f32 + 1.0);
         let nullsc = ((l as f32) as f64 * (p1 as f64).ln() + (1.0 - p1 as f64).ln()) as f32;
         let bits = ((fwdsc - nullsc) as f64 / std::f64::consts::LN_2) as f32;

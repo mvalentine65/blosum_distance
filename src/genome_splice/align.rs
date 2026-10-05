@@ -101,8 +101,8 @@ pub struct AlnHit {
     pub rl: i32,
 }
 
-/// Reusable DP storage (log space). Forward's cells are reused for the
-/// optimal-accuracy fill and Backward's for the posteriors.
+/// Reusable DP storage (log space): one matrix, used in turn for Forward,
+/// Forward plus Backward, the posteriors and the optimal-accuracy fill.
 #[derive(Default)]
 pub struct Dp {
     fm: Vec<f32>, fi: Vec<f32>, fd: Vec<f32>, fx: Vec<f32>,
@@ -140,15 +140,15 @@ fn lsum(a: f32, b: f32) -> f32 {
 }
 
 /// Forward and Backward in log space (p7_GForward, p7_GBackward): no scaling,
-/// so no limit on how far apart the paths of a row may score. The posteriors
-/// are written over Backward and the optimal-accuracy fill over Forward.
+/// so no limit on how far apart the paths of a row may score.
 fn run(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, usize)>) {
     let l = seq.len();
     let m = p.m;
     if l == 0 { return (AlnHit::default(), Vec::new()); }
     let w = m + 1;
     let cells = (l + 1) * w;
-    for v in [&mut dp.fm, &mut dp.fi, &mut dp.fd, &mut dp.bm, &mut dp.bi, &mut dp.bd] { grow(v, cells); }
+    for v in [&mut dp.fm, &mut dp.fi, &mut dp.fd] { grow(v, cells); }
+    for v in [&mut dp.bm, &mut dp.bi, &mut dp.bd] { grow(v, 2 * w); }
     for v in [&mut dp.fx, &mut dp.bx, &mut dp.px, &mut dp.ox] { grow(v, (l + 1) * 5); }
 
     // length model: unilocal, nj = 0 (J is never entered: E->J is impossible)
@@ -189,10 +189,11 @@ fn run(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, usize)>) {
     }
     let total = dp.fx[x(l, XC)] + cmove;
 
-    // ---- Backward
+    // ---- Backward, row i in slot i & 1; each finished row is added to Forward's (M and I)
     {
+        let (fm, fi) = (&mut dp.fm, &mut dp.fi);
         let (bm, bi, bd, bx) = (&mut dp.bm, &mut dp.bi, &mut dp.bd, &mut dp.bx);
-        let lr = l * w;
+        let lr = (l & 1) * w;
         bx[x(l, XC)] = cmove; bx[x(l, XE)] = cmove; bx[x(l, XB)] = LNEG; bx[x(l, XN)] = LNEG; bx[x(l, XJ)] = LNEG;
         bm[lr + m] = cmove; bd[lr + m] = cmove; bi[lr + m] = LNEG;
         for k in (1..m).rev() {
@@ -200,9 +201,10 @@ fn run(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, usize)>) {
             bd[lr + k] = lsum(cmove, bd[lr + k + 1] + tdd[k]);
             bi[lr + k] = LNEG;
         }
+        for k in 1..w { fm[l * w + k] += bm[lr + k]; fi[l * w + k] += bi[lr + k]; }
         for i in (0..l).rev() {
             let r = seq[i] as usize; // x_{i+1}
-            let (cr, nr) = (i * w, (i + 1) * w);
+            let (cr, nr) = ((i & 1) * w, ((i + 1) & 1) * w);
             let mut b = LNEG;
             for k in 1..w { b = lsum(b, bm[nr + k] + tbm[k - 1] + p.msc[k][r] as f32); }
             let nval = lsum(bx[x(i + 1, XN)] + nloop, b + nmove);
@@ -219,21 +221,22 @@ fn run(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, usize)>) {
                 bi[cr + k] = lsum(nm + tim[k], bi[nr + k] + tii[k]);
                 bd[cr + k] = lsum(lsum(nm + tdm[k], bd[cr + k + 1] + tdd[k]), e);
             }
+            for k in 1..w { fm[i * w + k] += bm[cr + k]; fi[i * w + k] += bi[cr + k]; }
             bx[x(i, XB)] = b; bx[x(i, XC)] = e; bx[x(i, XE)] = e; bx[x(i, XN)] = nval; bx[x(i, XJ)] = LNEG;
         }
     }
 
-    // ---- Posterior decoding (p7_GDecoding), over Backward; rows normalised
+    // ---- Posterior decoding (p7_GDecoding), in place; rows normalised
     {
-        let (fm, fi, fx, bx) = (&dp.fm, &dp.fi, &dp.fx, &dp.bx);
-        let (pm, pi, px) = (&mut dp.bm, &mut dp.bi, &mut dp.px);
+        let (fx, bx) = (&dp.fx, &dp.bx);
+        let (pm, pi, px) = (&mut dp.fm, &mut dp.fi, &mut dp.px);
         for i in 1..=l {
             let cr = i * w;
             pm[cr] = 0.0; pi[cr] = 0.0;
             let mut denom = 0.0f32;
             for k in 1..w {
-                pm[cr + k] = (fm[cr + k] + pm[cr + k] - total).exp(); denom += pm[cr + k];
-                pi[cr + k] = if k < m { (fi[cr + k] + pi[cr + k] - total).exp() } else { 0.0 }; denom += pi[cr + k];
+                pm[cr + k] = (pm[cr + k] - total).exp(); denom += pm[cr + k];
+                pi[cr + k] = if k < m { (pi[cr + k] - total).exp() } else { 0.0 }; denom += pi[cr + k];
             }
             px[x(i, XN)] = (fx[x(i - 1, XN)] + bx[x(i, XN)] + nloop - total).exp();
             px[x(i, XJ)] = 0.0;
@@ -245,9 +248,9 @@ fn run(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, usize)>) {
         }
     }
 
-    // ---- Optimal accuracy fill (p7_GOptimalAccuracy), over Forward
+    // ---- Optimal accuracy fill (p7_GOptimalAccuracy), in place
     let td = |v: f64| if v == NEG { FLT_MIN } else { 1.0 };
-    let (pm, pi, px) = (&dp.bm, &dp.bi, &dp.px);
+    let px = &dp.px;
     let (om, oi, od, ox) = (&mut dp.fm, &mut dp.fi, &mut dp.fd, &mut dp.ox);
     for k in 0..w { om[k] = LNEG; oi[k] = LNEG; od[k] = LNEG; }
     ox[x(0, XN)] = 0.0; ox[x(0, XB)] = 0.0; ox[x(0, XE)] = LNEG; ox[x(0, XC)] = LNEG; ox[x(0, XJ)] = LNEG;
@@ -259,16 +262,16 @@ fn run(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, usize)>) {
         om[cr] = LNEG; oi[cr] = LNEG; od[cr] = LNEG;
         let mut e = LNEG;
         for k in 1..m {
-            let pp = pm[cr + k];
+            let (pp, ppi) = (om[cr + k], oi[cr + k]);
             let v = f32::max(
                 f32::max(td(p.mm[k - 1]) * (om[pr + k - 1] + pp), td(p.im[k - 1]) * (oi[pr + k - 1] + pp)),
                 f32::max(td(p.dm[k - 1]) * (od[pr + k - 1] + pp), td(p.bm[k - 1]) * (ox[x(i - 1, XB)] + pp)));
             om[cr + k] = v;
             e = f32::max(e, v);
-            oi[cr + k] = f32::max(td(p.mi[k]) * (om[pr + k] + pi[cr + k]), td(p.ii[k]) * (oi[pr + k] + pi[cr + k]));
+            oi[cr + k] = f32::max(td(p.mi[k]) * (om[pr + k] + ppi), td(p.ii[k]) * (oi[pr + k] + ppi));
             od[cr + k] = f32::max(td(p.md[k - 1]) * om[cr + k - 1], td(p.dd[k - 1]) * od[cr + k - 1]);
         }
-        let pp = pm[cr + m];
+        let pp = om[cr + m];
         om[cr + m] = f32::max(
             f32::max(td(p.mm[m - 1]) * (om[pr + m - 1] + pp), td(p.im[m - 1]) * (oi[pr + m - 1] + pp)),
             f32::max(td(p.dm[m - 1]) * (od[pr + m - 1] + pp), td(p.bm[m - 1]) * (ox[x(i - 1, XB)] + pp)));

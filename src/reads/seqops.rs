@@ -1,12 +1,12 @@
 //! Sequence primitives.
 //!
 //! Ported from fastp 1.3.6 `src/simd.cpp` (MIT, (c) 2016 OpenGene). fastp
-//! dispatches these through Google Highway; we stay in safe Rust — bio's
+//! dispatches these through Google Highway; we stay in safe Rust — triple_accel's
 //! vectorised `hamming` for the exact count, a block-at-a-time loop LLVM
 //! vectorises for the bounded one. Semantics match the Highway scalar tails
 //! exactly.
 
-use bio::alignment::distance::simd::hamming;
+use crate::hamming;
 
 /// Complement lookup, built the way fastp's `kComplement` table works: A/a,
 /// C/c, T/t, G/g map across cases and everything else falls to N. A table
@@ -60,7 +60,7 @@ pub fn reverse_complement(src: &[u8]) -> Vec<u8> {
 #[inline]
 pub fn count_mismatches(a: &[u8], b: &[u8], len: usize) -> usize {
     let n = len.min(a.len()).min(b.len());
-    // bio's vectorised hamming; the clamp above gives it the equal lengths it
+    // vectorised hamming; the clamp above gives it the equal lengths it
     // requires.
     hamming(&a[..n], &b[..n]) as usize
 }

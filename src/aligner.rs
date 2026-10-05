@@ -1,21 +1,46 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use std::io::Write;
+use flate2::read::MultiGzDecoder;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::Builder;
 
-use fastx::FastX;
-
+/// (id, sequence) of each record: the id is the header up to its first space,
+/// the sequence its lines joined. Reading stops at a record with no sequence.
 fn parse_fasta_file(path: &str) -> Vec<(String, String)> {
+    let mut data = Vec::new();
+    let mut file = File::open(path).unwrap();
+    if Path::new(path).extension().is_some_and(|e| e == "gz") {
+        MultiGzDecoder::new(file).read_to_end(&mut data).unwrap();
+    } else {
+        file.read_to_end(&mut data).unwrap();
+    }
+    assert!(data.first() == Some(&b'>'), "{path} is not FASTA");
     let mut records = Vec::new();
-    let mut reader = FastX::reader_from_path(Path::new(path)).unwrap();
-    let mut rec = FastX::from_reader(&mut reader).unwrap();
-    while let Ok(1..=usize::MAX) = rec.read(&mut reader) {
-        records.push((
-            rec.id().to_string(),
-            String::from_utf8(rec.seq()).unwrap(),
-        ));
+    let mut pos = 0;
+    while pos < data.len() {
+        pos += 1; // the '>' that opens the record
+        if pos >= data.len() {
+            break;
+        }
+        let line_end = memchr::memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i + 1);
+        let Ok(name) = std::str::from_utf8(&data[pos..line_end]) else { break };
+        let name = name.trim_end_matches(['\n', '\r']);
+        let id = name.split(' ').next().unwrap_or("");
+        pos = line_end;
+        let end = memchr::memchr(b'>', &data[pos..]).map_or(data.len(), |i| pos + i);
+        if end == pos {
+            break;
+        }
+        let mut raw = &data[pos..end];
+        while let [rest @ .., b'\n' | b'\r'] = raw {
+            raw = rest;
+        }
+        let seq: Vec<u8> = raw.iter().copied().filter(|&c| c != b'\n').collect();
+        records.push((id.to_string(), String::from_utf8(seq).unwrap()));
+        pos = end;
     }
     records
 }

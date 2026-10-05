@@ -14,11 +14,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = "0.29"
-bio = "4"
-itertools = "0.15"
 tempfile = "3.27"
-fastx = "0.6"
-meminterval = "0.4.2"
+# SIMD Hamming distance.
+triple_accel = "0.4"
 anyhow = "1"
 ahash = "0.8"
 # Already in the tree; named here so the N scan can use memchr2.

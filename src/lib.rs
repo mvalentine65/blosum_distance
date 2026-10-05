@@ -13,15 +13,50 @@ mod overlap;
 mod blosum_tables;
 mod translate;
 
-use bio::alignment::distance::simd::hamming;
 use flexcull::*;
 use overlap::get_overlap;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 
+/// Mismatches between two texts of equal length (SIMD).
+#[inline]
+pub(crate) fn hamming(alpha: &[u8], beta: &[u8]) -> u64 {
+    assert_eq!(
+        alpha.len(),
+        beta.len(),
+        "simd hamming distance cannot be calculated for texts of different length ({}!={})",
+        alpha.len(),
+        beta.len()
+    );
+    triple_accel::hamming(alpha, beta) as u64
+}
+
+/// IUPAC complement of each byte, case kept; any other byte maps to itself.
+const COMPLEMENT: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = i as u8;
+        i += 1;
+    }
+    let (from, to) = (b"AGCTYRWSKMDVHBN", b"TCGARYWSMKHBDVN");
+    let mut j = 0;
+    while j < from.len() {
+        t[from[j] as usize] = to[j];
+        t[from[j] as usize + 32] = to[j] + 32;
+        j += 1;
+    }
+    t
+};
+
 #[pyfunction]
 fn bio_revcomp(sequence: String) -> String {
-    String::from_utf8(bio::alphabets::dna::revcomp(sequence.into_bytes())).unwrap()
+    let mut bytes = sequence.into_bytes();
+    bytes.reverse();
+    for b in &mut bytes {
+        *b = COMPLEMENT[*b as usize];
+    }
+    String::from_utf8(bytes).unwrap()
 }
 
 fn find_indices(sequence: &[u8], gap: u8) -> (usize, usize) {

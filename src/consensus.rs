@@ -1,6 +1,9 @@
-use itertools::enumerate;
 use pyo3::pyfunction;
 use crate::find_indices;
+
+fn enumerate<I: IntoIterator>(iterable: I) -> std::iter::Enumerate<I::IntoIter> {
+    iterable.into_iter().enumerate()
+}
 
 #[pyfunction]
 pub fn dumb_consensus(sequences: Vec<String>, threshold: f64, min_depth: u32) -> String {

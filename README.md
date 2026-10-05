@@ -19,4 +19,4 @@ pip install sapphyre-tools
 Actively maintained and used in research pipelines. Packaging and documentation improvements are in progress.
 
 ## License
-Apache-2.0
+GPL-3.0-or-later. Parts are derived from BATH, HMMER, Easel and fastp; their notices are in `LICENSE-THIRD-PARTY`.

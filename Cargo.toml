@@ -2,10 +2,11 @@
 name = "sapphyre_tools"
 version = "0.13.8"
 edition = "2021"
+license = "GPL-3.0-or-later"
 # Oldest toolchain we build on. Cargo skips dependency versions that need a
 # newer rustc, instead of resolving to one and failing at compile time.
 rust-version = "1.91"
-include = ["/src", "/python", "/pyproject.toml", "/README.md", "/LICENSE"]
+include = ["/src", "/python", "/pyproject.toml", "/README.md", "/LICENSE", "/LICENSE-THIRD-PARTY"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "sapphyre_tools"

@@ -79,7 +79,7 @@ pub struct Opts {
     pub alt_size: f64,
     pub alt_nodes_large: f64,
     pub alt_refined: bool,
-    /// refine: stop codon score on the junction path (forced_splice's -4)
+    /// refine: stop codon score on the junction path (BLOSUM62 '*' against a residue)
     pub refine_stop: f64,
     /// refine: frameshift score on the junction path (NaN: fspen)
     pub refine_fs: f64,
@@ -596,7 +596,7 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
               _do_refine: bool, do_pseudo: bool, cache: &mut HashMap<String, JxOut>, out: Option<&mut Out>,
               subset: Option<&[(usize, usize, usize)]>) -> (Refine, Vec<Pseudo>) {
     let mut prm = o.prm;
-    prm.stop = o.refine_stop; if !o.refine_fs.is_nan() { prm.fs = o.refine_fs; } prm.xsc = 0.0; prm.null_run = false; prm.min_gap_nt = 0; // annotate, as forced_splice
+    prm.stop = o.refine_stop; if !o.refine_fs.is_nan() { prm.fs = o.refine_fs; } prm.xsc = 0.0; prm.null_run = false; prm.min_gap_nt = 0; // annotate
     // stop-free path for splice sites (inserts may not hold stops either)
     let mut bar = prm;
     bar.stop = -1000.0;

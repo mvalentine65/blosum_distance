@@ -5,8 +5,8 @@
 //! anchor deeper than w_in. Introns score the splice PSSMs of sites, intron open
 //! and non-canonical penalties; phase 1/2 introns score the codon assembled
 //! across them, node-skipping ones included; 1-2 nt frameshifts and node-skipping introns are penalised. Scores are
-//! in half-bits. This is the Viterbi of SAPPHYRE's forced_splice (after
-//! exonerate 2.4.0, GPL-3+, Guy St.C. Slater). The fill stage runs it twice:
+//! in half-bits. Intron open, minimum intron and frameshift costs take the
+//! values exonerate 2.4.0 uses. The fill stage runs it twice:
 //! free, and with no codon starting inside the gap (beyond ext nt of either
 //! anchor); the difference is the evidence for new exons. For detection, N
 //! codons score xsc and, when stops are barred, inserts may not hold them

@@ -1,6 +1,7 @@
 //! Unilocal alignment of a peptide to a node slice of a model: HMMER's generic
 //! profile configuration (p7_ProfileConfig, unilocal), Forward, Backward,
 //! posterior decoding and optimal-accuracy traceback, as BATH uses them.
+//! HMMER and BATH are BSD 3-clause; their notices are in LICENSE-THIRD-PARTY.
 //!
 //! Scores are computed in f32 log space with an exact log-sum; profile
 //! parameters are rounded to f32 as HMMER stores them.

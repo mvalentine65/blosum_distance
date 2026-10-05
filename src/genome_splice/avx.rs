@@ -2,6 +2,7 @@
 //! posterior decoding and optimal-accuracy traceback (impl_avx/fwdback_avx.c,
 //! decoding_avx.c, optacc_avx.c, p7_oprofile_avx.c), ported operation for
 //! operation so the float results match BATH's. Used when the CPU has AVX2.
+//! BATH, HMMER and Easel are BSD 3-clause; their notices are in LICENSE-THIRD-PARTY.
 
 #![allow(clippy::missing_safety_doc)]
 use super::align::{AlnHit, Profile};

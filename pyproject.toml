@@ -10,7 +10,8 @@ authors = [
     {email = "mvalentine65@gmail.com"},
     {name = "Michael Valentine"}
 ]
-license = { text = "Apache-2.0" }
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "LICENSE-THIRD-PARTY"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

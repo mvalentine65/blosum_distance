@@ -1,9 +1,10 @@
 //! Base codes, codons and splice-site scores.
 //!
-//! The donor PSSM is exonerate 2.4.0's (splice.c; Senapathy et al. 1990 primate
-//! frequencies); the acceptor's is pooled from 12 arthropod genomes, or learned
-//! from the run's own junctions (learn_acceptor). Both are log-odds scaled as
-//! exonerate does, rounded to integers.
+//! The donor PSSM is the primate frequencies of Senapathy et al. 1990 (Methods
+//! in Enzymology 183:252-278), as tabulated in exonerate 2.4.0; the acceptor's
+//! is pooled from 12 arthropod genomes, or learned from the run's own junctions
+//! (learn_acceptor). Both are log-odds scaled as exonerate does, rounded to
+//! integers.
 
 pub const HMM_AA: &[u8; 20] = b"ACDEFGHIKLMNPQRSTVWY";
 const CODE: &[u8; 64] = b"FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG"; // TCAG order

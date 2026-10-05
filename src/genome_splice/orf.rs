@@ -7,6 +7,11 @@ use super::hmm::Hmm;
 use super::sites::{revcomp, translate};
 use std::fmt::Write as _;
 
+#[cfg(target_arch = "x86_64")]
+pub use super::avx::XRow as ChainRow;
+#[cfg(not(target_arch = "x86_64"))]
+pub struct ChainRow;
+
 pub struct OrfOpts {
     pub margin: i64,
     pub min_aa: usize,
@@ -69,6 +74,30 @@ impl Aligner {
         #[cfg(target_arch = "x86_64")]
         if let Some(om) = self.oprof.as_ref() { return super::avx::fwd_lnc(om, &seq, &mut self.avxdp); }
         super::align::fwd_lnc(self.prof.as_ref().unwrap(), &seq, &mut self.dp)
+    }
+    /// Forward bits of a whole chain `pep`, by a Forward that cannot lose a path.
+    /// Also the state after each row of `marks` (ascending), for `fwd_bits_chain_from`.
+    pub fn fwd_bits_chain(&self, pep: &[u8], marks: &[usize]) -> (f32, Vec<ChainRow>) {
+        let seq: Vec<u8> = pep.iter().map(|&c| residue_code(c)).collect();
+        #[cfg(target_arch = "x86_64")]
+        if let Some(om) = self.oprof.as_ref() {
+            let mut snaps = Vec::with_capacity(marks.len());
+            let b = super::avx::fwd_bits_x(om, &seq, 0, None, marks, &mut snaps);
+            return (b, snaps);
+        }
+        let _ = marks;
+        (super::align::fwd_bits_exact(self.prof.as_ref().unwrap(), &seq), Vec::new())
+    }
+    /// The same for a chain that has the first `row` residues of the one `snap`
+    /// was taken from (and its length): only the rows after `row` are computed.
+    pub fn fwd_bits_chain_from(&self, pep: &[u8], snap: Option<&ChainRow>, row: usize) -> f32 {
+        let seq: Vec<u8> = pep.iter().map(|&c| residue_code(c)).collect();
+        #[cfg(target_arch = "x86_64")]
+        if let (Some(om), Some(s)) = (self.oprof.as_ref(), snap) {
+            return super::avx::fwd_bits_x(om, &seq, row, Some(s), &[], &mut Vec::new());
+        }
+        let _ = (snap, row);
+        super::align::fwd_bits_exact(self.prof.as_ref().unwrap(), &seq)
     }
     /// Forward bits of `pep` against the current slice.
     pub fn fwd_bits(&mut self, pep: &[u8]) -> f32 {

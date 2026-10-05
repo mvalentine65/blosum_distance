@@ -120,6 +120,50 @@ pub fn align_both(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, 
     run(p, seq, dp)
 }
 
+/// ln(e^a + e^b) in f64; a term 40 nats under the other is below its resolution.
+#[inline(always)]
+fn lsum64(a: f64, b: f64) -> f64 {
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    let d = lo - hi;
+    if !(d >= -40.0) { return hi; } // -inf terms too
+    hi + d.exp().ln_1p()
+}
+
+/// Forward bits of `seq` in f64 log space, two rows: no path can be lost,
+/// however far behind the others it falls.
+pub fn fwd_bits_exact(p: &Profile, seq: &[u8]) -> f32 {
+    let l = seq.len();
+    if l == 0 { return 0.0; }
+    let m = p.m;
+    let w = m + 1;
+    let pmove = 2.0f32 / (l as f32 + 2.0);
+    let ploop = 1.0f32 - pmove;
+    let (nloop, nmove) = (lnf(ploop as f64), lnf(pmove as f64));
+    let (cloop, cmove) = (nloop, nmove);
+    let p1 = l as f32 / (l as f32 + 1.0);
+    let nullsc = ((l as f32) as f64 * (p1 as f64).ln() + (1.0 - p1 as f64).ln()) as f32 as f64;
+    let (mut fm, mut fi, mut fd) = (vec![NEG; 2 * w], vec![NEG; 2 * w], vec![NEG; 2 * w]);
+    let (mut xn, mut xb, mut xc) = (0.0f64, nmove, NEG);
+    for i in 1..=l {
+        let r = seq[i - 1] as usize;
+        let (pr, cr) = (((i - 1) & 1) * w, (i & 1) * w);
+        fm[cr] = NEG; fi[cr] = NEG; fd[cr] = NEG;
+        let mut e = NEG;
+        for k in 1..w {
+            let mv = lsum64(lsum64(fm[pr + k - 1] + p.mm[k - 1], fi[pr + k - 1] + p.im[k - 1]),
+                            lsum64(xb + p.bm[k - 1], fd[pr + k - 1] + p.dm[k - 1])) + p.msc[k][r];
+            let iv = if k < m { lsum64(fm[pr + k] + p.mi[k], fi[pr + k] + p.ii[k]) } else { NEG };
+            let dv = lsum64(fm[cr + k - 1] + p.md[k - 1], fd[cr + k - 1] + p.dd[k - 1]);
+            fm[cr + k] = mv; fi[cr + k] = iv; fd[cr + k] = dv;
+            e = lsum64(lsum64(e, mv), dv);
+        }
+        xn += nloop;
+        xc = lsum64(xc + cloop, e);
+        xb = xn + nmove;
+    }
+    ((xc + cmove - nullsc) / std::f64::consts::LN_2) as f32
+}
+
 /// ln C(i) per residue (see avx::fwd_lnc), generic path.
 pub fn fwd_lnc(p: &Profile, seq: &[u8], dp: &mut Dp) -> Vec<f64> {
     let l = seq.len();

@@ -718,3 +718,190 @@ pub fn fwd_bits(om: &OProfile, seq: &[u8], dp: &mut AvxDp) -> f32 {
         ((fwdsc - nullsc) as f64 / std::f64::consts::LN_2) as f32
     }
 }
+
+// ---- Forward with an exponent in every cell: a cell holds m * 2^(64 e).
+// The rescaled Forward keeps one scale per row and rounds a far-behind path to
+// zero; here none is lost, so the score of a whole chain is exact.
+
+const XEMIN: i32 = i32::MIN / 2;
+const X2P64: f32 = 18446744073709551616.0;
+const X2M64: f32 = 1.0 / X2P64;
+const XLN: f64 = 64.0 * std::f64::consts::LN_2;
+
+#[derive(Clone, Copy)]
+struct Xv { m: __m256, e: __m256i }
+
+/// A row of that Forward and its special states, to resume from.
+#[derive(Clone)]
+pub struct XRow { m: Vec<__m256>, e: Vec<__m256i>, xn: f64, xb: f64, xc: f64 }
+
+/// 1 where the exponents agree, 2^-64 one block below, else 0.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn xfactor(d: __m256i) -> __m256 {
+    let is0 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(d, _mm256_setzero_si256()));
+    let is1 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(d, _mm256_set1_epi32(1)));
+    _mm256_or_ps(_mm256_and_ps(is0, _mm256_set1_ps(1.0)), _mm256_and_ps(is1, _mm256_set1_ps(X2M64)))
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn xadd(a: Xv, b: Xv) -> Xv {
+    if _mm256_movemask_epi8(_mm256_cmpeq_epi32(a.e, b.e)) == -1 {
+        return Xv { m: _mm256_add_ps(a.m, b.m), e: a.e };
+    }
+    // a zero has no exponent of its own
+    let (z, emin) = (_mm256_setzero_ps(), _mm256_set1_epi32(XEMIN));
+    let ea = _mm256_blendv_epi8(a.e, emin, _mm256_castps_si256(_mm256_cmp_ps::<_CMP_EQ_OQ>(a.m, z)));
+    let eb = _mm256_blendv_epi8(b.e, emin, _mm256_castps_si256(_mm256_cmp_ps::<_CMP_EQ_OQ>(b.m, z)));
+    let e = _mm256_max_epi32(ea, eb);
+    Xv { m: _mm256_add_ps(_mm256_mul_ps(a.m, xfactor(_mm256_sub_epi32(e, ea))), _mm256_mul_ps(b.m, xfactor(_mm256_sub_epi32(e, eb)))), e }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn xmul(a: Xv, t: __m256) -> Xv { Xv { m: _mm256_mul_ps(a.m, t), e: a.e } }
+
+/// Mantissas back into [2^-32, 2^32).
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn xnorm(v: Xv) -> Xv {
+    let big = _mm256_cmp_ps::<_CMP_GE_OQ>(v.m, _mm256_set1_ps(4294967296.0));
+    let small = _mm256_and_ps(_mm256_cmp_ps::<_CMP_LT_OQ>(v.m, _mm256_set1_ps(1.0 / 4294967296.0)),
+                              _mm256_cmp_ps::<_CMP_GT_OQ>(v.m, _mm256_setzero_ps()));
+    if _mm256_movemask_ps(_mm256_or_ps(big, small)) == 0 { return v; }
+    let m = _mm256_blendv_ps(_mm256_blendv_ps(v.m, _mm256_mul_ps(v.m, _mm256_set1_ps(X2M64)), big),
+                             _mm256_mul_ps(v.m, _mm256_set1_ps(X2P64)), small);
+    // a set lane is -1 as an integer: +1 where big, -1 where small
+    Xv { m, e: _mm256_add_epi32(_mm256_sub_epi32(v.e, _mm256_castps_si256(big)), _mm256_castps_si256(small)) }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn xshift(v: Xv) -> Xv {
+    Xv { m: rightshiftz(v.m), e: _mm256_castps_si256(rightshiftz(_mm256_castsi256_ps(v.e))) }
+}
+
+/// ln of the sum of the lanes.
+#[target_feature(enable = "avx2")]
+unsafe fn xhsum_ln(v: Xv) -> f64 {
+    let m: [f32; 8] = std::mem::transmute(v.m);
+    let e: [i32; 8] = std::mem::transmute(v.e);
+    let top = (0..8).filter(|&i| m[i] > 0.0).map(|i| e[i]).max();
+    let Some(top) = top else { return f64::NEG_INFINITY };
+    let mut s = 0.0f64;
+    for i in 0..8 {
+        if m[i] > 0.0 && top - e[i] <= 2 { s += m[i] as f64 * (2.0f64).powi(-64 * (top - e[i])); }
+    }
+    s.ln() + top as f64 * XLN
+}
+
+fn lse(a: f64, b: f64) -> f64 {
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    if lo == f64::NEG_INFINITY { hi } else { hi + (lo - hi).exp().ln_1p() }
+}
+
+/// Rows after `start` of the Forward of dsq[1..=l], resumed from `init` (None: row 0).
+/// The state after each row of `marks` (ascending) goes to `snaps`. Score in nats.
+#[target_feature(enable = "avx2")]
+unsafe fn xforward(dsq: &[u8], om: &OProfile, start: usize, init: Option<&XRow>, marks: &[usize], snaps: &mut Vec<XRow>) -> f32 {
+    let l = dsq.len() - 1;
+    let q_ = om.q;
+    let row = q_ * 3;
+    let xf = xf_for(om, l);
+    debug_assert!(xf.e[LOOP] == 0.0); // unilocal: J is never entered
+    let (nloop, nmove) = ((xf.n[LOOP] as f64).ln(), (xf.n[MOVE] as f64).ln());
+    let (cloop, cmove, emove) = ((xf.c[LOOP] as f64).ln(), (xf.c[MOVE] as f64).ln(), (xf.e[MOVE] as f64).ln());
+    let zx = Xv { m: _mm256_setzero_ps(), e: _mm256_set1_epi32(XEMIN) };
+    let mut dm = vec![zx.m; 2 * row];
+    let mut de = vec![zx.e; 2 * row];
+    let (mut xn, mut xb, mut xc) = (0.0f64, nmove, f64::NEG_INFINITY);
+    if let Some(s) = init {
+        let pc = (start & 1) * row;
+        dm[pc..pc + row].copy_from_slice(&s.m);
+        de[pc..pc + row].copy_from_slice(&s.e);
+        xn = s.xn; xb = s.xb; xc = s.xc;
+    }
+    let mut mk = 0usize;
+    let t = &om.tfv;
+    let dd0 = 7 * q_;
+    for i in start..=l {
+        if i > start {
+            let (pc, pp) = ((i & 1) * row, ((i - 1) & 1) * row);
+            let rp = dsq[i] as usize * q_;
+            let xbv = if xb == f64::NEG_INFINITY { zx } else {
+                let e = (xb / XLN).round();
+                Xv { m: _mm256_set1_ps((xb - e * XLN).exp() as f32), e: _mm256_set1_epi32(e as i32) }
+            };
+            let at = |s: usize| Xv { m: dm[s], e: de[s] };
+            let mut mpv = xshift(at(pp + (q_ - 1) * 3 + XM));
+            let mut dpv = xshift(at(pp + (q_ - 1) * 3 + XD));
+            let mut ipv = xshift(at(pp + (q_ - 1) * 3 + XI));
+            let (mut dcv, mut xev) = (zx, zx);
+            let mut tp = 0usize;
+            for q in 0..q_ {
+                let mut sv = xadd(xadd(xadd(xmul(xbv, t[tp]), xmul(mpv, t[tp + 1])), xmul(ipv, t[tp + 2])), xmul(dpv, t[tp + 3]));
+                sv = xnorm(xmul(sv, om.rfv[rp + q]));
+                xev = xadd(xev, sv);
+                let c = pc + q * 3;
+                mpv = Xv { m: dm[pp + q * 3 + XM], e: de[pp + q * 3 + XM] };
+                dpv = Xv { m: dm[pp + q * 3 + XD], e: de[pp + q * 3 + XD] };
+                ipv = Xv { m: dm[pp + q * 3 + XI], e: de[pp + q * 3 + XI] };
+                dm[c + XM] = sv.m; de[c + XM] = sv.e;
+                dm[c + XD] = dcv.m; de[c + XD] = dcv.e;
+                dcv = xnorm(xmul(sv, t[tp + 4]));
+                let iv = xnorm(xadd(xmul(mpv, t[tp + 5]), xmul(ipv, t[tp + 6])));
+                dm[c + XI] = iv.m; de[c + XI] = iv.e;
+                tp += 7;
+            }
+            // D paths: along the nodes, then around the stripes until nothing changes
+            dcv = xshift(dcv);
+            dm[pc + XD] = zx.m; de[pc + XD] = zx.e;
+            for q in 0..q_ {
+                let c = pc + q * 3 + XD;
+                let d = xnorm(xadd(dcv, Xv { m: dm[c], e: de[c] }));
+                dm[c] = d.m; de[c] = d.e;
+                dcv = xnorm(xmul(d, t[dd0 + q]));
+            }
+            for _ in 1..8 {
+                dcv = xshift(dcv);
+                let mut changed = 0i32;
+                for q in 0..q_ {
+                    let c = pc + q * 3 + XD;
+                    let d = xnorm(xadd(dcv, Xv { m: dm[c], e: de[c] }));
+                    changed |= _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_NEQ_UQ>(d.m, dm[c])) | !_mm256_movemask_epi8(_mm256_cmpeq_epi32(d.e, de[c]));
+                    dm[c] = d.m; de[c] = d.e;
+                    dcv = xnorm(xmul(dcv, t[dd0 + q]));
+                }
+                if changed == 0 { break; }
+            }
+            for q in 0..q_ { xev = xadd(xev, Xv { m: dm[pc + q * 3 + XD], e: de[pc + q * 3 + XD] }); }
+            let xe = xhsum_ln(xev);
+            xn += nloop;
+            xc = lse(xc + cloop, xe + emove);
+            xb = xn + nmove;
+        }
+        while mk < marks.len() && marks[mk] == i {
+            let pc = (i & 1) * row;
+            snaps.push(XRow { m: dm[pc..pc + row].to_vec(), e: de[pc..pc + row].to_vec(), xn, xb, xc });
+            mk += 1;
+        }
+    }
+    (xc + cmove) as f32
+}
+
+/// Forward bits of `seq`, exact for a whole chain. `init` and `start` resume a call
+/// on a sequence with the same first `start` residues and the same length.
+pub fn fwd_bits_x(om: &OProfile, seq: &[u8], start: usize, init: Option<&XRow>, marks: &[usize], snaps: &mut Vec<XRow>) -> f32 {
+    let l = seq.len();
+    if l == 0 { return 0.0; }
+    let mut dsq = Vec::with_capacity(l + 1);
+    dsq.push(0u8);
+    dsq.extend_from_slice(seq);
+    unsafe {
+        let fwdsc = xforward(&dsq, om, start, init, marks, snaps);
+        let p1 = l as f32 / (l as f32 + 1.0);
+        let nullsc = ((l as f32) as f64 * (p1 as f64).ln() + (1.0 - p1 as f64).ln()) as f32;
+        ((fwdsc - nullsc) as f64 / std::f64::consts::LN_2) as f32
+    }
+}

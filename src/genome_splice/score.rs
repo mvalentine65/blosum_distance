@@ -81,13 +81,16 @@ pub fn score_chain(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, c: &Chain, spans:
     let n = pep.len();
     if n == 0 { return out; }
     al.set(hmm_id, hmm, a as usize, b as usize);
-    if (0..res.len()).any(|j| res[j].1 > res[j].0 && want_rev(j)) {
-        let full = al.fwd_bits(&pep) as f64;
-        for (j, &(lo, hi)) in res.iter().enumerate() {
-            if hi == lo || !want_rev(j) { continue; }
+    let tested: Vec<usize> = (0..res.len()).filter(|&j| res[j].1 > res[j].0 && want_rev(j)).collect();
+    if !tested.is_empty() {
+        // the chain with an exon reversed resumes from the row saved before that exon
+        let marks: Vec<usize> = tested.iter().map(|&j| res[j].0).collect();
+        let (full, rows) = al.fwd_bits_chain(&pep, &marks);
+        for (t, &j) in tested.iter().enumerate() {
+            let (lo, hi) = res[j];
             let mut r = pep.clone();
             r[lo..hi].reverse();
-            out[j].rev = full - al.fwd_bits(&r) as f64;
+            out[j].rev = full as f64 - al.fwd_bits_chain_from(&r, rows.get(t), lo) as f64;
         }
     }
     if !nodes && !bits { return out; }

@@ -2,7 +2,7 @@
 //! profile configuration (p7_ProfileConfig, unilocal), Forward, Backward,
 //! posterior decoding and optimal-accuracy traceback, as BATH uses them.
 //!
-//! Scores are computed in f64 log space with an exact log-sum; profile
+//! Scores are computed in f32 log space with an exact log-sum; profile
 //! parameters are rounded to f32 as HMMER stores them.
 
 use super::hmm::{Hmm, DD, DM, II, IM, K, MD, MI, MM};
@@ -16,7 +16,8 @@ pub const BG: [f32; K] = [
 /// Residue code for anything that is not one of the 20 (scored as X).
 pub const RX: u8 = 20;
 const NEG: f64 = f64::NEG_INFINITY;
-const FLT_MIN: f64 = f32::MIN_POSITIVE as f64;
+const LNEG: f32 = f32::NEG_INFINITY;
+const FLT_MIN: f32 = f32::MIN_POSITIVE;
 
 pub fn residue_code(c: u8) -> u8 {
     match c.to_ascii_uppercase() {
@@ -35,10 +36,6 @@ pub struct Profile {
     pub(super) md: Vec<f64>, pub(super) mi: Vec<f64>, pub(super) ii: Vec<f64>, pub(super) dd: Vec<f64>,
     /// match scores [node][residue 0..=20]
     msc: Vec<[f64; 21]>,
-    // the same in probability space: transitions and match odds ratios
-    pmm: Vec<f64>, pim: Vec<f64>, pdm: Vec<f64>, pbm: Vec<f64>,
-    pmd: Vec<f64>, pmi: Vec<f64>, pii: Vec<f64>, pdd: Vec<f64>,
-    odds: Vec<[f64; 21]>,
 }
 
 fn lnf(x: f64) -> f64 { (x.ln() as f32) as f64 }
@@ -67,9 +64,6 @@ impl Profile {
             mm: vec![NEG; m + 1], im: vec![NEG; m + 1], dm: vec![NEG; m + 1], bm: vec![NEG; m + 1],
             md: vec![NEG; m + 1], mi: vec![NEG; m + 1], ii: vec![NEG; m + 1], dd: vec![NEG; m + 1],
             msc: vec![[NEG; 21]; m + 1],
-            pmm: Vec::new(), pim: Vec::new(), pdm: Vec::new(), pbm: Vec::new(),
-            pmd: Vec::new(), pmi: Vec::new(), pii: Vec::new(), pdd: Vec::new(),
-            odds: Vec::new(),
         };
         for k in 1..=m {
             p.bm[k - 1] = lnf((occ[k] / z) as f64);
@@ -91,10 +85,6 @@ impl Profile {
             for x in 0..K { p.msc[k][x] = sc[x] as f64; }
             p.msc[k][RX as usize] = (r / d) as f64;
         }
-        let ex = |v: &Vec<f64>| v.iter().map(|x| x.exp()).collect::<Vec<f64>>();
-        p.pmm = ex(&p.mm); p.pim = ex(&p.im); p.pdm = ex(&p.dm); p.pbm = ex(&p.bm);
-        p.pmd = ex(&p.md); p.pmi = ex(&p.mi); p.pii = ex(&p.ii); p.pdd = ex(&p.dd);
-        p.odds = p.msc.iter().map(|row| { let mut o = [0f64; 21]; for x in 0..21 { o[x] = row[x].exp(); } o }).collect();
         p
     }
 }
@@ -111,19 +101,18 @@ pub struct AlnHit {
     pub rl: i32,
 }
 
-/// Reusable DP storage (probability space, rows scaled).
+/// Reusable DP storage (log space). Forward's cells are reused for the
+/// optimal-accuracy fill and Backward's for the posteriors.
 #[derive(Default)]
 pub struct Dp {
-    fm: Vec<f64>, fi: Vec<f64>, fd: Vec<f64>, fx: Vec<f64>,
-    bm: Vec<f64>, bi: Vec<f64>, bd: Vec<f64>, bx: Vec<f64>,
-    scale: Vec<f64>,
-    pm: Vec<f64>, pi: Vec<f64>, px: Vec<f64>,
-    om: Vec<f64>, oi: Vec<f64>, od: Vec<f64>, ox: Vec<f64>,
+    fm: Vec<f32>, fi: Vec<f32>, fd: Vec<f32>, fx: Vec<f32>,
+    bm: Vec<f32>, bi: Vec<f32>, bd: Vec<f32>, bx: Vec<f32>,
+    px: Vec<f32>, ox: Vec<f32>,
 }
 
 const XN: usize = 0; const XB: usize = 1; const XE: usize = 2; const XC: usize = 3; const XJ: usize = 4;
 
-fn grow(v: &mut Vec<f64>, n: usize) { if v.len() < n { v.resize(n, 0.0); } }
+fn grow(v: &mut Vec<f32>, n: usize) { if v.len() < n { v.resize(n, 0.0); } }
 
 /// Unilocal Forward/Backward/decoding/optimal-accuracy of `seq` (residue codes):
 /// summary and matched (model node, residue) pairs.
@@ -137,134 +126,118 @@ pub fn fwd_lnc(p: &Profile, seq: &[u8], dp: &mut Dp) -> Vec<f64> {
     let mut lnc = vec![0.0f64; l + 1];
     if l == 0 { return lnc; }
     run(p, seq, dp);
-    let mut cum = 0.0f64;
-    for i in 1..=l {
-        cum += dp.scale[i].ln();
-        lnc[i] = cum + dp.fx[i * 5 + XC].ln();
-    }
+    for i in 1..=l { lnc[i] = dp.fx[i * 5 + XC] as f64; }
     lnc
 }
 
-/// Forward and Backward run in probability space with each row rescaled (the
-/// forward scale factors are reused by Backward, as HMMER's SIMD code does);
-/// the result equals the log-space algorithm without a log per cell.
+/// ln(e^a + e^b). A term 18 nats under the other is below f32 resolution.
+#[inline(always)]
+fn lsum(a: f32, b: f32) -> f32 {
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    let d = lo - hi;
+    if !(d >= -18.0) { return hi; } // -inf terms too
+    hi + d.exp().ln_1p()
+}
+
+/// Forward and Backward in log space (p7_GForward, p7_GBackward): no scaling,
+/// so no limit on how far apart the paths of a row may score. The posteriors
+/// are written over Backward and the optimal-accuracy fill over Forward.
 fn run(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, usize)>) {
     let l = seq.len();
     let m = p.m;
     if l == 0 { return (AlnHit::default(), Vec::new()); }
     let w = m + 1;
     let cells = (l + 1) * w;
-    for v in [&mut dp.fm, &mut dp.fi, &mut dp.fd, &mut dp.bm, &mut dp.bi, &mut dp.bd, &mut dp.pm, &mut dp.pi,
-              &mut dp.om, &mut dp.oi, &mut dp.od] { grow(v, cells); }
+    for v in [&mut dp.fm, &mut dp.fi, &mut dp.fd, &mut dp.bm, &mut dp.bi, &mut dp.bd] { grow(v, cells); }
     for v in [&mut dp.fx, &mut dp.bx, &mut dp.px, &mut dp.ox] { grow(v, (l + 1) * 5); }
-    grow(&mut dp.scale, l + 1);
 
     // length model: unilocal, nj = 0 (J is never entered: E->J is impossible)
     let pmove = 2.0f32 / (l as f32 + 2.0);
     let ploop = 1.0f32 - pmove;
-    let (nloop, nmove) = (lnf(ploop as f64), lnf(pmove as f64));
+    let (nloop, nmove) = (lnf(ploop as f64) as f32, lnf(pmove as f64) as f32);
     let (cloop, cmove) = (nloop, nmove);
-    let (pnl, pnm, pcl, pcm) = (nloop.exp(), nmove.exp(), cloop.exp(), cmove.exp());
     let p1 = l as f32 / (l as f32 + 1.0);
     let nullsc = ((l as f32) as f64 * (p1 as f64).ln() + (1.0 - p1 as f64).ln()) as f32 as f64;
     let at = |i: usize, k: usize| i * w + k;
     let x = |i: usize, s: usize| i * 5 + s;
+    let f = |v: &Vec<f64>| v.iter().map(|&t| t as f32).collect::<Vec<f32>>();
+    let (tmm, tim, tdm, tbm) = (f(&p.mm), f(&p.im), f(&p.dm), f(&p.bm));
+    let (tmd, tmi, tii, tdd) = (f(&p.md), f(&p.mi), f(&p.ii), f(&p.dd));
 
     // ---- Forward
     {
-        let (fm, fi, fd, fx, sc) = (&mut dp.fm, &mut dp.fi, &mut dp.fd, &mut dp.fx, &mut dp.scale);
-        for k in 0..w { fm[k] = 0.0; fi[k] = 0.0; fd[k] = 0.0; }
-        fx[x(0, XN)] = 1.0; fx[x(0, XB)] = pnm; fx[x(0, XE)] = 0.0; fx[x(0, XC)] = 0.0; fx[x(0, XJ)] = 0.0;
-        sc[0] = 1.0;
+        let (fm, fi, fd, fx) = (&mut dp.fm, &mut dp.fi, &mut dp.fd, &mut dp.fx);
+        for k in 0..w { fm[k] = LNEG; fi[k] = LNEG; fd[k] = LNEG; }
+        fx[x(0, XN)] = 0.0; fx[x(0, XB)] = nmove; fx[x(0, XE)] = LNEG; fx[x(0, XC)] = LNEG; fx[x(0, XJ)] = LNEG;
         for i in 1..=l {
-            let o = &p.odds;
             let r = seq[i - 1] as usize;
             let (pr, cr) = ((i - 1) * w, i * w);
-            fm[cr] = 0.0; fi[cr] = 0.0; fd[cr] = 0.0;
+            fm[cr] = LNEG; fi[cr] = LNEG; fd[cr] = LNEG;
             let bprev = fx[x(i - 1, XB)];
-            let mut e = 0.0;
-            let mut mx = 0.0f64;
+            let mut e = LNEG;
             for k in 1..w {
-                let mv = (fm[pr + k - 1] * p.pmm[k - 1] + fi[pr + k - 1] * p.pim[k - 1]
-                        + bprev * p.pbm[k - 1] + fd[pr + k - 1] * p.pdm[k - 1]) * o[k][r];
-                let iv = if k < m { fm[pr + k] * p.pmi[k] + fi[pr + k] * p.pii[k] } else { 0.0 };
-                let dv = fm[cr + k - 1] * p.pmd[k - 1] + fd[cr + k - 1] * p.pdd[k - 1];
+                let mv = lsum(lsum(fm[pr + k - 1] + tmm[k - 1], fi[pr + k - 1] + tim[k - 1]),
+                              lsum(bprev + tbm[k - 1], fd[pr + k - 1] + tdm[k - 1])) + p.msc[k][r] as f32;
+                let iv = if k < m { lsum(fm[pr + k] + tmi[k], fi[pr + k] + tii[k]) } else { LNEG };
+                let dv = lsum(fm[cr + k - 1] + tmd[k - 1], fd[cr + k - 1] + tdd[k - 1]);
                 fm[cr + k] = mv; fi[cr + k] = iv; fd[cr + k] = dv;
-                e += mv + dv;
-                mx = mx.max(mv).max(iv).max(dv);
+                e = lsum(lsum(e, mv), dv);
             }
-            let cval = fx[x(i - 1, XC)] * pcl + e;
-            let nval = fx[x(i - 1, XN)] * pnl;
-            let bval = nval * pnm;
-            mx = mx.max(e).max(cval).max(nval).max(bval);
-            let s = if mx > 0.0 { mx } else { 1.0 };
-            let inv = 1.0 / s;
-            for k in 1..w { fm[cr + k] *= inv; fi[cr + k] *= inv; fd[cr + k] *= inv; }
-            fx[x(i, XE)] = e * inv; fx[x(i, XC)] = cval * inv; fx[x(i, XN)] = nval * inv; fx[x(i, XB)] = bval * inv; fx[x(i, XJ)] = 0.0;
-            sc[i] = s;
+            let nval = fx[x(i - 1, XN)] + nloop;
+            fx[x(i, XE)] = e; fx[x(i, XC)] = lsum(fx[x(i - 1, XC)] + cloop, e); fx[x(i, XN)] = nval; fx[x(i, XB)] = nval + nmove; fx[x(i, XJ)] = LNEG;
         }
     }
-    let lnscale: f64 = dp.scale[1..=l].iter().map(|s| s.ln()).sum();
-    let total = dp.fx[x(l, XC)] * pcm; // scaled
-    let fwd = total.ln() + lnscale;
+    let total = dp.fx[x(l, XC)] + cmove;
 
-    // ---- Backward, rows scaled by the forward factors: row i holds B_i / prod_{j>i} s_j
+    // ---- Backward
     {
-        let (fx, bm, bi, bd, bx, sc) = (&dp.fx, &mut dp.bm, &mut dp.bi, &mut dp.bd, &mut dp.bx, &dp.scale);
-        let _ = fx;
+        let (bm, bi, bd, bx) = (&mut dp.bm, &mut dp.bi, &mut dp.bd, &mut dp.bx);
         let lr = l * w;
-        bx[x(l, XC)] = pcm; bx[x(l, XE)] = pcm; bx[x(l, XB)] = 0.0; bx[x(l, XN)] = 0.0; bx[x(l, XJ)] = 0.0;
-        bm[lr + m] = pcm; bd[lr + m] = pcm; bi[lr + m] = 0.0;
+        bx[x(l, XC)] = cmove; bx[x(l, XE)] = cmove; bx[x(l, XB)] = LNEG; bx[x(l, XN)] = LNEG; bx[x(l, XJ)] = LNEG;
+        bm[lr + m] = cmove; bd[lr + m] = cmove; bi[lr + m] = LNEG;
         for k in (1..m).rev() {
-            bm[lr + k] = pcm + bd[lr + k + 1] * p.pmd[k];
-            bd[lr + k] = pcm + bd[lr + k + 1] * p.pdd[k];
-            bi[lr + k] = 0.0;
+            bm[lr + k] = lsum(cmove, bd[lr + k + 1] + tmd[k]);
+            bd[lr + k] = lsum(cmove, bd[lr + k + 1] + tdd[k]);
+            bi[lr + k] = LNEG;
         }
         for i in (0..l).rev() {
             let r = seq[i] as usize; // x_{i+1}
-            let o = &p.odds;
             let (cr, nr) = (i * w, (i + 1) * w);
-            let mut b = 0.0;
-            for k in 1..w { b += bm[nr + k] * p.pbm[k - 1] * o[k][r]; }
-            let inv = 1.0 / sc[i + 1];
+            let mut b = LNEG;
+            for k in 1..w { b = lsum(b, bm[nr + k] + tbm[k - 1] + p.msc[k][r] as f32); }
+            let nval = lsum(bx[x(i + 1, XN)] + nloop, b + nmove);
             if i == 0 {
-                bx[x(0, XB)] = b * inv;
-                bx[x(0, XN)] = (bx[x(1, XN)] * pnl + b * pnm) * inv;
+                bx[x(0, XB)] = b;
+                bx[x(0, XN)] = nval;
                 break;
             }
-            let cval = bx[x(i + 1, XC)] * pcl;
-            let e = cval;
-            let nval = bx[x(i + 1, XN)] * pnl + b * pnm;
-            bm[cr + m] = e; bd[cr + m] = e; bi[cr + m] = 0.0;
+            let e = bx[x(i + 1, XC)] + cloop;
+            bm[cr + m] = e; bd[cr + m] = e; bi[cr + m] = LNEG;
             for k in (1..m).rev() {
-                let nm = bm[nr + k + 1] * o[k + 1][r];
-                bm[cr + k] = nm * p.pmm[k] + bi[nr + k] * p.pmi[k] + e + bd[cr + k + 1] * p.pmd[k];
-                bi[cr + k] = nm * p.pim[k] + bi[nr + k] * p.pii[k];
-                bd[cr + k] = nm * p.pdm[k] + bd[cr + k + 1] * p.pdd[k] + e;
+                let nm = bm[nr + k + 1] + p.msc[k + 1][r] as f32;
+                bm[cr + k] = lsum(lsum(nm + tmm[k], bi[nr + k] + tmi[k]), lsum(e, bd[cr + k + 1] + tmd[k]));
+                bi[cr + k] = lsum(nm + tim[k], bi[nr + k] + tii[k]);
+                bd[cr + k] = lsum(lsum(nm + tdm[k], bd[cr + k + 1] + tdd[k]), e);
             }
-            for k in 1..w { bm[cr + k] *= inv; bi[cr + k] *= inv; bd[cr + k] *= inv; }
-            bx[x(i, XB)] = b * inv; bx[x(i, XC)] = cval * inv; bx[x(i, XE)] = e * inv; bx[x(i, XN)] = nval * inv; bx[x(i, XJ)] = 0.0;
+            bx[x(i, XB)] = b; bx[x(i, XC)] = e; bx[x(i, XE)] = e; bx[x(i, XN)] = nval; bx[x(i, XJ)] = LNEG;
         }
     }
 
-    // ---- Posterior decoding (p7_GDecoding); rows normalised
+    // ---- Posterior decoding (p7_GDecoding), over Backward; rows normalised
     {
-        let (fm, fi, fx, bm, bi, bx, sc) = (&dp.fm, &dp.fi, &dp.fx, &dp.bm, &dp.bi, &dp.bx, &dp.scale);
-        let (pm, pi, px) = (&mut dp.pm, &mut dp.pi, &mut dp.px);
-        let inv_total = 1.0 / total;
+        let (fm, fi, fx, bx) = (&dp.fm, &dp.fi, &dp.fx, &dp.bx);
+        let (pm, pi, px) = (&mut dp.bm, &mut dp.bi, &mut dp.px);
         for i in 1..=l {
             let cr = i * w;
             pm[cr] = 0.0; pi[cr] = 0.0;
-            let mut denom = 0.0;
+            let mut denom = 0.0f32;
             for k in 1..w {
-                pm[cr + k] = fm[cr + k] * bm[cr + k] * inv_total; denom += pm[cr + k];
-                pi[cr + k] = if k < m { fi[cr + k] * bi[cr + k] * inv_total } else { 0.0 }; denom += pi[cr + k];
+                pm[cr + k] = (fm[cr + k] + pm[cr + k] - total).exp(); denom += pm[cr + k];
+                pi[cr + k] = if k < m { (fi[cr + k] + pi[cr + k] - total).exp() } else { 0.0 }; denom += pi[cr + k];
             }
-            // specials: F_{i-1} B_i misses the factor s_i
-            let f = inv_total / sc[i];
-            px[x(i, XN)] = fx[x(i - 1, XN)] * bx[x(i, XN)] * pnl * f;
+            px[x(i, XN)] = (fx[x(i - 1, XN)] + bx[x(i, XN)] + nloop - total).exp();
             px[x(i, XJ)] = 0.0;
-            px[x(i, XC)] = fx[x(i - 1, XC)] * bx[x(i, XC)] * pcl * f;
+            px[x(i, XC)] = (fx[x(i - 1, XC)] + bx[x(i, XC)] + cloop - total).exp();
             denom += px[x(i, XN)] + px[x(i, XC)];
             let d = 1.0 / denom;
             for k in 1..w { pm[cr + k] *= d; pi[cr + k] *= d; }
@@ -272,41 +245,41 @@ fn run(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, usize)>) {
         }
     }
 
-    // ---- Optimal accuracy fill (p7_GOptimalAccuracy)
+    // ---- Optimal accuracy fill (p7_GOptimalAccuracy), over Forward
     let td = |v: f64| if v == NEG { FLT_MIN } else { 1.0 };
-    let (pm, pi, px) = (&dp.pm, &dp.pi, &dp.px);
-    let (om, oi, od, ox) = (&mut dp.om, &mut dp.oi, &mut dp.od, &mut dp.ox);
-    for k in 0..w { om[k] = NEG; oi[k] = NEG; od[k] = NEG; }
-    ox[x(0, XN)] = 0.0; ox[x(0, XB)] = 0.0; ox[x(0, XE)] = NEG; ox[x(0, XC)] = NEG; ox[x(0, XJ)] = NEG;
-    let (t_jl, t_el) = (td(nloop), FLT_MIN); // J loop finite; E->J impossible
-    let (t_cl, t_em) = (td(cloop), 1.0);
-    let (t_nl, t_nm, t_jm) = (td(nloop), td(nmove), td(nmove));
+    let (pm, pi, px) = (&dp.bm, &dp.bi, &dp.px);
+    let (om, oi, od, ox) = (&mut dp.fm, &mut dp.fi, &mut dp.fd, &mut dp.ox);
+    for k in 0..w { om[k] = LNEG; oi[k] = LNEG; od[k] = LNEG; }
+    ox[x(0, XN)] = 0.0; ox[x(0, XB)] = 0.0; ox[x(0, XE)] = LNEG; ox[x(0, XC)] = LNEG; ox[x(0, XJ)] = LNEG;
+    let (t_jl, t_el) = (td(nloop as f64), FLT_MIN); // J loop finite; E->J impossible
+    let (t_cl, t_em) = (td(cloop as f64), 1.0);
+    let (t_nl, t_nm, t_jm) = (td(nloop as f64), td(nmove as f64), td(nmove as f64));
     for i in 1..=l {
         let (pr, cr) = ((i - 1) * w, i * w);
-        om[cr] = NEG; oi[cr] = NEG; od[cr] = NEG;
-        let mut e = NEG;
+        om[cr] = LNEG; oi[cr] = LNEG; od[cr] = LNEG;
+        let mut e = LNEG;
         for k in 1..m {
             let pp = pm[cr + k];
-            let v = f64::max(
-                f64::max(td(p.mm[k - 1]) * (om[pr + k - 1] + pp), td(p.im[k - 1]) * (oi[pr + k - 1] + pp)),
-                f64::max(td(p.dm[k - 1]) * (od[pr + k - 1] + pp), td(p.bm[k - 1]) * (ox[x(i - 1, XB)] + pp)));
+            let v = f32::max(
+                f32::max(td(p.mm[k - 1]) * (om[pr + k - 1] + pp), td(p.im[k - 1]) * (oi[pr + k - 1] + pp)),
+                f32::max(td(p.dm[k - 1]) * (od[pr + k - 1] + pp), td(p.bm[k - 1]) * (ox[x(i - 1, XB)] + pp)));
             om[cr + k] = v;
-            e = f64::max(e, v);
-            oi[cr + k] = f64::max(td(p.mi[k]) * (om[pr + k] + pi[cr + k]), td(p.ii[k]) * (oi[pr + k] + pi[cr + k]));
-            od[cr + k] = f64::max(td(p.md[k - 1]) * om[cr + k - 1], td(p.dd[k - 1]) * od[cr + k - 1]);
+            e = f32::max(e, v);
+            oi[cr + k] = f32::max(td(p.mi[k]) * (om[pr + k] + pi[cr + k]), td(p.ii[k]) * (oi[pr + k] + pi[cr + k]));
+            od[cr + k] = f32::max(td(p.md[k - 1]) * om[cr + k - 1], td(p.dd[k - 1]) * od[cr + k - 1]);
         }
         let pp = pm[cr + m];
-        om[cr + m] = f64::max(
-            f64::max(td(p.mm[m - 1]) * (om[pr + m - 1] + pp), td(p.im[m - 1]) * (oi[pr + m - 1] + pp)),
-            f64::max(td(p.dm[m - 1]) * (od[pr + m - 1] + pp), td(p.bm[m - 1]) * (ox[x(i - 1, XB)] + pp)));
-        oi[cr + m] = NEG;
-        od[cr + m] = f64::max(td(p.md[m - 1]) * om[cr + m - 1], td(p.dd[m - 1]) * od[cr + m - 1]);
-        e = f64::max(e, f64::max(om[cr + m], od[cr + m]));
+        om[cr + m] = f32::max(
+            f32::max(td(p.mm[m - 1]) * (om[pr + m - 1] + pp), td(p.im[m - 1]) * (oi[pr + m - 1] + pp)),
+            f32::max(td(p.dm[m - 1]) * (od[pr + m - 1] + pp), td(p.bm[m - 1]) * (ox[x(i - 1, XB)] + pp)));
+        oi[cr + m] = LNEG;
+        od[cr + m] = f32::max(td(p.md[m - 1]) * om[cr + m - 1], td(p.dd[m - 1]) * od[cr + m - 1]);
+        e = f32::max(e, f32::max(om[cr + m], od[cr + m]));
         ox[x(i, XE)] = e;
-        ox[x(i, XJ)] = f64::max(t_jl * (ox[x(i - 1, XJ)] + px[x(i, XJ)]), t_el * e);
-        ox[x(i, XC)] = f64::max(t_cl * (ox[x(i - 1, XC)] + px[x(i, XC)]), t_em * e);
+        ox[x(i, XJ)] = f32::max(t_jl * (ox[x(i - 1, XJ)] + px[x(i, XJ)]), t_el * e);
+        ox[x(i, XC)] = f32::max(t_cl * (ox[x(i - 1, XC)] + px[x(i, XC)]), t_em * e);
         ox[x(i, XN)] = t_nl * (ox[x(i - 1, XN)] + px[x(i, XN)]);
-        ox[x(i, XB)] = f64::max(t_nm * ox[x(i, XN)], t_jm * ox[x(i, XJ)]);
+        ox[x(i, XB)] = f32::max(t_nm * ox[x(i, XN)], t_jm * ox[x(i, XJ)]);
     }
 
     // ---- Traceback (p7_GOATrace): collect match states
@@ -345,7 +318,7 @@ fn run(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, usize)>) {
             S::C => if t_cl * (ox[x(i - 1, XC)] + px[x(i, XC)]) > t_em * ox[x(i, XE)] { S::C } else { S::E },
             S::J => if t_jl * (ox[x(i - 1, XJ)] + px[x(i, XJ)]) > t_el * ox[x(i, XE)] { S::J } else { S::E },
             S::E => {
-                let (mut best, mut s, mut kb) = (NEG, S::S, 0usize);
+                let (mut best, mut s, mut kb) = (LNEG, S::S, 0usize);
                 for kk in 1..=m {
                     if om[at(i, kk)] >= best { best = om[at(i, kk)]; s = S::M; kb = kk; }
                     if od[at(i, kk)] > best { best = od[at(i, kk)]; s = S::D; kb = kk; }
@@ -361,7 +334,7 @@ fn run(p: &Profile, seq: &[u8], dp: &mut Dp) -> (AlnHit, Vec<(usize, usize)>) {
         sprv = scur;
     }
     matches.reverse();
-    let mut h = AlnHit { bits: ((fwd - nullsc) / std::f64::consts::LN_2) as f32, ..Default::default() };
+    let mut h = AlnHit { bits: ((total as f64 - nullsc) / std::f64::consts::LN_2) as f32, ..Default::default() };
     let trace: Vec<(usize, usize)> = matches.iter().map(|&(kk, ii)| (kk + p.a - 1, ii)).collect();
     for (n, &(node, ii)) in trace.iter().enumerate() {
         if n == 0 { h.kf = node as i32; h.rf = ii as i32; }

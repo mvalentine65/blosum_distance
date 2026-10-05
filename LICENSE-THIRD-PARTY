@@ -4,7 +4,8 @@ Third-party code in sapphyre_tools
 sapphyre_tools is distributed under the GNU General Public License,
 version 3 or later (see LICENSE). Parts of it are derived from the
 projects in sections 1 to 3, whose notices are reproduced here as their
-licenses require. Section 4 acknowledges data and parameter values.
+licenses require. Section 4 acknowledges data and parameter values,
+section 5 the origin of pn2codon.
 
 
 ========================================================================
@@ -307,3 +308,17 @@ published in
 as tabulated in exonerate 2.4.0 by Guy St.C. Slater. Their log-odds
 scaling, and the intron and frameshift costs in
 src/genome_splice/splice.rs, take the values exonerate uses.
+
+
+========================================================================
+5. PAL2NAL (acknowledgement)
+========================================================================
+
+src/pn2codon.rs began as a port of the pn2codon routine of PAL2NAL
+(pal2nal.pl, Mikita Suyama) and has since been rewritten: it checks
+consecutive codons against the NCBI tables instead of searching with
+PAL2NAL's reverse-translation patterns.
+
+  M. Suyama, D. Torrents and P. Bork (2006). PAL2NAL: robust conversion of
+  protein sequence alignments into the corresponding codon alignments.
+  Nucleic Acids Research 34:W609-W612.

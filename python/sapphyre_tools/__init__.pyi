@@ -115,3 +115,20 @@ def hmm_align(
     cached_hmm: Optional[str] = ...,
     cached_template: Optional[str] = ...,
 ) -> List[Tuple[str, str]]: ...
+
+# Codon alignment
+def pn2codon(
+    _file_steem: str,
+    aa_path: str,
+    nt_path: str,
+    table_num: int,
+    seqs: Dict[str, Tuple[Tuple[str, str], Tuple[int, str, str]]],
+) -> str: ...
+def pn2codon_original_args(
+    _file_steem: str,
+    aa_path: str,
+    nt_path: str,
+    gene_table: Dict[str, List[str]],
+    seqs: Dict[str, Tuple[Tuple[str, str], Tuple[str, str]]],
+) -> str: ...
+def attempt_iupac_substitution(original_triplet: str, taxa: List[str]) -> Optional[str]: ...

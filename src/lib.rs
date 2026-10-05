@@ -7,6 +7,7 @@ mod flexcull;
 mod identity;
 mod interval_tree;
 mod ntbatch;
+mod pn2codon;
 mod reads;
 mod overlap;
 mod blosum_tables;
@@ -477,6 +478,9 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(column_cull::apply_gff_culls, m)?)?;
     m.add_function(wrap_pyfunction!(genome_splice::run::exonfill_run, m)?)?;
     m.add_function(wrap_pyfunction!(genome_splice::run::exonfill_model_cols, m)?)?;
+    m.add_function(wrap_pyfunction!(pn2codon::pn2codon, m)?)?;
+    m.add_function(wrap_pyfunction!(pn2codon::pn2codon_original_args, m)?)?;
+    m.add_function(wrap_pyfunction!(pn2codon::attempt_iupac_substitution, m)?)?;
 
     m.add_class::<CullTables>()?;
     m.add_class::<ntbatch::NtBatchScanner>()?;

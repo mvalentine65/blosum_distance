@@ -86,6 +86,8 @@ pub struct Opts {
     pub refine_stop: f64,
     /// refine: frameshift score on the junction path (NaN: fspen)
     pub refine_fs: f64,
+    /// split a recovered exon at a frameshift its junction path holds inside it
+    pub split_fs: bool,
     pub threads: usize,
 }
 
@@ -95,7 +97,7 @@ impl Default for Opts {
             orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false, runs: true },
             chain: ChainOpts { min_gap: 10, max_gap: 1000, max_end: 250, flank: 15000, share: true, siblings: true },
             prm: Params::default(),
-            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, refine_stop: -4.0, refine_fs: f64::NAN,
+            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true,
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
@@ -148,6 +150,7 @@ impl Opts {
             "join" => self.join = v != 0.0,
             "refine_stop" => self.refine_stop = v,
             "refine_fs" => self.refine_fs = v,
+            "split_fs" => self.split_fs = v != 0.0,
             "skip_open" => self.prm.skip_open = v,
             "gc_donor" => self.prm.gc_donor = v,
             "cpu" => self.threads = (v as usize).max(1),
@@ -584,6 +587,9 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
 /// One distinct junction's refine/pseudo result.
 /// One refined junction, reusable across refine passes (rows are formatted
 /// per pass, since exon indices change when exons are dropped).
+/// nt each part of an exon split at a frameshift must hold
+const SPLIT_NT: i64 = 15;
+
 struct JxOut {
     sites: JxSites,
     pseudo: Pseudo,
@@ -988,6 +994,51 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             }
             let mut j = 0;
             c.ex.retain(|_| { j += 1; !gone[j - 1] });
+        }
+    }
+    if do_fill && do_refine && o.split_fs {
+        // a recovered exon whose junction path crosses a frameshift inside it holds two reading
+        // frames; as one exon its second part is translated off frame. It becomes two exons there.
+        let (rf1, _) = refine_all(&models, &mid, o, &cs, &genome, true, false, &mut cache, None, None);
+        for i in 0..cs.len() {
+            let c = &cs[i];
+            let (n, plus) = (c.ex.len(), c.strand == b'+');
+            let Some(m) = mid.get(&c.model).map(|&h| models[h].m as i64) else { continue };
+            let mut ex: Vec<ChainExon> = Vec::with_capacity(n);
+            for j in 0..n {
+                let e = c.ex[j];
+                if e.src != SRC_ORF && e.src != SRC_SPLICE { ex.push(e); continue; }
+                let (s, t) = rf1.span(c, i, j);
+                let (lo, hi) = (s.min(e.start), t.max(e.end));
+                // frameshifts of the junctions either side, as offsets of the first base skipped and the base after
+                let mut cuts: Vec<(i64, i64)> = Vec::new();
+                for (a, b) in [(j.wrapping_sub(1), j), (j, j + 1)] {
+                    if a >= n || b >= n { continue; }
+                    let Some(r) = cache.get(&jx_key(c, &c.ex[a], &c.ex[b])) else { continue };
+                    cuts.extend(r.dis.iter().filter(|x| x.0 == DIS_FS as usize && x.1 >= lo && x.1 <= hi)
+                        .map(|x| if plus { (x.1 - lo, x.1 - lo + x.2) } else { (hi - x.1, hi - x.1 + x.2) }));
+                }
+                cuts.sort();
+                cuts.dedup();
+                // parts in coding order, as offsets from the exon's first base; a part under SPLIT_NT stays with its neighbour
+                let len = hi - lo + 1;
+                let (mut parts, mut from) = (Vec::new(), 0i64);
+                for &(a, b) in &cuts {
+                    if a - from >= SPLIT_NT && len - b >= SPLIT_NT { parts.push((from, a - 1)); from = b; }
+                }
+                if parts.is_empty() { ex.push(e); continue; }
+                parts.push((from, len - 1));
+                let mut k = e.k1;
+                for (p, &(a, b)) in parts.iter().enumerate() {
+                    let (gs, ge) = if plus { (lo + a, lo + b) } else { (hi - b, hi - a) };
+                    let k2 = if p + 1 == parts.len() { (k + (b - a + 1) / 3 - 1).max(e.k2) } else { k + (b - a + 1) / 3 - 1 };
+                    // a part after a frameshift starts on a codon
+                    let codon = if p == 0 { e.codon } else if plus { gs } else { ge };
+                    ex.push(ChainExon { start: gs, end: ge, k1: k.min(m), k2: k2.min(m).max(k.min(m)), codon, ..e });
+                    k = k2 + 1;
+                }
+            }
+            if ex.len() != n { cs[i].ex = ex; }
         }
     }
     if do_fill && o.module {

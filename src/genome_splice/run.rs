@@ -10,8 +10,8 @@ use super::sites::{acceptor_default, base, code, learn_acceptor, revcomp, splice
 use super::module::{alternatives, copies};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
-use super::refine::{junction_sites, JxSites, Refine};
-use super::gate::{keep_against_reversal, keep_at_frameshift, keep_run_piece};
+use super::refine::{junction_sites, start_upstream, JxSites, Refine};
+use super::gate::{keep_against_reversal, keep_at_frameshift, keep_run_piece, lead_start_reach};
 use super::gff::write_gff;
 use super::score::{score_chain, ExonScore};
 use super::splice::{Params, DIS_FS, DIS_STOP, MIN_INTRON};
@@ -181,6 +181,8 @@ struct WinOut {
     fills: String,
     exons: String,
     pend: Vec<(usize, ChainExon, u8)>, // chain, exon, window kind
+    /// chains a lead piece was refused for (gate::lead_refused)
+    refused: Vec<usize>,
 }
 
 /// seq (starting at genomic position start) with the mask range read as N
@@ -884,7 +886,15 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 let seg: Vec<u8> = masked(&sc[(w.gs - 1) as usize..w.ge as usize], w.gs, w.mask);
                 let mut kept: Vec<ChainExon> = Vec::new();
                 let cover = covered_nodes(c, hmm.m) as f64 / hmm.m as f64;
-                orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, cover, &mut wo.segments, &mut kept);
+                // before the row's first exon: does that exon read back to a start codon of its own
+                let plus = c.strand == b'+';
+                let before = w.kind != GAP && (if plus { w.ge < e.start } else { w.gs > e.end });
+                let start = before && lead_start_reach(e.k1 - 1)
+                    .is_some_and(|reach| start_upstream(o.prm.code, sc, plus, if plus { e.start } else { e.end }, reach).is_some());
+                if orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, cover, start, &mut wo.segments, &mut kept) {
+                    wo.refused.push(w.ci);
+                    wo.refused.extend(&w.also);
+                }
                 for k in kept {
                     wo.pend.push((w.ci, k, w.kind));
                     for &c2 in &w.also { wo.pend.push((c2, k, w.kind)); }
@@ -902,6 +912,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 out.buf("segments").push_str(&wo.segments);
                 if do_splice { out.buf("fills").push_str(&wo.fills); out.buf("exons").push_str(&wo.exons); }
                 pend.extend(wo.pend);
+                for ci in wo.refused { cs[ci].lead_refused = true; }
             }
             let mut grew: HashSet<(usize, u8)> = HashSet::new();
             for pass in 0..2 {

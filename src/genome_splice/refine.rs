@@ -177,19 +177,11 @@ impl Refine {
             };
             let stop = |x: &[u8; 3]| translate(code, x) == b'*';
             let covered = covered_nodes(c, m);
-            let end = |short: i64| End { short, covered, m, exons: n, lone: c.passive };
+            let end = |short: i64| End { short, covered, m, exons: n, lone: c.passive, refused: c.lead_refused };
             if let Some(reach) = start_reach(&end(c.ex[0].k1 - 1)) {
                 let (a, b) = self.span(c, i, 0);
                 let cs0 = if plus { a } else { b };
-                let step = if plus { -3 } else { 3 };
-                let (mut p, mut atg) = (cs0, None);
-                while (p - cs0).abs() <= reach {
-                    let Some(x) = codon(p) else { break };
-                    if stop(&x) { break; }
-                    if &x == b"ATG" { atg = Some(p); }
-                    p += step;
-                }
-                if let Some(p) = atg { if p != cs0 { self.ex[i][0].start_g = p; } }
+                if let Some(p) = start_upstream(code, sq, plus, cs0, reach) { if p != cs0 { self.ex[i][0].start_g = p; } }
             }
             let last = end(m as i64 - c.ex[n - 1].k2);
             let (a, b) = self.span(c, i, n - 1);
@@ -276,6 +268,23 @@ impl Refine {
         }
         s
     }
+}
+
+/// The farthest in-frame ATG within `reach` nt upstream of the codon starting at
+/// cs0 (1-based, coding-first base), before any stop; cs0 itself counts.
+pub fn start_upstream(code: Code, sq: &[u8], plus: bool, cs0: i64, reach: i64) -> Option<i64> {
+    let step = if plus { -3 } else { 3 };
+    let (mut p, mut atg) = (cs0, None);
+    while (p - cs0).abs() <= reach {
+        let (lo, hi) = if plus { (p, p + 2) } else { (p - 2, p) };
+        if lo < 1 || hi > sq.len() as i64 { break; }
+        let t = &sq[(lo - 1) as usize..hi as usize];
+        let x = if plus { [t[0], t[1], t[2]] } else { [comp(t[2]), comp(t[1]), comp(t[0])] };
+        if translate(code, &x) == b'*' { break; }
+        if &x == b"ATG" { atg = Some(p); }
+        p += step;
+    }
+    atg
 }
 
 fn comp(b: u8) -> u8 {

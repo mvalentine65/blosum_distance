@@ -7,6 +7,7 @@ use super::orf::OrfOpts;
 
 /// A recovered ORF piece as it is judged. `cover` is evidence no rule reads yet.
 #[allow(dead_code)]
+#[derive(Clone, Copy)]
 pub struct Piece {
     /// Forward bits against the window's model nodes
     pub bits: f32,
@@ -27,6 +28,10 @@ pub struct Piece {
     pub flank: bool,
     /// share of the model's nodes the row's exons cover
     pub cover: f64,
+    /// found before the row's first exon
+    pub lead: bool,
+    /// that exon reads back to a start codon of its own (lead_start_reach)
+    pub start: bool,
 }
 
 /// nt within which a piece has no room for an intron before the row's exon
@@ -54,12 +59,26 @@ pub fn bits_needed(p: &Piece) -> f32 {
     need
 }
 
+/// nt from which a piece is far before a first exon that has its own start codon
+const LEAD_FAR_NT: i64 = 1000;
+/// codons under which such a piece is short
+const LEAD_SHORT_AA: i64 = 30;
+
+/// A short piece far before a first exon that reads back to a start codon of
+/// its own is refused: the gene more likely starts at that codon than across an
+/// intron of that length. The model's first nodes match short hydrophobic ORFs
+/// easily.
+pub fn lead_refused(p: &Piece) -> bool {
+    p.lead && p.start && p.dist >= LEAD_FAR_NT && p.aa < LEAD_SHORT_AA
+}
+
 /// A piece is kept when it is no repeat, beats its reversal by `revthr`, has
 /// `minm` residues on nodes, either outscores the charge by `thr` or lies
-/// within `near` nt of the row, and scores what its place asks (bits_needed).
+/// within `near` nt of the row, scores what its place asks (bits_needed), and
+/// is no refused lead piece.
 pub fn keep_piece(p: &Piece, o: &OrfOpts) -> bool {
     !p.repeat && p.margin >= o.revthr && p.nmatch >= o.minm && (p.bits - p.charge >= o.thr || p.dist <= o.near)
-        && p.bits >= bits_needed(p)
+        && p.bits >= bits_needed(p) && !lead_refused(p)
 }
 
 /// nt the pieces of a run may lie apart, and the first from the row's exon
@@ -72,7 +91,7 @@ const RUN_BITS: f32 = 10.0;
 /// A piece may be one of a run when it is no repeat, beats its reversal by
 /// `revthr` and has `minm` residues on nodes; its own bits are not asked.
 pub fn in_run(p: &Piece, o: &OrfOpts) -> bool {
-    !p.repeat && p.margin >= o.revthr && p.nmatch >= o.minm && p.bits > 0.0
+    !p.repeat && p.margin >= o.revthr && p.nmatch >= o.minm && p.bits > 0.0 && !lead_refused(p)
 }
 
 /// Pieces past a row's end, none kept alone, that follow one another in the
@@ -128,11 +147,15 @@ pub struct End {
     pub exons: usize,
     /// a hit in no row
     pub lone: bool,
+    /// a lead piece was refused for this end's own start codon (lead_refused)
+    pub refused: bool,
 }
 
 const START_NODES: i64 = 30;
 const START_NT: i64 = 30;
 const START_COVER: f64 = 0.7;
+/// codons a start codon may lie beyond the model nodes the first exon lacks
+const START_SLACK: i64 = 20;
 const STOP_NODES: i64 = 20;
 const STOP_NT: i64 = 90;
 const STOP_REACH_NODES: i64 = 100;
@@ -144,8 +167,18 @@ pub const STOP_SCAN_NT: i64 = 1500;
 /// within START_NODES of the model's first node and the row's exons cover
 /// START_COVER of the model. A lone hit or a thin row is too often no gene's
 /// first exon. Alignments fade a few codons short of the start.
+/// Where a lead piece was refused for the exon's own start codon, the search
+/// reaches as far as that codon was looked for (lead_start_reach).
 pub fn start_reach(e: &End) -> Option<i64> {
-    (e.short < START_NODES && e.covered as f64 >= START_COVER * e.m as f64).then_some(START_NT)
+    (e.short < START_NODES && e.covered as f64 >= START_COVER * e.m as f64)
+        .then(|| if e.refused { 3 * (e.short + START_SLACK) } else { START_NT })
+}
+
+/// nt upstream of a first exon, `short` model nodes from the model's start, in
+/// which a start codon of its own counts against a far lead piece: the nodes it
+/// lacks and START_SLACK codons. None when the exon is not near the model's start.
+pub fn lead_start_reach(short: i64) -> Option<i64> {
+    (short < START_NODES).then_some(3 * (short + START_SLACK))
 }
 
 /// Whether the first in-frame stop, `dist` nt past a row's last exon, ends the

@@ -56,6 +56,8 @@ pub struct Chain {
     pub alt_of: Option<String>,
     /// rebased onto a recovered tail: the chain that owns it
     pub rebased: Option<String>,
+    /// a lead piece was refused for the first exon's own start codon (gate::lead_refused)
+    pub lead_refused: bool,
     pub ex: Vec<ChainExon>,
 }
 
@@ -85,7 +87,7 @@ pub fn read_chains(path: &str) -> Result<Vec<Chain>, String> {
                 gene: f[1].into(), model: f[2].into(), scaffold: f[3].into(), strand: f[4].as_bytes()[0],
                 klo: f[5].parse().unwrap_or(0), khi: f[6].parse().unwrap_or(0),
                 flank_only: f.len() >= 8 && f[7] == "flank_only", passive: f.len() >= 8 && f[7] == "passive",
-                imx: f.len() >= 8 && f[7] == "imx", alt_of: None, rebased: None, ex: Vec::new(),
+                imx: f.len() >= 8 && f[7] == "imx", alt_of: None, rebased: None, lead_refused: false, ex: Vec::new(),
             });
         } else if f[0].starts_with('E') && f.len() >= 6 {
             if let Some(&i) = idx.get(f[1]) {

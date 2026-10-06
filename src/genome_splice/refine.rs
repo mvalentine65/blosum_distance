@@ -3,7 +3,8 @@
 //! acceptor from the junction before it and its donor from the junction after
 //! it; gene ends keep their input coordinates.
 
-use super::chain::{Chain, ChainExon, SRC_CUT, SRC_INPUT, SRC_NAME};
+use super::chain::{covered_nodes, Chain, ChainExon, SRC_CUT, SRC_INPUT, SRC_NAME};
+use super::gate::{start_reach, take_stop, End, STOP_SCAN_NT};
 use super::junction::{JxStatus, Junction};
 use super::sites::{acceptor_default, base, revcomp, splice_scores, translate, Code};
 use super::splice::MIN_INTRON;
@@ -158,25 +159,10 @@ impl Refine {
         }
         (ns, ne)
     }
-    /// Gene ends: a chain's first exon, when it starts within START_NODES of
-    /// the model's first node and the chain's exons cover START_COVER of the
-    /// model, extends to the farthest in-frame ATG upstream before a stop
-    /// (within START_NT): a lone hit or a thin chain is too often no gene's
-    /// first exon. Its last exon, when it ends within
-    /// STOP_NODES of the last node, extends through the first in-frame stop
-    /// within STOP_NT. Alignments fade a few codons short of both. A last exon
-    /// further from the model's end, up to STOP_REACH_NODES, still reads on to a
-    /// stop within STOP_FAR_NT unless a donor lies on the way (donor_ahead): a
-    /// further exon. Beyond STOP_REACH_NODES the exon is rarely the gene's last
-    /// and is left as it is.
+    /// Gene ends: a chain's first exon extends to the farthest in-frame ATG
+    /// upstream before a stop, its last exon through the first in-frame stop,
+    /// where gate::start_reach and gate::take_stop allow.
     pub fn extend_ends(&mut self, code: Code, cs: &[Chain], genome: &HashMap<String, Vec<u8>>, m_of: impl Fn(&Chain) -> Option<usize>) {
-        const START_NODES: i64 = 30;
-        const START_NT: i64 = 30;
-        const START_COVER: f64 = 0.7;
-        const STOP_NODES: i64 = 20;
-        const STOP_NT: i64 = 90;
-        const STOP_FAR_NT: i64 = 1500;
-        const STOP_REACH_NODES: i64 = 100;
         for (i, c) in cs.iter().enumerate() {
             let (Some(m), Some(sq)) = (m_of(c), genome.get(&c.scaffold)) else { continue };
             let n = c.ex.len();
@@ -190,17 +176,14 @@ impl Refine {
                 Some(if plus { [t[0], t[1], t[2]] } else { [comp(t[2]), comp(t[1]), comp(t[0])] })
             };
             let stop = |x: &[u8; 3]| translate(code, x) == b'*';
-            let covered = {
-                let mut on = vec![false; m + 1];
-                for e in &c.ex { for k in e.k1.max(1)..=e.k2.min(m as i64) { on[k as usize] = true; } }
-                on.iter().filter(|&&x| x).count()
-            };
-            if c.ex[0].k1 <= START_NODES && covered as f64 >= START_COVER * m as f64 {
+            let covered = covered_nodes(c, m);
+            let end = |short: i64| End { short, covered, m, exons: n, lone: c.passive };
+            if let Some(reach) = start_reach(&end(c.ex[0].k1 - 1)) {
                 let (a, b) = self.span(c, i, 0);
                 let cs0 = if plus { a } else { b };
                 let step = if plus { -3 } else { 3 };
                 let (mut p, mut atg) = (cs0, None);
-                while (p - cs0).abs() <= START_NT {
+                while (p - cs0).abs() <= reach {
                     let Some(x) = codon(p) else { break };
                     if stop(&x) { break; }
                     if &x == b"ATG" { atg = Some(p); }
@@ -208,16 +191,15 @@ impl Refine {
                 }
                 if let Some(p) = atg { if p != cs0 { self.ex[i][0].start_g = p; } }
             }
-            let short = m as i64 - c.ex[n - 1].k2;
-            let (near, reach) = (short <= STOP_NODES, short <= STOP_REACH_NODES);
+            let last = end(m as i64 - c.ex[n - 1].k2);
             let (a, b) = self.span(c, i, n - 1);
             let ce = if plus { b } else { a };
             let step = if plus { 3 } else { -3 };
             let mut p = ce + step / 3;
-            while (p - ce).abs() <= STOP_FAR_NT {
+            while (p - ce).abs() <= STOP_SCAN_NT {
                 let Some(x) = codon(p) else { break };
                 if stop(&x) {
-                    if (near && (p - ce).abs() <= STOP_NT) || (reach && !donor_ahead(sq, plus, ce, p)) {
+                    if take_stop(&last, (p - ce).abs(), || donor_ahead(sq, plus, ce, p)) {
                         self.ex[i][n - 1].stop_g = if plus { p + 2 } else { p - 2 };
                     }
                     break;

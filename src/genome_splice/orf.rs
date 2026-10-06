@@ -3,6 +3,7 @@
 
 use super::align::{residue_code, AlnHit, Dp, Profile};
 use super::chain::{ChainExon, SRC_ORF};
+use super::gate::{keep_piece, Piece};
 use super::hmm::Hmm;
 use super::sites::{revcomp, translate, Code};
 use std::fmt::Write as _;
@@ -255,10 +256,11 @@ struct Cand {
     rep: bool,
 }
 
-/// One gap/flank window (+ strand sequence). Rows go to `out`; kept exons to `kept`.
+/// One gap/flank window (+ strand sequence) of a row whose exons cover `cover`
+/// of the model. Rows go to `out`; kept exons to `kept`.
 #[allow(clippy::too_many_arguments)]
 pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &OrfOpts, id: &str, lead: &str, goff: i64,
-                  strand: u8, a0: i64, b0: i64, mut alo: i64, mut ahi: i64, wseq: &[u8],
+                  strand: u8, a0: i64, b0: i64, mut alo: i64, mut ahi: i64, wseq: &[u8], cover: f64,
                   out: &mut String, kept: &mut Vec<ChainExon>) {
     let w = wseq.len() as i64;
     let s: Vec<u8> = if strand == b'-' {
@@ -319,12 +321,16 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
     let adj = if cands.len() > 1 { (cands.len() as f32).log2() } else { 0.0 };
     let flank = up != dn;
     for n in 0..cands.len() {
-        let a = if o.rank && flank {
-            let d = cands[n].dist;
-            (1.0 + cands.iter().filter(|x| x.dist < d).count() as f32).log2()
+        let c = &cands[n];
+        let charge = if o.rank && flank {
+            (1.0 + cands.iter().filter(|x| x.dist < c.dist).count() as f32).log2()
         } else { adj };
-        let c = &mut cands[n];
-        c.kept = !c.rep && c.margin >= o.revthr && c.nmatch >= o.minm && (c.bits - a >= o.thr || c.dist <= o.near);
+        // the row's exon is before the window (up), after it (dn), or both
+        let (from_up, to_dn) = (c.kf as i64 - a0, b0 - c.kl as i64);
+        let skip = if !dn { from_up } else if !up { to_dn } else { from_up.min(to_dn) };
+        let p = Piece { bits: c.bits, margin: c.margin, charge, nmatch: c.nmatch, aa: (c.shi - c.slo + 1) / 3, repeat: c.rep,
+                        dist: c.dist, skip, flank, cover };
+        cands[n].kept = keep_piece(&p, o);
     }
     cands.sort_by(|x, y| y.bits.partial_cmp(&x.bits).unwrap_or(std::cmp::Ordering::Equal));
     for k in 0..cands.len() {

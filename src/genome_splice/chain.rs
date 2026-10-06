@@ -57,6 +57,13 @@ pub struct Chain {
     pub ex: Vec<ChainExon>,
 }
 
+/// Model nodes (of m) the chain's exons cover.
+pub fn covered_nodes(c: &Chain, m: usize) -> usize {
+    let mut on = vec![false; m + 1];
+    for e in &c.ex { for k in e.k1.max(1)..=e.k2.min(m as i64) { on[k as usize] = true; } }
+    on.iter().filter(|&&x| x).count()
+}
+
 pub fn sort_exons(ex: &mut [ChainExon]) {
     ex.sort_by(|a, b| (a.k1, a.start).cmp(&(b.k1, b.start)));
 }

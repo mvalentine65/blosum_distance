@@ -3,7 +3,7 @@
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
 //! .pseudo.tsv, .gff3) plus .acceptor.tsv, .cut.tsv and .rebase.tsv, genomic 1-based coordinates.
 
-use super::chain::{add_exon, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_ORF, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
+use super::chain::{add_exon, covered_nodes, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_ORF, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
 use super::sites::{acceptor_default, base, code, learn_acceptor, revcomp, splice_scores, translate, AccTable, Code, SS3_LAST};
@@ -11,6 +11,7 @@ use super::module::{alternatives, copies};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
 use super::refine::{junction_sites, JxSites, Refine};
+use super::gate::{keep_against_reversal, keep_at_frameshift};
 use super::gff::write_gff;
 use super::score::{score_chain, ExonScore};
 use super::splice::{Params, DIS_FS, DIS_STOP, MIN_INTRON};
@@ -880,7 +881,8 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 // a gap part that belongs to other isoforms reads as N
                 let seg: Vec<u8> = masked(&sc[(w.gs - 1) as usize..w.ge as usize], w.gs, w.mask);
                 let mut kept: Vec<ChainExon> = Vec::new();
-                orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, &mut wo.segments, &mut kept);
+                let cover = covered_nodes(c, hmm.m) as f64 / hmm.m as f64;
+                orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, cover, &mut wo.segments, &mut kept);
                 for k in kept {
                     wo.pend.push((w.ci, k, w.kind));
                     for &c2 in &w.also { wo.pend.push((c2, k, w.kind)); }
@@ -931,7 +933,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             c.ex.retain(|e| {
                 let r = v[j].rev;
                 j += 1;
-                let drop = r < o.min_rev; // NaN (untested) keeps
+                let drop = !keep_against_reversal(r, o.min_rev);
                 if drop {
                     let _ = writeln!(d, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}", c.gene, c.scaffold, c.strand as char, e.start, e.end,
                                      e.k1, e.k2, SRC_NAME[e.src as usize], r);
@@ -951,7 +953,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 .is_some_and(|r| r.dis.iter().any(|x| x.0 == DIS_FS as usize && x.3));
             let gone: Vec<bool> = (0..n).map(|j| {
                 let e = &c.ex[j];
-                e.src == SRC_ORF && e.bits < o.orf_fs_bits && ((j > 0 && fs(&c.ex[j - 1], e)) || (j + 1 < n && fs(e, &c.ex[j + 1])))
+                e.src == SRC_ORF && !keep_at_frameshift(e.bits, o.orf_fs_bits) && ((j > 0 && fs(&c.ex[j - 1], e)) || (j + 1 < n && fs(e, &c.ex[j + 1])))
             }).collect();
             if !gone.contains(&true) { continue; }
             for (e, _) in c.ex.iter().zip(&gone).filter(|x| *x.1) {

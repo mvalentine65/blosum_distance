@@ -5,6 +5,7 @@ pub mod align;
 #[cfg(target_arch = "x86_64")]
 pub mod avx;
 pub mod chain;
+pub mod gate;
 pub mod gff;
 pub mod hmm;
 pub mod junction;

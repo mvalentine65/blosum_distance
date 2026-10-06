@@ -1,6 +1,6 @@
 [package]
 name = "sapphyre_tools"
-version = "0.13.9"
+version = "0.13.10"
 edition = "2021"
 license = "GPL-3.0-or-later"
 # Oldest toolchain we build on. Cargo skips dependency versions that need a

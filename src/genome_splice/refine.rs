@@ -159,8 +159,10 @@ impl Refine {
         (ns, ne)
     }
     /// Gene ends: a chain's first exon, when it starts within START_NODES of
-    /// the model's first node, extends to the farthest in-frame ATG upstream
-    /// before a stop (within START_NT); its last exon, when it ends within
+    /// the model's first node and the chain's exons cover START_COVER of the
+    /// model, extends to the farthest in-frame ATG upstream before a stop
+    /// (within START_NT): a lone hit or a thin chain is too often no gene's
+    /// first exon. Its last exon, when it ends within
     /// STOP_NODES of the last node, extends through the first in-frame stop
     /// within STOP_NT. Alignments fade a few codons short of both. A last exon
     /// further from the model's end, up to STOP_REACH_NODES, still reads on to a
@@ -170,6 +172,7 @@ impl Refine {
     pub fn extend_ends(&mut self, code: Code, cs: &[Chain], genome: &HashMap<String, Vec<u8>>, m_of: impl Fn(&Chain) -> Option<usize>) {
         const START_NODES: i64 = 30;
         const START_NT: i64 = 30;
+        const START_COVER: f64 = 0.7;
         const STOP_NODES: i64 = 20;
         const STOP_NT: i64 = 90;
         const STOP_FAR_NT: i64 = 1500;
@@ -187,7 +190,12 @@ impl Refine {
                 Some(if plus { [t[0], t[1], t[2]] } else { [comp(t[2]), comp(t[1]), comp(t[0])] })
             };
             let stop = |x: &[u8; 3]| translate(code, x) == b'*';
-            if c.ex[0].k1 <= START_NODES {
+            let covered = {
+                let mut on = vec![false; m + 1];
+                for e in &c.ex { for k in e.k1.max(1)..=e.k2.min(m as i64) { on[k as usize] = true; } }
+                on.iter().filter(|&&x| x).count()
+            };
+            if c.ex[0].k1 <= START_NODES && covered as f64 >= START_COVER * m as f64 {
                 let (a, b) = self.span(c, i, 0);
                 let cs0 = if plus { a } else { b };
                 let step = if plus { -3 } else { 3 };

@@ -2,8 +2,8 @@
 //!
 //! Nodes k1..k2 (anchor A's first to anchor B's last) are aligned through the
 //! locus A..B. Codons inside an anchor keep its frame; no intron may enter an
-//! anchor deeper than w_in. Introns score the splice PSSMs of sites, intron open
-//! and non-canonical penalties; phase 1/2 introns score the codon assembled
+//! anchor deeper than w_in. Introns score the splice PSSMs of sites, intron open,
+//! non-canonical and GC donor penalties; phase 1/2 introns score the codon assembled
 //! across them, node-skipping ones included; 1-2 nt frameshifts and node-skipping introns are penalised. Scores are
 //! in half-bits. Intron open, minimum intron and frameshift costs take the
 //! values exonerate 2.4.0 uses. The fill stage runs it twice:
@@ -21,6 +21,8 @@ pub const HALF: f64 = -1e17;
 const HALFBITS: f64 = 2.0 / std::f64::consts::LN_2;
 const INTRON_OPEN: f64 = -30.0;
 const NONCANON: f64 = -30.0;
+// what the donor table leaves of a GC donor's rarity among annotated introns
+const GC_DONOR: f64 = -9.0;
 pub const MIN_INTRON: usize = 30;
 const SKIP_INTRON: usize = 60;
 // kernel tiling: ring columns kept per row (> SKIP_INTRON + TILE is not needed:
@@ -38,6 +40,8 @@ pub struct Params {
     pub fs: f64,
     /// once per intron that skips model nodes, however many
     pub skip_open: f64,
+    /// a GC donor, on top of its site score
+    pub gc_donor: f64,
     pub w_in: i64,
     pub ext: i64,
     pub max_cells: i64,
@@ -53,7 +57,7 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Params { stop: -1000.0, fs: -28.0, skip_open: -20.0, w_in: 60, ext: 45, max_cells: 40_000_000, xsc: -4.0, slack: 15, null_run: true, min_gap_nt: 30, acc: acceptor_default(), code: STANDARD }
+        Params { stop: -1000.0, fs: -28.0, skip_open: -20.0, gc_donor: GC_DONOR, w_in: 60, ext: 45, max_cells: 40_000_000, xsc: -4.0, slack: 15, null_run: true, min_gap_nt: 30, acc: acceptor_default(), code: STANDARD }
     }
 }
 
@@ -165,9 +169,10 @@ fn tables(hmm: &Hmm, loc: &Locus, prm: &Params, wall: Option<(i64, i64)>) -> Tab
         let nxt = tb[k + 1];
         let prv = if k > 0 { tb[k - 1] } else { 4 };
         let gt_gc = tb[k] == 2 && (nxt == 3 || nxt == 1);
+        let gc = if gt_gc && nxt == 1 { prm.gc_donor } else { 0.0 };
         let ag = prv == 0 && tb[k] == 2;
         if !core {
-            don[k] = ss5[k] + INTRON_OPEN + if gt_gc { 0.0 } else { NONCANON };
+            don[k] = ss5[k] + INTRON_OPEN + gc + if gt_gc { 0.0 } else { NONCANON };
             acc[k] = ss3[k] + if ag { 0.0 } else { NONCANON };
         }
         if core { last_core = k as i64; }

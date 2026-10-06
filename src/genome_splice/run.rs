@@ -148,6 +148,7 @@ impl Opts {
             "refine_stop" => self.refine_stop = v,
             "refine_fs" => self.refine_fs = v,
             "skip_open" => self.prm.skip_open = v,
+            "gc_donor" => self.prm.gc_donor = v,
             "cpu" => self.threads = (v as usize).max(1),
             "table" => self.prm.code = code(v as u8).ok_or_else(|| format!("unknown NCBI table {v}"))?,
             _ => return Err(format!("unknown option '{k}'")),

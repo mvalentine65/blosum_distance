@@ -536,8 +536,10 @@ fn fake_cut(code: Code, jx: &Junction) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// True when a and b join on their own: one exon or one clean intron, no frameshift or
+/// stop, and no model node skipped between them.
 fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &ChainExon, b: &ChainExon, sc: &[u8],
-            mask: Option<(i64, i64)>, jid: &str, ci: usize, wo: &mut WinOut) {
+            mask: Option<(i64, i64)>, jid: &str, ci: usize, wo: &mut WinOut) -> bool {
     let lo = a.start.min(b.start);
     let hi = a.end.max(b.end);
     let seq = masked(&sc[(lo - 1) as usize..hi as usize], lo, mask);
@@ -547,7 +549,7 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
     let st = c.strand as char;
     if jx.status != JxStatus::Ok {
         let _ = writeln!(wo.fills, "{}\t{}\t{}\t-\t-\t{}\t{}", c.gene, c.scaffold, st, jx.status.name(), jid);
-        return;
+        return false;
     }
     let res = &jx.res;
     // evidence in bits against log2 of the search space: gap searched (not masked) x missing nodes x 3 frames
@@ -582,6 +584,7 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
             wo.pend.push((ci, ChainExon { start: p.min(q), end: p.max(q), k1: x.kf, k2: x.kl, src: SRC_SPLICE, codon: 0, bits: 0.0, run: false }, GAP));
         }
     }
+    res.nfs == 0 && res.nstop == 0 && res.nnonc == 0 && (n == 1 || (n == 2 && res.exons[1].kf - res.exons[0].kl <= 1))
 }
 
 /// One distinct junction's refine/pseudo result.
@@ -897,18 +900,19 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 let before = w.kind != GAP && (if plus { w.ge < e.start } else { w.gs > e.end });
                 let start = before && lead_start_reach(e.k1 - 1)
                     .is_some_and(|reach| start_upstream(o.prm.code, sc, plus, if plus { e.start } else { e.end }, reach).is_some());
-                if orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, cover, start, &mut wo.segments, &mut kept) {
+                // the gap's two exons aligned to each other: the exons between them, and whether they join on their own
+                let joined = do_splice && w.kind == GAP && {
+                    let jid = format!("j{}", base + i);
+                    let (a, b) = (c.ex[w.ia], c.ex[w.ib.unwrap()]);
+                    fill_gap(al, hid, hmm, o, c, &a, &b, sc, w.mask, &jid, w.ci, &mut wo)
+                };
+                if orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, cover, start, joined, &mut wo.segments, &mut kept) {
                     wo.refused.push(w.ci);
                     wo.refused.extend(&w.also);
                 }
                 for k in kept {
                     wo.pend.push((w.ci, k, w.kind));
                     for &c2 in &w.also { wo.pend.push((c2, k, w.kind)); }
-                }
-                if do_splice && w.kind == GAP {
-                    let jid = format!("j{}", base + i);
-                    let (a, b) = (c.ex[w.ia], c.ex[w.ib.unwrap()]);
-                    fill_gap(al, hid, hmm, o, c, &a, &b, sc, w.mask, &jid, w.ci, &mut wo);
                 }
                 wo
             });

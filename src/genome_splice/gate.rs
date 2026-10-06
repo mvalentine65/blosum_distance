@@ -32,6 +32,8 @@ pub struct Piece {
     pub lead: bool,
     /// that exon reads back to a start codon of its own (lead_start_reach)
     pub start: bool,
+    /// in a gap: the two exons beside it join on their own (fill_gap)
+    pub joined: bool,
 }
 
 /// nt within which a piece has no room for an intron before the row's exon
@@ -72,13 +74,20 @@ pub fn lead_refused(p: &Piece) -> bool {
     p.lead && p.start && p.dist >= LEAD_FAR_NT && p.aa < LEAD_SHORT_AA
 }
 
+/// A piece in a gap whose two exons already join on their own, with no model
+/// node between them left over, is refused: they cover what it would, and in
+/// the row it forces an intron on each side of itself.
+pub fn gap_covered(p: &Piece) -> bool {
+    !p.flank && p.joined
+}
+
 /// A piece is kept when it is no repeat, beats its reversal by `revthr`, has
 /// `minm` residues on nodes, either outscores the charge by `thr` or lies
 /// within `near` nt of the row, scores what its place asks (bits_needed), and
-/// is no refused lead piece.
+/// is no refused lead piece or covered gap piece.
 pub fn keep_piece(p: &Piece, o: &OrfOpts) -> bool {
     !p.repeat && p.margin >= o.revthr && p.nmatch >= o.minm && (p.bits - p.charge >= o.thr || p.dist <= o.near)
-        && p.bits >= bits_needed(p) && !lead_refused(p)
+        && p.bits >= bits_needed(p) && !lead_refused(p) && !gap_covered(p)
 }
 
 /// nt the pieces of a run may lie apart, and the first from the row's exon

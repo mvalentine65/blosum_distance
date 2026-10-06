@@ -263,11 +263,11 @@ struct Cand {
 
 /// One gap/flank window (+ strand sequence) of a row whose exons cover `cover`
 /// of the model; `start`: the row's first exon reads back to a start codon of
-/// its own. Rows go to `out`; kept exons to `kept`. True when a lead piece was
-/// refused for that start codon.
+/// its own; `joined`: the gap's two exons join on their own. Rows go to `out`;
+/// kept exons to `kept`. True when a lead piece was refused for that start codon.
 #[allow(clippy::too_many_arguments)]
 pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &OrfOpts, id: &str, lead: &str, goff: i64,
-                  strand: u8, a0: i64, b0: i64, mut alo: i64, mut ahi: i64, wseq: &[u8], cover: f64, start: bool,
+                  strand: u8, a0: i64, b0: i64, mut alo: i64, mut ahi: i64, wseq: &[u8], cover: f64, start: bool, joined: bool,
                   out: &mut String, kept: &mut Vec<ChainExon>) -> bool {
     let w = wseq.len() as i64;
     let s: Vec<u8> = if strand == b'-' {
@@ -335,7 +335,7 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
         let (from_up, to_dn) = (c.kf as i64 - a0, b0 - c.kl as i64);
         let skip = if !dn { from_up } else if !up { to_dn } else { from_up.min(to_dn) };
         Piece { bits: c.bits, margin: c.margin, charge, nmatch: c.nmatch, aa: (c.shi - c.slo + 1) / 3, repeat: c.rep,
-                dist: c.dist, skip, flank, cover, lead: dn && !up, start }
+                dist: c.dist, skip, flank, cover, lead: dn && !up, start, joined }
     };
     let mut refused = false;
     for n in 0..cands.len() {

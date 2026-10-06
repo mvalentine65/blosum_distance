@@ -169,7 +169,7 @@ impl Refine {
     /// and is left as it is.
     pub fn extend_ends(&mut self, code: Code, cs: &[Chain], genome: &HashMap<String, Vec<u8>>, m_of: impl Fn(&Chain) -> Option<usize>) {
         const START_NODES: i64 = 30;
-        const START_NT: i64 = 300;
+        const START_NT: i64 = 30;
         const STOP_NODES: i64 = 20;
         const STOP_NT: i64 = 90;
         const STOP_FAR_NT: i64 = 1500;

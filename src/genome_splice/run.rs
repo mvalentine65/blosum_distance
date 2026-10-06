@@ -11,7 +11,7 @@ use super::module::{alternatives, copies};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
 use super::refine::{junction_sites, JxSites, Refine};
-use super::gate::{keep_against_reversal, keep_at_frameshift};
+use super::gate::{keep_against_reversal, keep_at_frameshift, keep_run_piece};
 use super::gff::write_gff;
 use super::score::{score_chain, ExonScore};
 use super::splice::{Params, DIS_FS, DIS_STOP, MIN_INTRON};
@@ -92,7 +92,7 @@ pub struct Opts {
 impl Default for Opts {
     fn default() -> Self {
         Opts {
-            orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false },
+            orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false, runs: true },
             chain: ChainOpts { min_gap: 10, max_gap: 1000, max_end: 250, flank: 15000, share: true, siblings: true },
             prm: Params::default(),
             fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, refine_stop: -4.0, refine_fs: f64::NAN,
@@ -116,6 +116,7 @@ impl Opts {
             "overlap" => self.orf.overlap = v as i64,
             "anchored" => self.orf.anchored = v != 0.0,
             "rank" => self.orf.rank = v != 0.0,
+            "runs" => self.orf.runs = v != 0.0,
             "min_gap" => self.chain.min_gap = v as i64,
             "max_gap" => self.chain.max_gap = v as i64,
             "max_end" => self.chain.max_end = v as i64,
@@ -363,8 +364,8 @@ fn cut_read_through(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usiz
             // genomic low and high piece; the coding-first one takes ka
             let (kl, kh) = if c.strand == b'-' { (kb, ka) } else { (ka, kb) };
             let low = keep_low(e.start, e.end, lo, hi);
-            ex.push(ChainExon { start: e.start, end: lo - 1, k1: kl.0, k2: kl.1, src: if low { SRC_INPUT } else { SRC_CUT }, codon: e.codon, bits: 0.0 });
-            ex.push(ChainExon { start: hi + 1, end: e.end, k1: kh.0, k2: kh.1, src: if low { SRC_CUT } else { SRC_INPUT }, codon: e.codon, bits: 0.0 });
+            ex.push(ChainExon { start: e.start, end: lo - 1, k1: kl.0, k2: kl.1, src: if low { SRC_INPUT } else { SRC_CUT }, codon: e.codon, bits: 0.0, run: false });
+            ex.push(ChainExon { start: hi + 1, end: e.end, k1: kh.0, k2: kh.1, src: if low { SRC_CUT } else { SRC_INPUT }, codon: e.codon, bits: 0.0, run: false });
         }
         c.ex = ex;
         sort_exons(&mut c.ex);
@@ -573,7 +574,7 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
         let _ = writeln!(wo.exons, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, st,
                          jid, i, role, p.min(q), p.max(q), ac, dn, asite, dsite, x.phase, x.nmatch, x.kf, x.kl, kept as i32);
         if kept && i > 0 && i < n - 1 && x.nmatch > 0 && x.hi - x.lo + 1 >= o.min_seg {
-            wo.pend.push((ci, ChainExon { start: p.min(q), end: p.max(q), k1: x.kf, k2: x.kl, src: SRC_SPLICE, codon: 0, bits: 0.0 }, GAP));
+            wo.pend.push((ci, ChainExon { start: p.min(q), end: p.max(q), k1: x.kf, k2: x.kl, src: SRC_SPLICE, codon: 0, bits: 0.0, run: false }, GAP));
         }
     }
 }
@@ -914,6 +915,8 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
         }
         copy_to_flank_rows(&mut cs);
     }
+    // pieces each row's runs hold; a run that loses one goes whole
+    let runs: Vec<usize> = cs.iter().map(|c| c.ex.iter().filter(|e| e.run).count()).collect();
     if do_fill && do_refine && o.min_rev.is_finite() {
         // drop internal recovered exons that fit their chain, at refined
         // boundaries, no better than reversed; then refine the new junctions
@@ -943,22 +946,34 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             });
         }
     }
-    if do_fill && do_refine && o.orf_fs_bits > 0.0 {
+    if do_fill && do_refine {
         // a weak ORF piece next to an exon in another frame is intron read as exon: the junction
         // comes out a strict frameshift where the gene has a splice site. The piece goes.
         refine_all(&models, &mid, o, &cs, &genome, true, false, &mut cache, None, None);
         let d = out.buf("dropped");
-        for c in cs.iter_mut() {
+        for (c, &held) in cs.iter_mut().zip(&runs) {
             let n = c.ex.len();
+            let whole = c.ex.iter().filter(|e| e.run).count() == held;
             let fs = |a: &ChainExon, b: &ChainExon| cache.get(&jx_key(c, a, b))
                 .is_some_and(|r| r.dis.iter().any(|x| x.0 == DIS_FS as usize && x.3));
+            // spliced or one exon with its neighbour, nothing disabling on the way
+            let clean = |a: &ChainExon, b: &ChainExon| cache.get(&jx_key(c, a, b)).is_some_and(|r| {
+                r.dis.is_empty() && (r.sites.joined || (r.sites.ok && r.sites.acc_site == *b"AG" && (r.sites.don_site == *b"GT" || r.sites.don_site == *b"GC")))
+            });
+            // one piece of a row's run that fails takes the run with it
+            let run_gone = (0..n).any(|j| {
+                let e = &c.ex[j];
+                e.run && !keep_run_piece((j == 0 || clean(&c.ex[j - 1], e)) && (j + 1 == n || clean(e, &c.ex[j + 1])), whole)
+            });
             let gone: Vec<bool> = (0..n).map(|j| {
                 let e = &c.ex[j];
-                e.src == SRC_ORF && !keep_at_frameshift(e.bits, o.orf_fs_bits) && ((j > 0 && fs(&c.ex[j - 1], e)) || (j + 1 < n && fs(e, &c.ex[j + 1])))
+                (e.run && run_gone) || (o.orf_fs_bits > 0.0 && e.src == SRC_ORF && !keep_at_frameshift(e.bits, o.orf_fs_bits)
+                    && ((j > 0 && fs(&c.ex[j - 1], e)) || (j + 1 < n && fs(e, &c.ex[j + 1]))))
             }).collect();
             if !gone.contains(&true) { continue; }
             for (e, _) in c.ex.iter().zip(&gone).filter(|x| *x.1) {
-                let _ = writeln!(d, "{}\t{}\t{}\t{}\t{}\t{}\t{}\tfs\t{:.2}", c.gene, c.scaffold, c.strand as char, e.start, e.end, e.k1, e.k2, e.bits);
+                let _ = writeln!(d, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}", c.gene, c.scaffold, c.strand as char, e.start, e.end, e.k1, e.k2,
+                                 if e.run && run_gone { "run" } else { "fs" }, e.bits);
             }
             let mut j = 0;
             c.ex.retain(|_| { j += 1; !gone[j - 1] });

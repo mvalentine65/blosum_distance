@@ -62,6 +62,46 @@ pub fn keep_piece(p: &Piece, o: &OrfOpts) -> bool {
         && p.bits >= bits_needed(p)
 }
 
+/// nt the pieces of a run may lie apart, and the first from the row's exon
+const RUN_NT: i64 = 1000;
+/// model nodes two pieces of a run may share
+const RUN_SHARE: i64 = 3;
+/// bits the pieces of a run sum to
+const RUN_BITS: f32 = 10.0;
+
+/// A piece may be one of a run when it is no repeat, beats its reversal by
+/// `revthr` and has `minm` residues on nodes; its own bits are not asked.
+pub fn in_run(p: &Piece, o: &OrfOpts) -> bool {
+    !p.repeat && p.margin >= o.revthr && p.nmatch >= o.minm && p.bits > 0.0
+}
+
+/// Pieces past a row's end, none kept alone, that follow one another in the
+/// genome and in the model (run_next), are judged as one piece: `n` of them,
+/// two or more, summing to RUN_BITS and outscoring the charge by `thr`. The run
+/// starts within RUN_NT and FAR_NODES of the row's exon (run_start). Exons of
+/// one gene each too short or too far in the model to stand alone.
+pub fn keep_run(bits: f32, n: usize, charge: f32, o: &OrfOpts) -> bool {
+    n >= 2 && bits >= RUN_BITS && bits - charge >= o.thr
+}
+
+/// Whether a run may start at this piece, the one next to the row's exon.
+pub fn run_start(p: &Piece) -> bool {
+    p.dist <= RUN_NT && p.skip <= FAR_NODES
+}
+
+/// Whether a piece follows the one before it in a run: `gap` nt past it with
+/// room for an intron, `skip` model nodes on (negative: nodes shared).
+pub fn run_next(gap: i64, skip: i64, min_intron: i64) -> bool {
+    gap >= min_intron && gap <= RUN_NT && skip >= -RUN_SHARE && skip <= FAR_NODES
+}
+
+/// A piece kept as one of a run must meet both neighbours across a junction
+/// with splice sites and no frameshift or stop (`clean`), and the run must still
+/// hold every piece it had (`whole`); else the run goes.
+pub fn keep_run_piece(clean: bool, whole: bool) -> bool {
+    clean && whole
+}
+
 /// A piece that meets a neighbour only across a strict frameshift needs `floor`
 /// bits: under that it is intron read as exon.
 pub fn keep_at_frameshift(bits: f32, floor: f32) -> bool {

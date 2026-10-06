@@ -3,7 +3,8 @@
 
 use super::align::{residue_code, AlnHit, Dp, Profile};
 use super::chain::{ChainExon, SRC_ORF};
-use super::gate::{keep_piece, Piece};
+use super::gate::{in_run, keep_piece, keep_run, run_next, run_start, Piece};
+use super::splice::MIN_INTRON;
 use super::hmm::Hmm;
 use super::sites::{revcomp, translate, Code};
 use std::fmt::Write as _;
@@ -29,6 +30,8 @@ pub struct OrfOpts {
     pub anchored: bool,
     /// flank windows: charge log2(1 + ORFs nearer the anchor) instead of log2(ORFs)
     pub rank: bool,
+    /// flank windows: judge pieces that follow one another as one (gate::keep_run)
+    pub runs: bool,
 }
 
 /// A profile slice kept while consecutive calls use the same model and nodes.
@@ -254,6 +257,8 @@ struct Cand {
     bits: f32,
     margin: f32,
     rep: bool,
+    /// kept only as one of a run
+    run: bool,
 }
 
 /// One gap/flank window (+ strand sequence) of a row whose exons cover `cover`
@@ -299,7 +304,7 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
         if ahi > 0 { d = d.min(if ahi > shi { ahi - shi } else if slo > ahi { slo - ahi } else { 0 }); }
         let fp: &[u8] = if o.decoy { &ra } else { aa };
         let rep = fh.nmatch > 0 && is_repeat(&fp[(fh.rf - 1) as usize..fh.rl as usize], hmm, fh.kf as i64, fh.kl as i64);
-        cands.push(Cand { slo, shi, nmatch: fh.nmatch, kf: fh.kf, kl: fh.kl, dist: d, kept: false, bits: fh.bits, margin: fh.bits - rh.bits, rep });
+        cands.push(Cand { slo, shi, nmatch: fh.nmatch, kf: fh.kf, kl: fh.kl, dist: d, kept: false, bits: fh.bits, margin: fh.bits - rh.bits, rep, run: false });
     };
     for f in 0..3usize {
         let mut aa: Vec<u8> = Vec::new();
@@ -320,17 +325,47 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
     }
     let adj = if cands.len() > 1 { (cands.len() as f32).log2() } else { 0.0 };
     let flank = up != dn;
-    for n in 0..cands.len() {
-        let c = &cands[n];
+    let piece = |c: &Cand, cands: &[Cand]| {
         let charge = if o.rank && flank {
             (1.0 + cands.iter().filter(|x| x.dist < c.dist).count() as f32).log2()
         } else { adj };
         // the row's exon is before the window (up), after it (dn), or both
         let (from_up, to_dn) = (c.kf as i64 - a0, b0 - c.kl as i64);
         let skip = if !dn { from_up } else if !up { to_dn } else { from_up.min(to_dn) };
-        let p = Piece { bits: c.bits, margin: c.margin, charge, nmatch: c.nmatch, aa: (c.shi - c.slo + 1) / 3, repeat: c.rep,
-                        dist: c.dist, skip, flank, cover };
-        cands[n].kept = keep_piece(&p, o);
+        Piece { bits: c.bits, margin: c.margin, charge, nmatch: c.nmatch, aa: (c.shi - c.slo + 1) / 3, repeat: c.rep,
+                dist: c.dist, skip, flank, cover }
+    };
+    for n in 0..cands.len() {
+        cands[n].kept = keep_piece(&piece(&cands[n], &cands), o);
+    }
+    if flank && o.runs {
+        // the best run leading away from the row's exon: position and nodes as they
+        // grow that way (mirrored before the exon)
+        let away = |c: &Cand| if up { (c.slo, c.shi, c.kf as i64, c.kl as i64) } else { (-c.shi, -c.slo, -(c.kl as i64), -(c.kf as i64)) };
+        let mut ord: Vec<usize> = (0..cands.len()).filter(|&n| !cands[n].kept && cands[n].nmatch > 0 && in_run(&piece(&cands[n], &cands), o)).collect();
+        ord.sort_by_key(|&n| away(&cands[n]).0);
+        // sum: bits of the best run ending at each piece; from: the piece before it
+        let (mut sum, mut from) = (vec![f32::NEG_INFINITY; ord.len()], vec![usize::MAX; ord.len()]);
+        for i in 0..ord.len() {
+            let (lo, _, kf, kl) = away(&cands[ord[i]]);
+            if run_start(&piece(&cands[ord[i]], &cands)) { sum[i] = cands[ord[i]].bits; }
+            for j in 0..i {
+                let (_, phi, _, pkl) = away(&cands[ord[j]]);
+                if sum[j] > f32::NEG_INFINITY && kl > pkl && run_next(lo - phi - 1, kf - pkl - 1, MIN_INTRON as i64)
+                    && sum[j] + cands[ord[i]].bits > sum[i] {
+                    sum[i] = sum[j] + cands[ord[i]].bits;
+                    from[i] = j;
+                }
+            }
+        }
+        let best = (0..ord.len()).filter(|&i| from[i] != usize::MAX).max_by(|&x, &y| sum[x].partial_cmp(&sum[y]).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(mut i) = best {
+            let mut run = vec![ord[i]];
+            while from[i] != usize::MAX { i = from[i]; run.push(ord[i]); }
+            if keep_run(sum[best.unwrap()], run.len(), adj, o) {
+                for n in run { cands[n].kept = true; cands[n].run = true; }
+            }
+        }
     }
     cands.sort_by(|x, y| y.bits.partial_cmp(&x.bits).unwrap_or(std::cmp::Ordering::Equal));
     for k in 0..cands.len() {
@@ -347,9 +382,9 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
         let (mut slo, mut shi) = (c.slo, c.shi);
         if strand == b'-' { slo = w - c.shi + 1; shi = w - c.slo + 1; }
         let _ = writeln!(out, "{lead}\t{}\t{}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{id}", goff + slo, goff + shi,
-                         c.bits, c.margin, c.nmatch, c.kf, c.kl, c.dist, c.kept as i32);
+                         c.bits, c.margin, c.nmatch, c.kf, c.kl, c.dist, if c.run { 2 } else { c.kept as i32 });
         if c.kept {
-            kept.push(ChainExon { start: goff + slo, end: goff + shi, k1: c.kf as i64, k2: c.kl as i64, src: SRC_ORF, codon: 0, bits: c.bits });
+            kept.push(ChainExon { start: goff + slo, end: goff + shi, k1: c.kf as i64, k2: c.kl as i64, src: SRC_ORF, codon: 0, bits: c.bits, run: c.run });
         }
     }
 }

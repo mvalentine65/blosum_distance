@@ -2,7 +2,9 @@
 //!
 //! chains.tsv, tab separated, '#' lines ignored:
 //!   G  gene  model  scaffold  strand  k_lo  k_hi  [flank_only|passive|imx]
-//!   E  gene  start  end  k1  k2
+//!   E  gene  start  end  k1  k2  [codon]
+//! codon: genomic first base (coding orientation) of one codon of the hit; it
+//! fixes the exon's reading frame. Without it the frame is found by score.
 //! Per chain, exons in model order. A gap window lies between consecutive
 //! exons missing min_gap..max_gap-1 nodes; a flank window lies beyond the
 //! first/last exon when k_lo/k_hi leave min_gap..max_end-1 nodes uncovered, reaching up
@@ -30,6 +32,8 @@ pub struct ChainExon {
     pub k1: i64,
     pub k2: i64,
     pub src: u8,
+    /// genomic first base (coding orientation) of one codon of the hit; 0: not given
+    pub codon: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +81,7 @@ pub fn read_chains(path: &str) -> Result<Vec<Chain>, String> {
                 chains[i].ex.push(ChainExon {
                     start: f[2].parse().unwrap_or(0), end: f[3].parse().unwrap_or(0),
                     k1: f[4].parse().unwrap_or(0), k2: f[5].parse().unwrap_or(0), src: SRC_INPUT,
+                    codon: f.get(6).and_then(|x| x.parse().ok()).unwrap_or(0),
                 });
             }
         }

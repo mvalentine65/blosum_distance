@@ -343,7 +343,7 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
         let _ = writeln!(out, "{lead}\t{}\t{}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{id}", goff + slo, goff + shi,
                          c.bits, c.margin, c.nmatch, c.kf, c.kl, c.dist, c.kept as i32);
         if c.kept {
-            kept.push(ChainExon { start: goff + slo, end: goff + shi, k1: c.kf as i64, k2: c.kl as i64, src: SRC_ORF });
+            kept.push(ChainExon { start: goff + slo, end: goff + shi, k1: c.kf as i64, k2: c.kl as i64, src: SRC_ORF, codon: 0 });
         }
     }
 }

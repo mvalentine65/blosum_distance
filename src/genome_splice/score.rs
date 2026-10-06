@@ -1,5 +1,5 @@
-//! Per-exon scores of a chain. Each exon is translated in its best frame and
-//! the chain's peptide is aligned once (Forward).
+//! Per-exon scores of a chain. Each exon is translated in its hit's frame, or
+//! its best frame when it has none, and the chain's peptide is aligned once (Forward).
 //! bits: BATH's p7_splice_ScoreExons score, the Forward gain across the exon's
 //! residues (ln C at its last residue minus ln C before its first), with the
 //! length model reset to the exon and its null score removed.
@@ -48,18 +48,24 @@ pub fn score_chain(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, c: &C
         if s >= 1 && t <= sc.len() as i64 && t - s + 1 >= 3 && k1 <= k2 {
             let fwd = &sc[(s - 1) as usize..t as usize];
             let nt = if c.strand == b'-' { revcomp(fwd) } else { fwd.to_vec() };
-            // best frame by Forward score alone (the full decoding pipeline isn't needed here)
-            al.set(hmm_id, hmm, k1 as usize, k2 as usize);
-            let (mut f, mut best) = (0i64, f32::NEG_INFINITY);
-            let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
-            for fr in 0..3 {
-                let t: Vec<u8> = translate_frame(code, &nt, fr).into_iter().map(|x| if x == b'*' { b'X' } else { x }).collect();
-                if !t.is_empty() {
-                    let b = al.fwd_bits(&t);
-                    if b > best { best = b; f = fr as i64; }
+            let mut frames: Vec<Vec<u8>> = (0..3)
+                .map(|fr| translate_frame(code, &nt, fr).into_iter().map(|x| if x == b'*' { b'X' } else { x }).collect())
+                .collect();
+            let f = if e.codon != 0 {
+                // an exon from a hit keeps the hit's frame
+                (if c.strand == b'-' { t - e.codon } else { e.codon - s }).rem_euclid(3)
+            } else {
+                // best frame by Forward score alone (the full decoding pipeline isn't needed here)
+                al.set(hmm_id, hmm, k1 as usize, k2 as usize);
+                let (mut f, mut best) = (0i64, f32::NEG_INFINITY);
+                for (fr, p) in frames.iter().enumerate() {
+                    if !p.is_empty() {
+                        let b = al.fwd_bits(p);
+                        if b > best { best = b; f = fr as i64; }
+                    }
                 }
-                frames.push(t);
-            }
+                f
+            };
             // in-frame stops, as genomic positions of the codon's first base;
             // the gene's own stop (the last codon of the chain's last exon) is not one
             let last = j + 1 == c.ex.len();

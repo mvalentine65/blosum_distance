@@ -163,14 +163,17 @@ impl Refine {
     /// before a stop (within START_NT); its last exon, when it ends within
     /// STOP_NODES of the last node, extends through the first in-frame stop
     /// within STOP_NT. Alignments fade a few codons short of both. A last exon
-    /// further from the model's end still reads on to a stop within STOP_FAR_NT
-    /// unless a donor lies on the way (donor_ahead): a further exon.
+    /// further from the model's end, up to STOP_REACH_NODES, still reads on to a
+    /// stop within STOP_FAR_NT unless a donor lies on the way (donor_ahead): a
+    /// further exon. Beyond STOP_REACH_NODES the exon is rarely the gene's last
+    /// and is left as it is.
     pub fn extend_ends(&mut self, code: Code, cs: &[Chain], genome: &HashMap<String, Vec<u8>>, m_of: impl Fn(&Chain) -> Option<usize>) {
         const START_NODES: i64 = 30;
         const START_NT: i64 = 300;
         const STOP_NODES: i64 = 20;
         const STOP_NT: i64 = 90;
         const STOP_FAR_NT: i64 = 1500;
+        const STOP_REACH_NODES: i64 = 100;
         for (i, c) in cs.iter().enumerate() {
             let (Some(m), Some(sq)) = (m_of(c), genome.get(&c.scaffold)) else { continue };
             let n = c.ex.len();
@@ -197,7 +200,8 @@ impl Refine {
                 }
                 if let Some(p) = atg { if p != cs0 { self.ex[i][0].start_g = p; } }
             }
-            let near = m as i64 - c.ex[n - 1].k2 <= STOP_NODES;
+            let short = m as i64 - c.ex[n - 1].k2;
+            let (near, reach) = (short <= STOP_NODES, short <= STOP_REACH_NODES);
             let (a, b) = self.span(c, i, n - 1);
             let ce = if plus { b } else { a };
             let step = if plus { 3 } else { -3 };
@@ -205,7 +209,7 @@ impl Refine {
             while (p - ce).abs() <= STOP_FAR_NT {
                 let Some(x) = codon(p) else { break };
                 if stop(&x) {
-                    if (near && (p - ce).abs() <= STOP_NT) || !donor_ahead(sq, plus, ce, p) {
+                    if (near && (p - ce).abs() <= STOP_NT) || (reach && !donor_ahead(sq, plus, ce, p)) {
                         self.ex[i][n - 1].stop_g = if plus { p + 2 } else { p - 2 };
                     }
                     break;

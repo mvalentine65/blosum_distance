@@ -133,8 +133,8 @@ pub fn keep_against_reversal(rev: f64, min_rev: f64) -> bool {
     !(rev < min_rev)
 }
 
-/// A row's end as its extension is judged. `exons` and `lone` are evidence no
-/// rule reads yet.
+/// A row's end as its extension is judged. `exons`, `lone` and `refused` are
+/// evidence no rule reads yet.
 #[allow(dead_code)]
 pub struct End {
     /// model nodes between the end exon and that end of the model
@@ -152,7 +152,7 @@ pub struct End {
 }
 
 const START_NODES: i64 = 30;
-const START_NT: i64 = 30;
+const START_NT: i64 = 150;
 const START_COVER: f64 = 0.7;
 /// codons a start codon may lie beyond the model nodes the first exon lacks
 const START_SLACK: i64 = 20;
@@ -166,12 +166,10 @@ pub const STOP_SCAN_NT: i64 = 1500;
 /// in-frame ATG before a stop), when the row earns the search: the exon starts
 /// within START_NODES of the model's first node and the row's exons cover
 /// START_COVER of the model. A lone hit or a thin row is too often no gene's
-/// first exon. Alignments fade a few codons short of the start.
-/// Where a lead piece was refused for the exon's own start codon, the search
-/// reaches as far as that codon was looked for (lead_start_reach).
+/// first exon. Genes run on before the model's first node. START_NT covers the
+/// reach lead_start_reach looks in.
 pub fn start_reach(e: &End) -> Option<i64> {
-    (e.short < START_NODES && e.covered as f64 >= START_COVER * e.m as f64)
-        .then(|| if e.refused { 3 * (e.short + START_SLACK) } else { START_NT })
+    (e.short < START_NODES && e.covered as f64 >= START_COVER * e.m as f64).then_some(START_NT)
 }
 
 /// nt upstream of a first exon, `short` model nodes from the model's start, in

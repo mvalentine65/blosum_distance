@@ -34,6 +34,8 @@ pub struct ChainExon {
     pub src: u8,
     /// genomic first base (coding orientation) of one codon of the hit; 0: not given
     pub codon: i64,
+    /// Forward bits of a recovered ORF piece; 0 for any other exon
+    pub bits: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +83,7 @@ pub fn read_chains(path: &str) -> Result<Vec<Chain>, String> {
                 chains[i].ex.push(ChainExon {
                     start: f[2].parse().unwrap_or(0), end: f[3].parse().unwrap_or(0),
                     k1: f[4].parse().unwrap_or(0), k2: f[5].parse().unwrap_or(0), src: SRC_INPUT,
-                    codon: f.get(6).and_then(|x| x.parse().ok()).unwrap_or(0),
+                    codon: f.get(6).and_then(|x| x.parse().ok()).unwrap_or(0), bits: 0.0,
                 });
             }
         }

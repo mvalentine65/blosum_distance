@@ -13,7 +13,7 @@ use super::pseudo::Pseudo;
 use super::refine::{junction_sites, JxSites, Refine};
 use super::gff::write_gff;
 use super::score::{score_chain, ExonScore};
-use super::splice::{Params, DIS_STOP, MIN_INTRON};
+use super::splice::{Params, DIS_FS, DIS_STOP, MIN_INTRON};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -59,6 +59,8 @@ pub struct Opts {
     pub splice: bool,
     /// internal recovered exons with rev below this are dropped after refine (-inf: off)
     pub min_rev: f64,
+    /// an ORF piece under this many bits is dropped when it meets a neighbour only across a strict frameshift (0: off)
+    pub orf_fs_bits: f32,
     /// extend gene ends to the start codon and through the stop codon
     pub ends: bool,
     /// score stage: also BATH-style bits and rev for every exon (else frames and nodes only)
@@ -92,7 +94,7 @@ impl Default for Opts {
             orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false },
             chain: ChainOpts { min_gap: 10, max_gap: 1000, max_end: 250, flank: 15000, share: true, siblings: true },
             prm: Params::default(),
-            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, refine_stop: -4.0, refine_fs: f64::NAN,
+            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, refine_stop: -4.0, refine_fs: f64::NAN,
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
@@ -106,6 +108,7 @@ impl Opts {
             "bits" => self.orf.thr = v as f32,
             "near" => self.orf.near = v as i64,
             "rev" => self.orf.revthr = v as f32,
+            "orf_fs_bits" => self.orf_fs_bits = v as f32,
             "min_match" => self.orf.minm = v as i32,
             "all" => self.orf.all = v != 0.0,
             "decoy" => self.orf.decoy = v != 0.0,
@@ -358,8 +361,8 @@ fn cut_read_through(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usiz
             // genomic low and high piece; the coding-first one takes ka
             let (kl, kh) = if c.strand == b'-' { (kb, ka) } else { (ka, kb) };
             let low = keep_low(e.start, e.end, lo, hi);
-            ex.push(ChainExon { start: e.start, end: lo - 1, k1: kl.0, k2: kl.1, src: if low { SRC_INPUT } else { SRC_CUT }, codon: e.codon });
-            ex.push(ChainExon { start: hi + 1, end: e.end, k1: kh.0, k2: kh.1, src: if low { SRC_CUT } else { SRC_INPUT }, codon: e.codon });
+            ex.push(ChainExon { start: e.start, end: lo - 1, k1: kl.0, k2: kl.1, src: if low { SRC_INPUT } else { SRC_CUT }, codon: e.codon, bits: 0.0 });
+            ex.push(ChainExon { start: hi + 1, end: e.end, k1: kh.0, k2: kh.1, src: if low { SRC_CUT } else { SRC_INPUT }, codon: e.codon, bits: 0.0 });
         }
         c.ex = ex;
         sort_exons(&mut c.ex);
@@ -568,7 +571,7 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
         let _ = writeln!(wo.exons, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, st,
                          jid, i, role, p.min(q), p.max(q), ac, dn, asite, dsite, x.phase, x.nmatch, x.kf, x.kl, kept as i32);
         if kept && i > 0 && i < n - 1 && x.nmatch > 0 && x.hi - x.lo + 1 >= o.min_seg {
-            wo.pend.push((ci, ChainExon { start: p.min(q), end: p.max(q), k1: x.kf, k2: x.kl, src: SRC_SPLICE, codon: 0 }, GAP));
+            wo.pend.push((ci, ChainExon { start: p.min(q), end: p.max(q), k1: x.kf, k2: x.kl, src: SRC_SPLICE, codon: 0, bits: 0.0 }, GAP));
         }
     }
 }
@@ -935,6 +938,27 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 }
                 !drop
             });
+        }
+    }
+    if do_fill && do_refine && o.orf_fs_bits > 0.0 {
+        // a weak ORF piece next to an exon in another frame is intron read as exon: the junction
+        // comes out a strict frameshift where the gene has a splice site. The piece goes.
+        refine_all(&models, &mid, o, &cs, &genome, true, false, &mut cache, None, None);
+        let d = out.buf("dropped");
+        for c in cs.iter_mut() {
+            let n = c.ex.len();
+            let fs = |a: &ChainExon, b: &ChainExon| cache.get(&jx_key(c, a, b))
+                .is_some_and(|r| r.dis.iter().any(|x| x.0 == DIS_FS as usize && x.3));
+            let gone: Vec<bool> = (0..n).map(|j| {
+                let e = &c.ex[j];
+                e.src == SRC_ORF && e.bits < o.orf_fs_bits && ((j > 0 && fs(&c.ex[j - 1], e)) || (j + 1 < n && fs(e, &c.ex[j + 1])))
+            }).collect();
+            if !gone.contains(&true) { continue; }
+            for (e, _) in c.ex.iter().zip(&gone).filter(|x| *x.1) {
+                let _ = writeln!(d, "{}\t{}\t{}\t{}\t{}\t{}\t{}\tfs\t{:.2}", c.gene, c.scaffold, c.strand as char, e.start, e.end, e.k1, e.k2, e.bits);
+            }
+            let mut j = 0;
+            c.ex.retain(|_| { j += 1; !gone[j - 1] });
         }
     }
     if do_fill && o.module {

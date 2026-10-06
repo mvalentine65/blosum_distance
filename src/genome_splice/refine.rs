@@ -250,7 +250,7 @@ impl Refine {
                     let mut cd = m.iter().map(|e| e.codon).filter(|&x| x != 0);
                     let codon = cd.next().filter(|&x| cd.all(|y| (y - x) % 3 == 0)).unwrap_or(0);
                     ex.push(ChainExon { start: m.iter().map(|e| e.start).min().unwrap(), end: m.iter().map(|e| e.end).max().unwrap(),
-                                        k1: m[0].k1, k2: m[m.len() - 1].k2, src, codon });
+                                        k1: m[0].k1, k2: m[m.len() - 1].k2, src, codon, bits: 0.0 });
                     let mut r = self.ex[i][j].clone();
                     let last = &self.ex[i][k];
                     r.don_g = last.don_g;

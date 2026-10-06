@@ -88,7 +88,7 @@ fn scan(al: &mut Aligner, hmm: &Hmm, code: Code, strand: u8, x: &ChainExon, xlen
             let (gs, ge) = if strand == b'-' { (hi - o2, hi - o1) } else { (lo + o1, lo + o2) };
             let dist = if ge < x.start { x.start - ge - 1 } else { gs - x.end - 1 };
             if dist < MIN_DIST { continue; }
-            out.push((ChainExon { start: gs, end: ge, k1: kf, k2: kl, src: SRC_ALT, codon: 0 }, margin));
+            out.push((ChainExon { start: gs, end: ge, k1: kf, k2: kl, src: SRC_ALT, codon: 0, bits: 0.0 }, margin));
         }
     }
 }

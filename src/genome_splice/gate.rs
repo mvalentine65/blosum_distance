@@ -5,8 +5,7 @@
 
 use super::orf::OrfOpts;
 
-/// A recovered ORF piece as it is judged. `aa`, `skip`, `flank` and `cover` are
-/// evidence no rule reads yet.
+/// A recovered ORF piece as it is judged. `cover` is evidence no rule reads yet.
 #[allow(dead_code)]
 pub struct Piece {
     /// Forward bits against the window's model nodes
@@ -30,11 +29,37 @@ pub struct Piece {
     pub cover: f64,
 }
 
+/// nt within which a piece has no room for an intron before the row's exon
+const CLOSE_NT: i64 = 30;
+/// nt beyond which a piece is far from the row
+const FAR_NT: i64 = 100;
+/// codons under which a piece is short
+const SHORT_AA: i64 = 20;
+/// model nodes a flank piece may lie from its exon before it needs FAR_NODES_BITS
+const FAR_NODES: i64 = 50;
+const FAR_NODES_BITS: f32 = 10.0;
+
+/// Bits a piece must score for where it lies: the less its place supports it,
+/// the more. A piece 31 to 100 nt from the row's exon, past the row's end and
+/// of 20 codons or more, needs none. One with no room for an intron needs 2,
+/// one far from the row 3; between two exons 2 more, short 3 more. A flank
+/// piece over FAR_NODES model nodes from its exon needs FAR_NODES_BITS.
+pub fn bits_needed(p: &Piece) -> f32 {
+    let mut need = 0.0;
+    if p.dist <= CLOSE_NT { need += 2.0; }
+    if p.dist > FAR_NT { need += 3.0; }
+    if !p.flank { need += 2.0; }
+    if p.aa < SHORT_AA { need += 3.0; }
+    if p.flank && p.skip > FAR_NODES { need = f32::max(need, FAR_NODES_BITS); }
+    need
+}
+
 /// A piece is kept when it is no repeat, beats its reversal by `revthr`, has
-/// `minm` residues on nodes, and either outscores the charge by `thr` or lies
-/// within `near` nt of the row.
+/// `minm` residues on nodes, either outscores the charge by `thr` or lies
+/// within `near` nt of the row, and scores what its place asks (bits_needed).
 pub fn keep_piece(p: &Piece, o: &OrfOpts) -> bool {
     !p.repeat && p.margin >= o.revthr && p.nmatch >= o.minm && (p.bits - p.charge >= o.thr || p.dist <= o.near)
+        && p.bits >= bits_needed(p)
 }
 
 /// A piece that meets a neighbour only across a strict frameshift needs `floor`

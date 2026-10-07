@@ -42,6 +42,18 @@ pub struct OverlapResult {
 pub struct OverlapScratch {
     rcr2: Vec<u8>,
     matcher: MatchScratch,
+    /// `full_limit_from` of the limits last seen: the two limits and its answer.
+    full_from: Option<(usize, u64, usize)>,
+}
+
+/// The shortest overlap whose percent limit reaches `diff_limit`. From it on
+/// an overlap's mismatch limit is `diff_limit` itself.
+fn full_limit_from(diff_limit: usize, diff_percent_limit: f64) -> usize {
+    // no read is this long; a percent limit that never gets there keeps the multiply
+    const NEVER: usize = 1 << 24;
+    (0..NEVER)
+        .find(|&len| (len as f64 * diff_percent_limit) as usize >= diff_limit)
+        .unwrap_or(usize::MAX)
 }
 
 /// Accept-or-not for one candidate offset, fastp's `acceptNoGapOverlap`.
@@ -90,8 +102,23 @@ pub fn analyze(
     reverse_complement_into(r2, &mut scratch.rcr2[..len2]);
     let str2 = &scratch.rcr2[..len2];
 
+    // The percent limit only binds on short overlaps, so the multiply is kept
+    // off the slide, which tries well over a hundred offsets a pair.
+    let key = (diff_limit, diff_percent_limit.to_bits());
+    let full_from = match scratch.full_from {
+        Some((limit, percent, from)) if (limit, percent) == key => from,
+        _ => {
+            let from = full_limit_from(diff_limit, diff_percent_limit);
+            scratch.full_from = Some((key.0, key.1, from));
+            from
+        }
+    };
     let limit_for = |overlap_len: usize| -> usize {
-        diff_limit.min((overlap_len as f64 * diff_percent_limit) as usize)
+        if overlap_len >= full_from {
+            diff_limit
+        } else {
+            diff_limit.min((overlap_len as f64 * diff_percent_limit) as usize)
+        }
     };
 
     // Forward, no gap: the fragment is at least as long as the read.

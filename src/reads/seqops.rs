@@ -32,6 +32,12 @@ pub fn complement(base: u8) -> u8 {
 /// `dst` receives the reverse complement of `src`. `dst` must be `src.len()`.
 pub fn reverse_complement_into(src: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if src.len() >= 32 && avx2() {
+        // SAFETY: AVX2 was just checked; the slices are equally long.
+        unsafe { reverse_complement_avx2(src, dst) };
+        return;
+    }
     // Walk both ends toward the middle so each iteration is a pair of
     // independent table lookups rather than one reversed dependent stride.
     let len = src.len();
@@ -44,6 +50,47 @@ pub fn reverse_complement_into(src: &[u8], dst: &mut [u8]) {
     }
     if i < j {
         dst[len - 1 - i] = COMPLEMENT[src[i] as usize];
+    }
+}
+
+/// `reverse_complement_into`, 32 bases a step.
+///
+/// # Safety
+/// The CPU must support AVX2 (`avx2()`); `dst` is as long as `src`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn reverse_complement_avx2(src: &[u8], dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let len = src.len();
+    let mut i = 0;
+    // SAFETY: a step reads 32 bytes at `i` and writes the 32 that mirror them.
+    unsafe {
+        let upper = _mm256_set1_epi8(0xDFu8 as i8);
+        let (a, c, g, t) = (
+            _mm256_set1_epi8(b'A' as i8),
+            _mm256_set1_epi8(b'C' as i8),
+            _mm256_set1_epi8(b'G' as i8),
+            _mm256_set1_epi8(b'T' as i8),
+        );
+        let backwards = _mm256_setr_epi8(
+            15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+            15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+        );
+        while i + 32 <= len {
+            let x = _mm256_and_si256(_mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i), upper);
+            let mut y = _mm256_set1_epi8(b'N' as i8);
+            y = _mm256_blendv_epi8(y, t, _mm256_cmpeq_epi8(x, a));
+            y = _mm256_blendv_epi8(y, a, _mm256_cmpeq_epi8(x, t));
+            y = _mm256_blendv_epi8(y, g, _mm256_cmpeq_epi8(x, c));
+            y = _mm256_blendv_epi8(y, c, _mm256_cmpeq_epi8(x, g));
+            let y = _mm256_shuffle_epi8(y, backwards);
+            let y = _mm256_permute2x128_si256::<1>(y, y);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(len - i - 32) as *mut __m256i, y);
+            i += 32;
+        }
+    }
+    for k in i..len {
+        dst[len - 1 - k] = COMPLEMENT[src[k] as usize];
     }
 }
 

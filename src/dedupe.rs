@@ -18,7 +18,7 @@ use crate::reads::pipeline::{
     process_pair, process_single, TrimOptions, TrimScratch, TrimStats,
 };
 use crate::reads::seed::PreparedAdapter;
-use crate::reads::seqops::{avx2, complement};
+use crate::reads::seqops::{avx2, complement, reverse_complement_into};
 
 // --- Optimized DedupTable from main_bestrs.rs ---
 
@@ -609,8 +609,8 @@ fn push_kept(out: &mut Kept, seq: &[u8], canon: &mut Vec<u8>, min_length: usize)
     let bytes: &[u8] = if forward_is_canonical(seq) {
         seq
     } else {
-        canon.clear();
-        canon.extend(seq.iter().rev().map(|&b| complement(b)));
+        canon.resize(seq.len(), 0);
+        reverse_complement_into(seq, canon);
         canon
     };
     let start = out.buf.len();
@@ -1007,8 +1007,8 @@ fn add_canonical(table: &mut DedupTable, seq: &[u8], scratch: &mut Vec<u8>, min_
     if forward_is_canonical(seq) {
         table.add(seq);
     } else {
-        scratch.clear();
-        scratch.extend(seq.iter().rev().map(|&b| complement(b)));
+        scratch.resize(seq.len(), 0);
+        reverse_complement_into(seq, scratch);
         table.add(scratch);
     }
 }

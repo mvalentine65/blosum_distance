@@ -122,11 +122,6 @@ pub fn count_mismatches_bounded(a: &[u8], b: &[u8], len: usize, limit: usize) ->
     const BLOCK: usize = 16;
     let n = len.min(a.len()).min(b.len());
     let (a, b) = (&a[..n], &b[..n]);
-    #[cfg(target_arch = "x86_64")]
-    if avx2() {
-        // SAFETY: AVX2 and POPCNT were just checked; the slices are equally long.
-        return unsafe { count_mismatches_bounded_avx2(a, b, limit) };
-    }
     let mut diff = 0usize;
     let mut i = 0usize;
     // A block at a time so the compare still vectorises; overshooting `limit`
@@ -164,6 +159,7 @@ pub fn avx2() -> bool {
 /// The CPU must support AVX2 and POPCNT (`avx2()`); both slices hold `n` bytes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,popcnt")]
+#[inline]
 pub unsafe fn count_mismatches_avx2(a: &[u8], b: &[u8], n: usize) -> usize {
     use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
     debug_assert!(a.len() >= n && b.len() >= n);
@@ -198,7 +194,8 @@ pub unsafe fn count_mismatches_avx2(a: &[u8], b: &[u8], n: usize) -> usize {
 /// The CPU must support AVX2 and POPCNT (`avx2()`); `b` is as long as `a`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,popcnt")]
-unsafe fn count_mismatches_bounded_avx2(a: &[u8], b: &[u8], limit: usize) -> usize {
+#[inline]
+pub unsafe fn count_mismatches_bounded_avx2(a: &[u8], b: &[u8], limit: usize) -> usize {
     use std::arch::x86_64::*;
     let n = a.len();
     let (mut i, mut diff) = (0usize, 0usize);

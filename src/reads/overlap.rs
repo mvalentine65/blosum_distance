@@ -19,7 +19,9 @@
 
 use crate::reads::matcher::{diff_with_one_insertion, MatchScratch};
 use crate::reads::read::ReadRec;
-use crate::reads::seqops::{count_mismatches, count_mismatches_bounded, reverse_complement_into};
+#[cfg(target_arch = "x86_64")]
+use crate::reads::seqops::count_mismatches_bounded_avx2;
+use crate::reads::seqops::{avx2, count_mismatches, count_mismatches_bounded, reverse_complement_into};
 
 /// fastp's `complete_compare_require`: past this many bases the mismatch limit
 /// stops gating acceptance. 1.3.6 behaviour, and the reason it accepts some
@@ -62,9 +64,20 @@ fn full_limit_from(diff_limit: usize, diff_percent_limit: f64) -> usize {
 /// bases; beyond that the overlap is accepted and the remaining mismatches are
 /// merely counted. fastp's own unit test asserts an overlap with 30 mismatches
 /// is accepted this way.
-fn accept_no_gap(a: &[u8], b: &[u8], len: usize, diff_limit: usize) -> Option<usize> {
+///
+/// `WIDE` picks the AVX2 compare; a caller sets it only with the CPU checked.
+#[inline(always)]
+fn accept_no_gap<const WIDE: bool>(a: &[u8], b: &[u8], len: usize, diff_limit: usize) -> Option<usize> {
     let len = len.min(a.len()).min(b.len());
     let protected_prefix = len.min(COMPLETE_COMPARE_REQUIRE);
+    #[cfg(target_arch = "x86_64")]
+    let mut mismatch = if WIDE {
+        // SAFETY: `WIDE` is set only by `analyze_avx2`, which the CPU check guards.
+        unsafe { count_mismatches_bounded_avx2(&a[..protected_prefix], &b[..protected_prefix], diff_limit) }
+    } else {
+        count_mismatches_bounded(a, b, protected_prefix, diff_limit)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
     let mut mismatch = count_mismatches_bounded(a, b, protected_prefix, diff_limit);
     if mismatch > diff_limit {
         return None;
@@ -82,6 +95,42 @@ fn accept_no_gap(a: &[u8], b: &[u8], len: usize, diff_limit: usize) -> Option<us
 
 /// Slide R1 against the reverse complement of R2 and report the best overlap.
 pub fn analyze(
+    r1: &[u8],
+    r2: &[u8],
+    diff_limit: usize,
+    overlap_require: usize,
+    diff_percent_limit: f64,
+    allow_gap: bool,
+    scratch: &mut OverlapScratch,
+) -> OverlapResult {
+    #[cfg(target_arch = "x86_64")]
+    if avx2() {
+        // SAFETY: AVX2 and POPCNT were just checked.
+        return unsafe { analyze_avx2(r1, r2, diff_limit, overlap_require, diff_percent_limit, allow_gap, scratch) };
+    }
+    slide::<false>(r1, r2, diff_limit, overlap_require, diff_percent_limit, allow_gap, scratch)
+}
+
+/// `analyze` compiled for AVX2, so the compare at each offset is inlined.
+///
+/// # Safety
+/// The CPU must support AVX2 and POPCNT (`seqops::avx2()`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn analyze_avx2(
+    r1: &[u8],
+    r2: &[u8],
+    diff_limit: usize,
+    overlap_require: usize,
+    diff_percent_limit: f64,
+    allow_gap: bool,
+    scratch: &mut OverlapScratch,
+) -> OverlapResult {
+    slide::<true>(r1, r2, diff_limit, overlap_require, diff_percent_limit, allow_gap, scratch)
+}
+
+#[inline(always)]
+fn slide<const WIDE: bool>(
     r1: &[u8],
     r2: &[u8],
     diff_limit: usize,
@@ -126,7 +175,7 @@ pub fn analyze(
     while offset < len1 as isize - overlap_require as isize {
         let overlap_len = (len1 - offset as usize).min(len2);
         let lim = limit_for(overlap_len);
-        if let Some(diff) = accept_no_gap(&r1[offset as usize..], str2, overlap_len, lim) {
+        if let Some(diff) = accept_no_gap::<WIDE>(&r1[offset as usize..], str2, overlap_len, lim) {
             return OverlapResult {
                 overlapped: true,
                 offset,
@@ -144,7 +193,7 @@ pub fn analyze(
     while offset > -(len2 as isize - overlap_require as isize) {
         let overlap_len = len1.min(len2 - offset.unsigned_abs());
         let lim = limit_for(overlap_len);
-        if let Some(diff) = accept_no_gap(r1, &str2[offset.unsigned_abs()..], overlap_len, lim) {
+        if let Some(diff) = accept_no_gap::<WIDE>(r1, &str2[offset.unsigned_abs()..], overlap_len, lim) {
             return OverlapResult {
                 overlapped: true,
                 offset,

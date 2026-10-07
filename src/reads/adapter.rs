@@ -63,6 +63,37 @@ pub fn trim_by_sequence(
     match_req: usize,
     scratch: &mut AdapterScratch,
 ) -> Option<AdapterHit> {
+    #[cfg(target_arch = "x86_64")]
+    if avx2() {
+        // SAFETY: AVX2 and POPCNT were just checked.
+        return unsafe { trim_by_sequence_avx2(r, prepared, match_req, scratch) };
+    }
+    trim::<false>(r, prepared, match_req, scratch)
+}
+
+/// `trim_by_sequence` compiled for AVX2, so each probe's compare is inlined.
+///
+/// # Safety
+/// The CPU must support AVX2 and POPCNT (`seqops::avx2()`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn trim_by_sequence_avx2(
+    r: &mut ReadRec<'_>,
+    prepared: &PreparedAdapter,
+    match_req: usize,
+    scratch: &mut AdapterScratch,
+) -> Option<AdapterHit> {
+    trim::<true>(r, prepared, match_req, scratch)
+}
+
+/// `WIDE` picks the AVX2 compare; a caller sets it only with the CPU checked.
+#[inline(always)]
+fn trim<const WIDE: bool>(
+    r: &mut ReadRec<'_>,
+    prepared: &PreparedAdapter,
+    match_req: usize,
+    scratch: &mut AdapterScratch,
+) -> Option<AdapterHit> {
     let adapter = &prepared.seq[..];
     let rlen = r.len();
     let alen = adapter.len();
@@ -98,9 +129,8 @@ pub fn trim_by_sequence(
 
     // The wide compare reads 32 bytes whatever is left, so the adapter and the
     // read's end, where the short compares are, both come padded.
-    let wide = avx2();
     let tail_start = rlen - rlen.min(alen);
-    if wide {
+    if WIDE {
         scratch.tail.clear();
         scratch.tail.extend_from_slice(&rdata[tail_start..]);
         scratch.tail.resize(rlen - tail_start + PAD, 0);
@@ -117,10 +147,10 @@ pub fn trim_by_sequence(
         let at = (start_offset as isize + pos) as usize;
         let len = cmplen - start_offset;
         #[cfg(target_arch = "x86_64")]
-        if wide {
+        if WIDE {
             let a = &prepared.padded[start_offset..];
             let b = if at >= tail_start { &tail[at - tail_start..] } else { &rdata[at..] };
-            // SAFETY: `wide` says the CPU has AVX2; both slices hold `len` bytes.
+            // SAFETY: `WIDE` is set only by `trim_by_sequence_avx2`; both slices hold `len` bytes.
             return unsafe { count_mismatches_avx2(a, b, len) } <= allowed_mismatch;
         }
         count_mismatches_bounded(&adapter[start_offset..], &rdata[at..], len, allowed_mismatch) <= allowed_mismatch

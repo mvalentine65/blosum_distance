@@ -2,6 +2,7 @@ mod aligner;
 mod column_cull;
 mod consensus;
 mod dedupe;
+mod genome_prep;
 mod genome_splice;
 mod flexcull;
 mod ntbatch;
@@ -515,6 +516,8 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ntbatch::NtBatchScanner>()?;
     m.add_class::<dedupe::PreparedReads>()?;
     m.add_function(wrap_pyfunction!(dedupe::dedupe_reads, m)?)?;
+    m.add_class::<genome_prep::GenomeScanner>()?;
+    m.add_function(wrap_pyfunction!(genome_prep::genome_windows, m)?)?;
 
     Ok(())
 }

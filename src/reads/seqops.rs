@@ -122,6 +122,11 @@ pub fn count_mismatches_bounded(a: &[u8], b: &[u8], len: usize, limit: usize) ->
     const BLOCK: usize = 16;
     let n = len.min(a.len()).min(b.len());
     let (a, b) = (&a[..n], &b[..n]);
+    #[cfg(target_arch = "x86_64")]
+    if avx2() {
+        // SAFETY: AVX2 and POPCNT were just checked; the slices are equally long.
+        return unsafe { count_mismatches_bounded_avx2(a, b, limit) };
+    }
     let mut diff = 0usize;
     let mut i = 0usize;
     // A block at a time so the compare still vectorises; overshooting `limit`
@@ -184,6 +189,41 @@ pub unsafe fn count_mismatches_avx2(a: &[u8], b: &[u8], n: usize) -> usize {
         }
     }
     n - same as usize
+}
+
+/// `count_mismatches_bounded` over two equally long slices, 32 bases a step
+/// and the budget checked after each.
+///
+/// # Safety
+/// The CPU must support AVX2 and POPCNT (`avx2()`); `b` is as long as `a`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn count_mismatches_bounded_avx2(a: &[u8], b: &[u8], limit: usize) -> usize {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    let (mut i, mut diff) = (0usize, 0usize);
+    // SAFETY: each step loads bytes that lie inside both slices.
+    unsafe {
+        while i + 32 <= n {
+            let x = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
+            let y = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+            diff += 32 - (_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32).count_ones() as usize;
+            if diff > limit {
+                return diff;
+            }
+            i += 32;
+        }
+        if i + 16 <= n {
+            let x = _mm_loadu_si128(a.as_ptr().add(i) as *const __m128i);
+            let y = _mm_loadu_si128(b.as_ptr().add(i) as *const __m128i);
+            diff += 16 - (_mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) as u32).count_ones() as usize;
+            if diff > limit {
+                return diff;
+            }
+            i += 16;
+        }
+    }
+    diff + count_mismatches_bounded_scalar(&a[i..], &b[i..], limit - diff)
 }
 
 #[inline]

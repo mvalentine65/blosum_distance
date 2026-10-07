@@ -177,7 +177,7 @@ impl Refine {
             };
             let stop = |x: &[u8; 3]| translate(code, x) == b'*';
             let covered = covered_nodes(c, m);
-            let end = |short: i64| End { short, covered, m, exons: n, lone: c.passive, refused: c.lead_refused };
+            let end = |short: i64| End { short, covered, m, exons: n, lone: c.passive };
             if let Some(reach) = start_reach(&end(c.ex[0].k1 - 1)) {
                 let (a, b) = self.span(c, i, 0);
                 let cs0 = if plus { a } else { b };
@@ -236,7 +236,7 @@ impl Refine {
                     let mut cd = m.iter().map(|e| e.codon).filter(|&x| x != 0);
                     let codon = cd.next().filter(|&x| cd.all(|y| (y - x) % 3 == 0)).unwrap_or(0);
                     ex.push(ChainExon { start: m.iter().map(|e| e.start).min().unwrap(), end: m.iter().map(|e| e.end).max().unwrap(),
-                                        k1: m[0].k1, k2: m[m.len() - 1].k2, src, codon, bits: 0.0, run: false });
+                                        k1: m[0].k1, k2: m[m.len() - 1].k2, src, codon, bits: 0.0, run: false, owes: false });
                     let mut r = self.ex[i][j].clone();
                     let last = &self.ex[i][k];
                     r.don_g = last.don_g;

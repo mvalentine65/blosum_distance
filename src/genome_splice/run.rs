@@ -6,15 +6,15 @@
 use super::chain::{add_exon, covered_nodes, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_ORF, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
-use super::sites::{acceptor_default, base, code, learn_acceptor, revcomp, splice_scores, translate, AccTable, Code, SS3_LAST};
+use super::sites::{acceptor_default, base, code, learn_acceptor, revcomp, site_scores, splice_scores, translate, AccTable, Code, SS3_LAST};
 use super::module::{alternatives, copies};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
 use super::refine::{junction_sites, start_upstream, JxSites, Refine};
-use super::gate::{keep_against_reversal, keep_at_frameshift, keep_run_piece, lead_start_reach};
+use super::gate::{keep_against_reversal, keep_at_frameshift, keep_run_piece, lead_start_reach, pays_intron};
 use super::gff::write_gff;
 use super::score::{score_chain, ExonScore};
-use super::splice::{Params, DIS_FS, DIS_STOP, MIN_INTRON};
+use super::splice::{intron_charge, Params, DIS_FS, DIS_STOP, MIN_INTRON};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -184,8 +184,6 @@ struct WinOut {
     fills: String,
     exons: String,
     pend: Vec<(usize, ChainExon, u8)>, // chain, exon, window kind
-    /// chains a lead piece was refused for (gate::lead_refused)
-    refused: Vec<usize>,
 }
 
 /// seq (starting at genomic position start) with the mask range read as N
@@ -369,8 +367,8 @@ fn cut_read_through(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usiz
             // genomic low and high piece; the coding-first one takes ka
             let (kl, kh) = if c.strand == b'-' { (kb, ka) } else { (ka, kb) };
             let low = keep_low(e.start, e.end, lo, hi);
-            ex.push(ChainExon { start: e.start, end: lo - 1, k1: kl.0, k2: kl.1, src: if low { SRC_INPUT } else { SRC_CUT }, codon: e.codon, bits: 0.0, run: false });
-            ex.push(ChainExon { start: hi + 1, end: e.end, k1: kh.0, k2: kh.1, src: if low { SRC_CUT } else { SRC_INPUT }, codon: e.codon, bits: 0.0, run: false });
+            ex.push(ChainExon { start: e.start, end: lo - 1, k1: kl.0, k2: kl.1, src: if low { SRC_INPUT } else { SRC_CUT }, codon: e.codon, bits: 0.0, run: false, owes: false });
+            ex.push(ChainExon { start: hi + 1, end: e.end, k1: kh.0, k2: kh.1, src: if low { SRC_CUT } else { SRC_INPUT }, codon: e.codon, bits: 0.0, run: false, owes: false });
         }
         c.ex = ex;
         sort_exons(&mut c.ex);
@@ -581,7 +579,7 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
         let _ = writeln!(wo.exons, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, st,
                          jid, i, role, p.min(q), p.max(q), ac, dn, asite, dsite, x.phase, x.nmatch, x.kf, x.kl, kept as i32);
         if kept && i > 0 && i < n - 1 && x.nmatch > 0 && x.hi - x.lo + 1 >= o.min_seg {
-            wo.pend.push((ci, ChainExon { start: p.min(q), end: p.max(q), k1: x.kf, k2: x.kl, src: SRC_SPLICE, codon: 0, bits: 0.0, run: false }, GAP));
+            wo.pend.push((ci, ChainExon { start: p.min(q), end: p.max(q), k1: x.kf, k2: x.kl, src: SRC_SPLICE, codon: 0, bits: 0.0, run: false, owes: false }, GAP));
         }
     }
     res.nfs == 0 && res.nstop == 0 && res.nnonc == 0 && (n == 1 || (n == 2 && res.exons[1].kf - res.exons[0].kl <= 1))
@@ -906,10 +904,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                     let (a, b) = (c.ex[w.ia], c.ex[w.ib.unwrap()]);
                     fill_gap(al, hid, hmm, o, c, &a, &b, sc, w.mask, &jid, w.ci, &mut wo)
                 };
-                if orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, cover, start, joined, &mut wo.segments, &mut kept) {
-                    wo.refused.push(w.ci);
-                    wo.refused.extend(&w.also);
-                }
+                orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, cover, start, joined, &mut wo.segments, &mut kept);
                 for k in kept {
                     wo.pend.push((w.ci, k, w.kind));
                     for &c2 in &w.also { wo.pend.push((c2, k, w.kind)); }
@@ -922,7 +917,6 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 out.buf("segments").push_str(&wo.segments);
                 if do_splice { out.buf("fills").push_str(&wo.fills); out.buf("exons").push_str(&wo.exons); }
                 pend.extend(wo.pend);
-                for ci in wo.refused { cs[ci].lead_refused = true; }
             }
             let mut grew: HashSet<(usize, u8)> = HashSet::new();
             for pass in 0..2 {
@@ -981,20 +975,32 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             let clean = |a: &ChainExon, b: &ChainExon| cache.get(&jx_key(c, a, b)).is_some_and(|r| {
                 r.dis.is_empty() && (r.sites.joined || (r.sites.ok && r.sites.acc_site == *b"AG" && (r.sites.don_site == *b"GT" || r.sites.don_site == *b"GC")))
             });
+            // a piece that owes its intron is charged what the spliced search asks for the one to the next exon
+            let pays = |j: usize| {
+                let e = &c.ex[j];
+                let Some(sq) = genome.get(&c.scaffold).filter(|_| e.owes && j + 1 < n) else { return true };
+                let s = cache.get(&jx_key(c, e, &c.ex[j + 1])).map(|r| r.sites.clone()).unwrap_or_default();
+                if s.joined { return true; }
+                let (ss5, ss3) = if s.ok { site_scores(sq, c.strand == b'+', s.don_g, s.acc_g, &o.prm.acc) } else { (0.0, 0.0) };
+                pays_intron(e.bits, intron_charge(&o.prm, ss5, ss3, s.don_site, s.acc_site))
+            };
+            // the last piece that does not pay goes, with the pieces found from it
+            let unpaid = (0..n).rev().find(|&j| !pays(j));
+            let orphan = |j: usize| unpaid.is_some_and(|u| j <= u) && c.ex[j].src != SRC_INPUT && c.ex[j].src != SRC_CUT;
             // one piece of a row's run that fails takes the run with it
             let run_gone = (0..n).any(|j| {
                 let e = &c.ex[j];
-                e.run && !keep_run_piece((j == 0 || clean(&c.ex[j - 1], e)) && (j + 1 == n || clean(e, &c.ex[j + 1])), whole)
+                e.run && (orphan(j) || !keep_run_piece((j == 0 || clean(&c.ex[j - 1], e)) && (j + 1 == n || clean(e, &c.ex[j + 1])), whole))
             });
             let gone: Vec<bool> = (0..n).map(|j| {
                 let e = &c.ex[j];
-                (e.run && run_gone) || (o.orf_fs_bits > 0.0 && e.src == SRC_ORF && !keep_at_frameshift(e.bits, o.orf_fs_bits)
+                orphan(j) || (e.run && run_gone) || (o.orf_fs_bits > 0.0 && e.src == SRC_ORF && !keep_at_frameshift(e.bits, o.orf_fs_bits)
                     && ((j > 0 && fs(&c.ex[j - 1], e)) || (j + 1 < n && fs(e, &c.ex[j + 1]))))
             }).collect();
             if !gone.contains(&true) { continue; }
-            for (e, _) in c.ex.iter().zip(&gone).filter(|x| *x.1) {
+            for (j, e) in c.ex.iter().enumerate().filter(|x| gone[x.0]) {
                 let _ = writeln!(d, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}", c.gene, c.scaffold, c.strand as char, e.start, e.end, e.k1, e.k2,
-                                 if e.run && run_gone { "run" } else { "fs" }, e.bits);
+                                 if orphan(j) { "intron" } else if e.run && run_gone { "run" } else { "fs" }, e.bits);
             }
             let mut j = 0;
             c.ex.retain(|_| { j += 1; !gone[j - 1] });

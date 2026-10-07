@@ -67,11 +67,17 @@ const LEAD_FAR_NT: i64 = 1000;
 const LEAD_SHORT_AA: i64 = 30;
 
 /// A short piece far before a first exon that reads back to a start codon of
-/// its own is refused: the gene more likely starts at that codon than across an
-/// intron of that length. The model's first nodes match short hydrophobic ORFs
-/// easily.
-pub fn lead_refused(p: &Piece) -> bool {
+/// its own owes its intron: the gene may as well start at that codon, and the
+/// model's first nodes match short hydrophobic ORFs easily. The search keeps it;
+/// it is judged once its junction has sites (pays_intron).
+pub fn owes_intron(p: &Piece) -> bool {
     p.lead && p.start && p.dist >= LEAD_FAR_NT && p.aa < LEAD_SHORT_AA
+}
+
+/// A piece that owes its intron stays when its bits outweigh what the spliced
+/// search charges for that intron (`intron`, half-bits: splice::intron_charge).
+pub fn pays_intron(bits: f32, intron: f64) -> bool {
+    bits as f64 + intron / 2.0 > 0.0
 }
 
 /// A piece in a gap whose two exons already join on their own, with no model
@@ -84,10 +90,10 @@ pub fn gap_covered(p: &Piece) -> bool {
 /// A piece is kept when it is no repeat, beats its reversal by `revthr`, has
 /// `minm` residues on nodes, either outscores the charge by `thr` or lies
 /// within `near` nt of the row, scores what its place asks (bits_needed), and
-/// is no refused lead piece or covered gap piece.
+/// is no covered gap piece.
 pub fn keep_piece(p: &Piece, o: &OrfOpts) -> bool {
     !p.repeat && p.margin >= o.revthr && p.nmatch >= o.minm && (p.bits - p.charge >= o.thr || p.dist <= o.near)
-        && p.bits >= bits_needed(p) && !lead_refused(p) && !gap_covered(p)
+        && p.bits >= bits_needed(p) && !gap_covered(p)
 }
 
 /// nt the pieces of a run may lie apart, and the first from the row's exon
@@ -100,7 +106,7 @@ const RUN_BITS: f32 = 10.0;
 /// A piece may be one of a run when it is no repeat, beats its reversal by
 /// `revthr` and has `minm` residues on nodes; its own bits are not asked.
 pub fn in_run(p: &Piece, o: &OrfOpts) -> bool {
-    !p.repeat && p.margin >= o.revthr && p.nmatch >= o.minm && p.bits > 0.0 && !lead_refused(p)
+    !p.repeat && p.margin >= o.revthr && p.nmatch >= o.minm && p.bits > 0.0
 }
 
 /// Pieces past a row's end, none kept alone, that follow one another in the
@@ -142,8 +148,8 @@ pub fn keep_against_reversal(rev: f64, min_rev: f64) -> bool {
     !(rev < min_rev)
 }
 
-/// A row's end as its extension is judged. `exons`, `lone` and `refused` are
-/// evidence no rule reads yet.
+/// A row's end as its extension is judged. `exons` and `lone` are evidence no
+/// rule reads yet.
 #[allow(dead_code)]
 pub struct End {
     /// model nodes between the end exon and that end of the model
@@ -156,8 +162,6 @@ pub struct End {
     pub exons: usize,
     /// a hit in no row
     pub lone: bool,
-    /// a lead piece was refused for this end's own start codon (lead_refused)
-    pub refused: bool,
 }
 
 const START_NODES: i64 = 30;

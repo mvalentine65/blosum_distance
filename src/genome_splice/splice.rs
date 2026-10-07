@@ -24,6 +24,14 @@ const NONCANON: f64 = -30.0;
 // what the donor table leaves of a GC donor's rarity among annotated introns
 const GC_DONOR: f64 = -9.0;
 pub const MIN_INTRON: usize = 30;
+
+/// What an intron costs a path, in half-bits: its site scores, intron open,
+/// and what a GC donor or a site that is not GT/GC or AG adds.
+pub fn intron_charge(prm: &Params, ss5: f64, ss3: f64, don: [u8; 2], acc: [u8; 2]) -> f64 {
+    let gt_gc = don == *b"GT" || don == *b"GC";
+    ss5 + ss3 + INTRON_OPEN + if don == *b"GC" { prm.gc_donor } else { 0.0 }
+        + if gt_gc { 0.0 } else { NONCANON } + if acc == *b"AG" { 0.0 } else { NONCANON }
+}
 const SKIP_INTRON: usize = 60;
 // kernel tiling: ring columns kept per row (> SKIP_INTRON + TILE is not needed:
 // rows above are read at most 3 back, own row at most SKIP_INTRON - 1 back)

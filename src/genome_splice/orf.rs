@@ -3,7 +3,7 @@
 
 use super::align::{residue_code, AlnHit, Dp, Profile};
 use super::chain::{ChainExon, SRC_ORF};
-use super::gate::{in_run, keep_piece, keep_run, lead_refused, run_next, run_start, Piece};
+use super::gate::{in_run, keep_piece, keep_run, owes_intron, run_next, run_start, Piece};
 use super::splice::MIN_INTRON;
 use super::hmm::Hmm;
 use super::sites::{revcomp, translate, Code};
@@ -259,16 +259,18 @@ struct Cand {
     rep: bool,
     /// kept only as one of a run
     run: bool,
+    /// stays only if it pays for its intron (gate::owes_intron)
+    owes: bool,
 }
 
 /// One gap/flank window (+ strand sequence) of a row whose exons cover `cover`
 /// of the model; `start`: the row's first exon reads back to a start codon of
 /// its own; `joined`: the gap's two exons join on their own. Rows go to `out`;
-/// kept exons to `kept`. True when a lead piece was refused for that start codon.
+/// kept exons to `kept`.
 #[allow(clippy::too_many_arguments)]
 pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &OrfOpts, id: &str, lead: &str, goff: i64,
                   strand: u8, a0: i64, b0: i64, mut alo: i64, mut ahi: i64, wseq: &[u8], cover: f64, start: bool, joined: bool,
-                  out: &mut String, kept: &mut Vec<ChainExon>) -> bool {
+                  out: &mut String, kept: &mut Vec<ChainExon>) {
     let w = wseq.len() as i64;
     let s: Vec<u8> = if strand == b'-' {
         let t1 = if alo != 0 { w - alo + 1 } else { 0 };
@@ -284,7 +286,7 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
     let a = 1.max(a0 - o.margin - if up { o.overlap } else { 0 });
     let b = (hmm.m as i64).min(b0 + o.margin + if dn { o.overlap } else { 0 });
     if b < a {
-        return false;
+        return;
     }
     let one_sided = o.anchored && up != dn;
     let mut cands: Vec<Cand> = Vec::new();
@@ -306,7 +308,7 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
         if ahi > 0 { d = d.min(if ahi > shi { ahi - shi } else if slo > ahi { slo - ahi } else { 0 }); }
         let fp: &[u8] = if o.decoy { &ra } else { aa };
         let rep = fh.nmatch > 0 && is_repeat(&fp[(fh.rf - 1) as usize..fh.rl as usize], hmm, fh.kf as i64, fh.kl as i64);
-        cands.push(Cand { slo, shi, nmatch: fh.nmatch, kf: fh.kf, kl: fh.kl, dist: d, kept: false, bits: fh.bits, margin: fh.bits - rh.bits, rep, run: false });
+        cands.push(Cand { slo, shi, nmatch: fh.nmatch, kf: fh.kf, kl: fh.kl, dist: d, kept: false, bits: fh.bits, margin: fh.bits - rh.bits, rep, run: false, owes: false });
     };
     for f in 0..3usize {
         let mut aa: Vec<u8> = Vec::new();
@@ -337,11 +339,9 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
         Piece { bits: c.bits, margin: c.margin, charge, nmatch: c.nmatch, aa: (c.shi - c.slo + 1) / 3, repeat: c.rep,
                 dist: c.dist, skip, flank, cover, lead: dn && !up, start, joined }
     };
-    let mut refused = false;
     for n in 0..cands.len() {
         let p = piece(&cands[n], &cands);
-        cands[n].kept = keep_piece(&p, o);
-        refused |= lead_refused(&p) && keep_piece(&Piece { start: false, ..p }, o);
+        (cands[n].kept, cands[n].owes) = (keep_piece(&p, o), owes_intron(&p));
     }
     if flank && o.runs {
         // the best run leading away from the row's exon: position and nodes as they
@@ -372,7 +372,8 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
             }
         }
     }
-    cands.sort_by(|x, y| y.bits.partial_cmp(&x.bits).unwrap_or(std::cmp::Ordering::Equal));
+    // by bits; a piece that owes its intron displaces none that owes nothing
+    cands.sort_by(|x, y| x.owes.cmp(&y.owes).then(y.bits.partial_cmp(&x.bits).unwrap_or(std::cmp::Ordering::Equal)));
     for k in 0..cands.len() {
         if !cands[k].kept { continue; }
         for kk in 0..k {
@@ -389,8 +390,7 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
         let _ = writeln!(out, "{lead}\t{}\t{}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{id}", goff + slo, goff + shi,
                          c.bits, c.margin, c.nmatch, c.kf, c.kl, c.dist, if c.run { 2 } else { c.kept as i32 });
         if c.kept {
-            kept.push(ChainExon { start: goff + slo, end: goff + shi, k1: c.kf as i64, k2: c.kl as i64, src: SRC_ORF, codon: 0, bits: c.bits, run: c.run });
+            kept.push(ChainExon { start: goff + slo, end: goff + shi, k1: c.kf as i64, k2: c.kl as i64, src: SRC_ORF, codon: 0, bits: c.bits, run: c.run, owes: c.owes });
         }
     }
-    refused
 }

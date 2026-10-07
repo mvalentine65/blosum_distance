@@ -38,6 +38,8 @@ pub struct ChainExon {
     pub bits: f32,
     /// an ORF piece kept only as one of a run of pieces (gate::keep_run)
     pub run: bool,
+    /// an ORF piece that stays only if it pays for its intron (gate::owes_intron)
+    pub owes: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -56,8 +58,6 @@ pub struct Chain {
     pub alt_of: Option<String>,
     /// rebased onto a recovered tail: the chain that owns it
     pub rebased: Option<String>,
-    /// a lead piece was refused for the first exon's own start codon (gate::lead_refused)
-    pub lead_refused: bool,
     pub ex: Vec<ChainExon>,
 }
 
@@ -87,14 +87,14 @@ pub fn read_chains(path: &str) -> Result<Vec<Chain>, String> {
                 gene: f[1].into(), model: f[2].into(), scaffold: f[3].into(), strand: f[4].as_bytes()[0],
                 klo: f[5].parse().unwrap_or(0), khi: f[6].parse().unwrap_or(0),
                 flank_only: f.len() >= 8 && f[7] == "flank_only", passive: f.len() >= 8 && f[7] == "passive",
-                imx: f.len() >= 8 && f[7] == "imx", alt_of: None, rebased: None, lead_refused: false, ex: Vec::new(),
+                imx: f.len() >= 8 && f[7] == "imx", alt_of: None, rebased: None, ex: Vec::new(),
             });
         } else if f[0].starts_with('E') && f.len() >= 6 {
             if let Some(&i) = idx.get(f[1]) {
                 chains[i].ex.push(ChainExon {
                     start: f[2].parse().unwrap_or(0), end: f[3].parse().unwrap_or(0),
                     k1: f[4].parse().unwrap_or(0), k2: f[5].parse().unwrap_or(0), src: SRC_INPUT,
-                    codon: f.get(6).and_then(|x| x.parse().ok()).unwrap_or(0), bits: 0.0, run: false,
+                    codon: f.get(6).and_then(|x| x.parse().ok()).unwrap_or(0), bits: 0.0, run: false, owes: false,
                 });
             }
         }

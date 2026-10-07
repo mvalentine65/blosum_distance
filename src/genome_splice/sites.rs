@@ -177,6 +177,30 @@ pub fn splice_scores(b: &[u8], acc: &AccTable, ss5: &mut [f64], ss3: &mut [f64])
     }
 }
 
+/// Donor score of the intron after scaffold base don_g and acceptor score of the
+/// one before acc_g (1-based, the gene read on its strand), under acc.
+pub fn site_scores(sq: &[u8], plus: bool, don_g: i64, acc_g: i64, acc: &AccTable) -> (f64, f64) {
+    // n bases as the gene reads them from scaffold base g; N off the scaffold
+    let read = |g: i64, n: i64| -> Vec<u8> {
+        (0..n).map(|i| {
+            let p = if plus { g + i } else { g - i };
+            if p < 1 || p > sq.len() as i64 { return 4; }
+            let b = base(sq[(p - 1) as usize]);
+            if plus || b > 3 { b } else { 3 - b }
+        }).collect()
+    };
+    let dir = if plus { 1 } else { -1 };
+    let score = |t: &[u8]| {
+        let (mut ss5, mut ss3) = (vec![0f64; t.len()], vec![0f64; t.len()]);
+        splice_scores(t, acc, &mut ss5, &mut ss3);
+        (ss5, ss3)
+    };
+    // the donor's G follows SS5_AFTER exon bases; the acceptor's G is one before the exon
+    let don = score(&read(don_g - dir * (SS5_AFTER - 1), SS5.len() as i64)).0[SS5_AFTER as usize];
+    let ac = score(&read(acc_g - dir * (SS3_LAST + 1), SS3.len() as i64)).1[SS3_LAST as usize];
+    (don, ac)
+}
+
 pub fn revcomp(s: &[u8]) -> Vec<u8> {
     s.iter()
         .rev()

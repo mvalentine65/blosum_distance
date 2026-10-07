@@ -89,6 +89,56 @@ pub fn count_mismatches_bounded(a: &[u8], b: &[u8], len: usize, limit: usize) ->
     diff + count_mismatches_bounded_scalar(&a[i..], &b[i..], limit - diff)
 }
 
+/// Whether the AVX2 compare below may run.
+#[inline]
+pub fn avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("popcnt")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Mismatches over the first `n` bytes of both slices, 32 bases a step.
+///
+/// A last short step is one masked compare when both slices can be read 32
+/// bytes on from it, so a caller that pads its buffers never reaches the byte
+/// loop.
+///
+/// # Safety
+/// The CPU must support AVX2 and POPCNT (`avx2()`); both slices hold `n` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+pub unsafe fn count_mismatches_avx2(a: &[u8], b: &[u8], n: usize) -> usize {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    debug_assert!(a.len() >= n && b.len() >= n);
+    let same_at = |i: usize| -> u32 {
+        // SAFETY: the callers below only pass an `i` with 32 readable bytes in both.
+        unsafe {
+            let x = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
+            let y = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32
+        }
+    };
+    let (mut i, mut same) = (0usize, 0u32);
+    while i + 32 <= n {
+        same += same_at(i).count_ones();
+        i += 32;
+    }
+    let rest = n - i;
+    if rest > 0 {
+        if a.len() >= i + 32 && b.len() >= i + 32 {
+            same += (same_at(i) & ((1u32 << rest) - 1)).count_ones();
+        } else {
+            same += (rest - count_mismatches_scalar(&a[i..n], &b[i..n])) as u32;
+        }
+    }
+    n - same as usize
+}
+
 #[inline]
 fn count_mismatches_scalar(a: &[u8], b: &[u8]) -> usize {
     let mut diff = 0;

@@ -21,10 +21,14 @@
 pub struct AdapterScratch {
     candidates: Vec<usize>,
     seen: Vec<u64>,
+    /// the read's last bases with PAD zero bytes after them
+    tail: Vec<u8>,
 }
 use crate::reads::read::ReadRec;
-use crate::reads::seed::PreparedAdapter;
-use crate::reads::seqops::count_mismatches_bounded;
+use crate::reads::seed::{PreparedAdapter, PAD};
+#[cfg(target_arch = "x86_64")]
+use crate::reads::seqops::count_mismatches_avx2;
+use crate::reads::seqops::{avx2, count_mismatches_bounded};
 
 const ALLOW_ONE_MISMATCH_FOR_EACH: usize = 8;
 
@@ -92,6 +96,17 @@ pub fn trim_by_sequence(
     let seeded_max: isize = rlen as isize - alen as isize;
     let scan_limit = rlen as isize - match_req as isize;
 
+    // The wide compare reads 32 bytes whatever is left, so the adapter and the
+    // read's end, where the short compares are, both come padded.
+    let wide = avx2();
+    let tail_start = rlen - rlen.min(alen);
+    if wide {
+        scratch.tail.clear();
+        scratch.tail.extend_from_slice(&rdata[tail_start..]);
+        scratch.tail.resize(rlen - tail_start + PAD, 0);
+    }
+    let tail = &scratch.tail[..];
+
     let probe = |pos: isize| -> bool {
         let cmplen = ((rlen as isize - pos) as usize).min(alen);
         let allowed_mismatch = cmplen / ALLOW_ONE_MISMATCH_FOR_EACH;
@@ -99,9 +114,16 @@ pub fn trim_by_sequence(
         if start_offset >= cmplen {
             return false;
         }
-        let a = &adapter[start_offset..];
-        let b = &rdata[(start_offset as isize + pos) as usize..];
-        count_mismatches_bounded(a, b, cmplen - start_offset, allowed_mismatch) <= allowed_mismatch
+        let at = (start_offset as isize + pos) as usize;
+        let len = cmplen - start_offset;
+        #[cfg(target_arch = "x86_64")]
+        if wide {
+            let a = &prepared.padded[start_offset..];
+            let b = if at >= tail_start { &tail[at - tail_start..] } else { &rdata[at..] };
+            // SAFETY: `wide` says the CPU has AVX2; both slices hold `len` bytes.
+            return unsafe { count_mismatches_avx2(a, b, len) } <= allowed_mismatch;
+        }
+        count_mismatches_bounded(&adapter[start_offset..], &rdata[at..], len, allowed_mismatch) <= allowed_mismatch
     };
 
     // Head: negative offsets.

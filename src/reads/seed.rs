@@ -15,6 +15,8 @@
 
 /// Block length. 6 bases pack into 12 bits, so the lookup table is 4096 entries.
 pub const SEED_K: usize = 6;
+/// Bytes a vector compare may read past the data it is given.
+pub const PAD: usize = 32;
 const TABLE_SIZE: usize = 1 << (2 * SEED_K);
 
 /// 2-bit code per base, 0xFF for anything that cannot start a seed. A table
@@ -42,6 +44,8 @@ fn base_code(b: u8) -> Option<u8> {
 #[derive(Debug, Clone)]
 pub struct PreparedAdapter {
     pub seq: Vec<u8>,
+    /// `seq` with PAD zero bytes after it, for compares that read past its end.
+    pub padded: Vec<u8>,
     /// For each k-mer code, a bitmask of the blocks holding it.
     table: Vec<u16>,
     /// Number of blocks; 0 means the adapter is too short to filter and the
@@ -60,7 +64,7 @@ impl PreparedAdapter {
         if alen < SEED_K || available < needed || needed > 16 {
             // Cannot guarantee the pigeonhole (or cannot fit the mask), so the
             // caller falls back to the exhaustive scan.
-            return PreparedAdapter { seq: seq.to_vec(), table: Vec::new(), nblocks: 0 };
+            return PreparedAdapter { seq: seq.to_vec(), padded: padded(seq), table: Vec::new(), nblocks: 0 };
         }
 
         let nblocks = needed;
@@ -71,7 +75,7 @@ impl PreparedAdapter {
                 table[code as usize] |= 1 << b;
             }
         }
-        PreparedAdapter { seq: seq.to_vec(), table, nblocks }
+        PreparedAdapter { seq: seq.to_vec(), padded: padded(seq), table, nblocks }
     }
 
     #[inline]
@@ -139,6 +143,12 @@ impl PreparedAdapter {
             }
         }
     }
+}
+
+fn padded(seq: &[u8]) -> Vec<u8> {
+    let mut out = seq.to_vec();
+    out.resize(seq.len() + PAD, 0);
+    out
 }
 
 fn encode(kmer: &[u8]) -> Option<u32> {

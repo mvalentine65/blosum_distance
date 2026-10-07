@@ -228,6 +228,44 @@ pub fn count_adjacent_diffs(data: &[u8]) -> usize {
     diff
 }
 
+/// `count_quality_metrics` over the whole 32-base steps of the first `n`
+/// bases, added to `m`. Returns the bases it covered.
+///
+/// # Safety
+/// The CPU must support AVX2 and POPCNT (`avx2()`); both slices hold `n` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn quality_metrics_avx2(qual: &[u8], seq: &[u8], n: usize, qualified_qual: i64, m: &mut QualityMetrics) -> usize {
+    use std::arch::x86_64::*;
+    // a byte is under the threshold never when it is 0 or less, always when it is over 255
+    let threshold = qualified_qual.clamp(0, 256);
+    let (mut i, mut at_or_over, mut n_bases) = (0usize, 0u32, 0u32);
+    let mut sums = [0u64; 4];
+    // SAFETY: a step loads the 32 bytes at `i` of both slices, `i + 32 <= n`.
+    unsafe {
+        let floor = _mm256_set1_epi8(threshold.min(255) as u8 as i8);
+        let (zero, base_n) = (_mm256_setzero_si256(), _mm256_set1_epi8(b'N' as i8));
+        let mut sum = zero;
+        while i + 32 <= n {
+            let q = _mm256_loadu_si256(qual.as_ptr().add(i) as *const __m256i);
+            let s = _mm256_loadu_si256(seq.as_ptr().add(i) as *const __m256i);
+            sum = _mm256_add_epi64(sum, _mm256_sad_epu8(q, zero));
+            at_or_over += (_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_max_epu8(q, floor), q)) as u32).count_ones();
+            n_bases += (_mm256_movemask_epi8(_mm256_cmpeq_epi8(s, base_n)) as u32).count_ones();
+            i += 32;
+        }
+        _mm256_storeu_si256(sums.as_mut_ptr() as *mut __m256i, sum);
+    }
+    m.total_qual += sums.iter().sum::<u64>() as i64 - 33 * i as i64;
+    m.n_bases += n_bases as usize;
+    m.low_qual += match threshold {
+        0 => 0,
+        256 => i,
+        _ => i - at_or_over as usize,
+    };
+    i
+}
+
 /// Per-read quality tallies, all three in one pass.
 ///
 /// * `low_qual` — bases scoring under `qualified_qual` (a raw phred+33 value,
@@ -243,7 +281,13 @@ pub struct QualityMetrics {
 pub fn count_quality_metrics(qual: &[u8], seq: &[u8], qualified_qual: i64) -> QualityMetrics {
     let n = qual.len().min(seq.len());
     let mut m = QualityMetrics { low_qual: 0, n_bases: 0, total_qual: 0 };
-    for i in 0..n {
+    let mut done = 0;
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && avx2() {
+        // SAFETY: AVX2 and POPCNT were just checked; both slices hold `n` bytes.
+        done = unsafe { quality_metrics_avx2(qual, seq, n, qualified_qual, &mut m) };
+    }
+    for i in done..n {
         let q = qual[i];
         m.total_qual += i64::from(q) - 33;
         if i64::from(q) < qualified_qual {

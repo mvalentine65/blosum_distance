@@ -18,7 +18,7 @@ use crate::reads::pipeline::{
     process_pair, process_single, TrimOptions, TrimScratch, TrimStats,
 };
 use crate::reads::seed::PreparedAdapter;
-use crate::reads::seqops::complement;
+use crate::reads::seqops::{avx2, complement};
 
 // --- Optimized DedupTable from main_bestrs.rs ---
 
@@ -121,6 +121,15 @@ static PACKED_BASES: [[u8; 4]; 256] = {
 #[inline]
 fn encode_into(seq: &[u8], out: &mut Vec<u8>) -> u32 {
     let len = seq.len() as u32;
+    #[cfg(target_arch = "x86_64")]
+    if seq.len() >= 32 && avx2() {
+        // SAFETY: AVX2 was just checked.
+        if unsafe { pack_avx2(seq, out) } {
+            return len | PACKED;
+        }
+        out.extend_from_slice(seq);
+        return len;
+    }
     if seq.iter().any(|&b| BASE_CODE[b as usize] == 4) {
         out.extend_from_slice(seq);
         return len;
@@ -134,6 +143,62 @@ fn encode_into(seq: &[u8], out: &mut Vec<u8>) -> u32 {
         out.push(byte);
     }
     len | PACKED
+}
+
+/// `encode_into`'s packing, 32 bases a step. False, with `out` as it was, when
+/// `seq` holds a byte that cannot be packed.
+///
+/// # Safety
+/// The CPU must support AVX2 (`seqops::avx2()`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pack_avx2(seq: &[u8], out: &mut Vec<u8>) -> bool {
+    use std::arch::x86_64::*;
+    let start = out.len();
+    out.reserve(seq.len().div_ceil(4));
+    let mut i = 0;
+    // SAFETY: a step loads the 32 bytes at `i`, all inside `seq`.
+    unsafe {
+        let (one, three) = (_mm256_set1_epi8(1), _mm256_set1_epi8(3));
+        let letters = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+            b'A' as i8, b'C' as i8, b'T' as i8, b'G' as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ));
+        let low_bytes = _mm256_setr_epi8(
+            0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        );
+        while i + 32 <= seq.len() {
+            let x = _mm256_loadu_si256(seq.as_ptr().add(i) as *const __m256i);
+            // bits 1 and 2 of a base: A 0, C 1, T 2, G 3; anything else lands on one of them
+            let t = _mm256_and_si256(_mm256_srli_epi16::<1>(x), three);
+            if _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, _mm256_shuffle_epi8(letters, t))) != -1 {
+                out.truncate(start);
+                return false;
+            }
+            // BASE_CODE has G 2 and T 3
+            let code = _mm256_xor_si256(t, _mm256_and_si256(_mm256_srli_epi16::<1>(t), one));
+            let pairs = _mm256_maddubs_epi16(code, _mm256_set1_epi16(0x0401));
+            let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0010_0001));
+            let bytes = _mm256_shuffle_epi8(quads, low_bytes);
+            let lo = _mm_cvtsi128_si32(_mm256_castsi256_si128(bytes)) as u32;
+            let hi = _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(bytes)) as u32;
+            out.extend_from_slice(&(u64::from(lo) | u64::from(hi) << 32).to_le_bytes());
+            i += 32;
+        }
+    }
+    for chunk in seq[i..].chunks(4) {
+        let mut byte = 0u8;
+        for (k, &b) in chunk.iter().enumerate() {
+            let code = BASE_CODE[b as usize];
+            if code == 4 {
+                out.truncate(start);
+                return false;
+            }
+            byte |= code << (2 * k);
+        }
+        out.push(byte);
+    }
+    true
 }
 
 /// Bases in a length word.

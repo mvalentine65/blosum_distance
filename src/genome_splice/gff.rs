@@ -1,5 +1,6 @@
 //! GFF3 of the final gene copies: one gene feature per chain with exons, then
-//! its exons in gene order, with refined splice sites where refine moved them.
+//! its exons in gene order, with refined splice sites where refine moved them
+//! and stop=1 on a last exon read on to its own in-frame stop.
 
 use super::chain::{Chain, SRC_NAME};
 use super::pseudo::Pseudo;
@@ -41,6 +42,8 @@ pub fn write_gff(cs: &[Chain], rf: Option<&Refine>, ps: Option<&[Pseudo]>, es: O
                 let x = &r.ex[i][j];
                 if x.acc_g != 0 { let _ = write!(out, ";acceptor={}", String::from_utf8_lossy(&x.acc_site)); }
                 if x.don_g != 0 { let _ = write!(out, ";donor={}", String::from_utf8_lossy(&x.don_site)); }
+                // the gene end was read on to this exon's own in-frame stop
+                if x.stop_g != 0 { out.push_str(";stop=1"); }
             }
             if let Some(x) = es.map(|v| &v[i][j]) {
                 if x.bits.is_finite() { let _ = write!(out, ";bits={:.1};rev={:.1}", x.bits, x.rev); }

@@ -1207,6 +1207,15 @@ pub fn cull_columns(
     // Step 5: Min length filter + global empty column removal
     // ---------------------------------------------------------------
 
+    // Min length counts only residues in columns a reference has data in.
+    let mut ref_cols = vec![false; after_stop_trim.first().map_or(0, |s| s.len())];
+    for (h, s) in norm_headers.iter().zip(after_stop_trim.iter()) {
+        if !h.ends_with(ref_suffix) { continue; }
+        for (i, &ch) in s.iter().enumerate() {
+            if ch != b'-' && i < ref_cols.len() { ref_cols[i] = true; }
+        }
+    }
+
     // Track which records survive the min-length filter via indices into
     // `norm_headers` / `after_stop_trim` rather than copying strings.
     let mut surviving_indices: Vec<usize> = Vec::new();
@@ -1215,7 +1224,7 @@ pub fn cull_columns(
         let seq = &after_stop_trim[idx];
 
         if !header.ends_with(ref_suffix) && min_seq_len > 0 {
-            let non_gap = seq.iter().filter(|&&c| c != b'-').count();
+            let non_gap = seq.iter().zip(ref_cols.iter()).filter(|&(&c, &r)| r && c != b'-').count();
             if non_gap < min_seq_len {
                 continue;
             }
@@ -1711,3 +1720,7 @@ pub fn apply_gff_culls(
         Ok((false, contained_kicked_names))
     }
 }
+
+#[cfg(test)]
+#[path = "tests/column_cull.rs"]
+mod tests;

@@ -5,12 +5,14 @@
 //! the module rule (similar length, the same model nodes) when it
 //! beats its own reversal clearly and per residue: repeats give long hits
 //! whose score is spread thin. The same scan finds the copies of an
-//! N-terminal row's tail for the rebase step.
+//! N-terminal row's tail for the rebase step. seq_copy finds a sibling row's exon
+//! again in a row's gap by the exon's own residues (BLOSUM62), for sibling_fill.
 
-use super::chain::{Chain, ChainExon, SRC_ALT};
+use super::chain::{Chain, ChainExon, SRC_ALT, SRC_SIBFILL};
 use super::hmm::Hmm;
 use super::orf::{is_repeat, translate_frame, Aligner};
 use super::sites::{revcomp, Code};
+use crate::blosum_tables::{BLOSUM, INVALID, XLAT};
 
 /// node overlap of the smaller span (the length ratio and the overlap of the
 /// larger span are the caller's: on the hit, or later on the refined exons)
@@ -130,3 +132,77 @@ pub fn copies(al: &mut Aligner, hid: usize, hmm: &Hmm, code: Code, strand: u8, x
     if xlen > 0 { scan(al, hmm, code, strand, x, xlen, sc, lo, hi, size, nodes_large, &mut out); }
     out
 }
+
+/// BLOSUM62 a sequence copy must score over its reversal, in all and per residue
+const SEQ_MIN_MARGIN: i32 = 60;
+const SEQ_MIN_DENSITY: f32 = 0.8;
+const SEQ_GAP_OPEN: i32 = 10;
+const SEQ_GAP_EXT: i32 = 1;
+
+fn b62(a: u8, b: u8) -> i32 {
+    let (i, j) = (XLAT[a as usize], XLAT[b as usize]);
+    if i == INVALID || j == INVALID { -4 } else { BLOSUM[27 * i as usize + j as usize] }
+}
+
+/// Best local alignment of q in t (affine gaps): score and t's first and last residue.
+fn local(q: &[u8], t: &[u8]) -> (i32, usize, usize) {
+    let n = q.len();
+    let mut h = vec![0i32; n + 1];
+    let mut hs = vec![0usize; n + 1];
+    let mut e = vec![i32::MIN / 2; n + 1];
+    let mut es = vec![0usize; n + 1];
+    let mut best = (0, 0, 0);
+    for (j, &tc) in t.iter().enumerate() {
+        let (mut diag, mut diag_s) = (0, j);
+        let (mut f, mut fs) = (i32::MIN / 2, j);
+        for i in 1..=n {
+            let (up, up_s) = (h[i], hs[i]);
+            // gap in q (t advances): from the cell left of this one, kept in e
+            if up - SEQ_GAP_OPEN > e[i] - SEQ_GAP_EXT { e[i] = up - SEQ_GAP_OPEN; es[i] = up_s; } else { e[i] -= SEQ_GAP_EXT; }
+            // gap in t (q advances): from the cell above
+            if h[i - 1] - SEQ_GAP_OPEN > f - SEQ_GAP_EXT { f = h[i - 1] - SEQ_GAP_OPEN; fs = hs[i - 1]; } else { f -= SEQ_GAP_EXT; }
+            let (mut v, mut vs) = (diag + b62(q[i - 1], tc), if diag > 0 { diag_s } else { j });
+            if e[i] > v { v = e[i]; vs = es[i]; }
+            if f > v { v = f; vs = fs; }
+            if v <= 0 { v = 0; vs = j + 1; }
+            diag = up; diag_s = up_s;
+            h[i] = v; hs[i] = vs;
+            if v > best.0 { best = (v, vs, j); }
+        }
+    }
+    best
+}
+
+/// The copy of exon x in lo..hi (spans in mask read as N) found by x's own residues: its best
+/// local BLOSUM62 hit in three frames, kept when it beats its reversal clearly and per residue.
+#[allow(clippy::too_many_arguments)]
+pub fn seq_copy(code: Code, strand: u8, x: &ChainExon, sc: &[u8], lo: i64, hi: i64, mask: &[(i64, i64)], size: f64) -> Option<(ChainExon, f32)> {
+    if x.start < 1 || x.end as usize > sc.len() || lo < 1 || hi as usize > sc.len() || hi - lo + 1 < 60 { return None; }
+    let xnt = oriented(sc, x.start, x.end, strand);
+    // x's frame: fewest stops, then longest
+    let xp = (0..3).map(|f| translate_frame(code, &xnt, f)).min_by_key(|t| (t.iter().filter(|&&c| c == b'*').count(), usize::MAX - t.len()))?;
+    let mut nt = sc[(lo - 1) as usize..hi as usize].to_vec();
+    for &(s, e) in mask {
+        for p in s.max(lo)..=e.min(hi) { nt[(p - lo) as usize] = b'N'; }
+    }
+    let s = if strand == b'-' { revcomp(&nt) } else { nt };
+    let mut best: Option<(i32, usize, usize, usize, Vec<u8>)> = None;
+    for f in 0..3usize {
+        let t = translate_frame(code, &s, f);
+        let (v, ts, te) = local(&xp, &t);
+        if v > 0 && best.as_ref().map_or(true, |b| v > b.0) { best = Some((v, f, ts, te, t)); }
+    }
+    let (v, f, ts, te, t) = best?;
+    let hit = &t[ts..=te];
+    let ratio = hit.len().min(xp.len()) as f64 / hit.len().max(xp.len()) as f64;
+    let rev: Vec<u8> = hit.iter().rev().copied().collect();
+    let margin = v - local(&xp, &rev).0;
+    if ratio < size || margin < SEQ_MIN_MARGIN || (margin as f32) / (hit.len() as f32) < SEQ_MIN_DENSITY { return None; }
+    let (o1, o2) = (f as i64 + 3 * ts as i64, f as i64 + 3 * te as i64 + 2);
+    let (gs, ge) = if strand == b'-' { (hi - o2, hi - o1) } else { (lo + o1, lo + o2) };
+    Some((ChainExon { start: gs, end: ge, k1: x.k1, k2: x.k2, src: SRC_SIBFILL, codon: 0, bits: 0.0, run: false, owes: false }, margin as f32))
+}
+
+#[cfg(test)]
+#[path = "../tests/genome_module.rs"]
+mod tests;

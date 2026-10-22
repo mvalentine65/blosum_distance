@@ -7,7 +7,7 @@ use super::chain::{add_exon, covered_nodes, module_block, sibling_mask, sort_exo
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
 use super::sites::{acceptor_default, base, code, learn_acceptor, revcomp, site_scores, splice_scores, translate, AccTable, Code, SS3_LAST};
-use super::module::{alternatives, copies};
+use super::module::{alternatives, copies, seq_copy};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
 use super::pseudo::Pseudo;
 use super::refine::{junction_sites, start_upstream, JxSites, Refine};
@@ -82,6 +82,8 @@ pub struct Opts {
     pub alt_size: f64,
     pub alt_nodes_large: f64,
     pub alt_refined: bool,
+    /// fill a row's gap with its own copy of an exon a sibling row has there (sibling_fill)
+    pub sibfill: bool,
     /// refine: stop codon score on the junction path (BLOSUM62 '*' against a residue)
     pub refine_stop: f64,
     /// refine: frameshift score on the junction path (NaN: fspen)
@@ -97,7 +99,7 @@ impl Default for Opts {
             orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false, runs: true },
             chain: ChainOpts { min_gap: 10, max_gap: 1000, max_end: 250, flank: 15000, share: true, siblings: true },
             prm: Params::default(),
-            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true,
+            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, sibfill: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true,
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
@@ -130,6 +132,7 @@ impl Opts {
             "alt_size" => self.alt_size = v,
             "alt_nodes_large" => self.alt_nodes_large = v,
             "alt_refined" => self.alt_refined = v != 0.0,
+            "sibfill" => self.sibfill = v != 0.0,
             "fill_margin" => self.fill_margin = v,
             "min_seg" => self.min_seg = v as i64,
             "ext" => self.prm.ext = v as i64,
@@ -508,6 +511,57 @@ fn rebase_tails(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usize>, 
         sort_exons(&mut c.ex);
         if i == oi { c.flank_only = false; }
         c.rebased = Some(owner);
+    }
+    log
+}
+
+/// missing nodes a gap needs before a sibling row's exon is looked for in it
+const SIBFILL_MIN_NODES: i64 = 10;
+/// nodes a sibling exon may reach past the gap's own
+const SIBFILL_NODE_SLACK: i64 = 5;
+
+/// A row's gap that a sibling row (same model and strand, sharing the exon on either side)
+/// fills with an exon on the gap's nodes takes that exon's copy in the gap, found by the exon's
+/// own residues (seq_copy). It keeps exons the model scores too weakly to fill the gap, and a
+/// start row's own copy in place of the sibling's exon copy_to_flank_rows would give it.
+/// Returns the log rows.
+fn sibling_fill(cs: &mut [Chain], genome: &HashMap<String, Vec<u8>>, o: &Opts) -> String {
+    let same = |x: &ChainExon, y: &ChainExon| x.start == y.start && x.end == y.end;
+    let mut taken: HashMap<(&str, u8, &str), Vec<(i64, i64)>> = HashMap::new();
+    for c in cs.iter().filter(|c| !c.passive) {
+        taken.entry((c.scaffold.as_str(), c.strand, c.model.as_str())).or_default().extend(c.ex.iter().map(|e| (e.start, e.end)));
+    }
+    // (row, gap lo, gap hi, sibling, its exon)
+    let mut todo: Vec<(usize, i64, i64, usize, ChainExon)> = Vec::new();
+    for (ci, c) in cs.iter().enumerate() {
+        if c.passive || !genome.contains_key(&c.scaffold) { continue; }
+        for j in 1..c.ex.len() {
+            let (a, b) = (c.ex[j - 1], c.ex[j]);
+            if b.k1 - a.k2 - 1 < SIBFILL_MIN_NODES { continue; }
+            let (lo, hi) = if c.strand == b'+' { (a.end + 1, b.start - 1) } else { (b.end + 1, a.start - 1) };
+            if hi - lo + 1 < 2 * MIN_INTRON as i64 { continue; }
+            let sib = cs.iter().enumerate().filter(|&(si, s)| si != ci && !s.passive && s.model == c.model && s.scaffold == c.scaffold
+                && s.strand == c.strand && s.ex.iter().any(|y| same(y, &a) || same(y, &b)))
+                .flat_map(|(si, s)| s.ex.iter().map(move |x| (si, *x)))
+                .filter(|(_, x)| x.k1 >= a.k2 + 1 - SIBFILL_NODE_SLACK && x.k2 <= b.k1 - 1 + SIBFILL_NODE_SLACK && !same(x, &a) && !same(x, &b))
+                .max_by_key(|(_, x)| x.k2 - x.k1);
+            if let Some((si, x)) = sib { todo.push((ci, lo, hi, si, x)); }
+        }
+    }
+    let found: Vec<Option<(ChainExon, f32)>> = par_map(todo.len(), o.threads, |t| todo[t].2 - todo[t].1, |t, _| {
+        let (ci, lo, hi, _, x) = todo[t];
+        let c = &cs[ci];
+        let tk = &taken[&(c.scaffold.as_str(), c.strand, c.model.as_str())];
+        seq_copy(o.prm.code, c.strand, &x, &genome[&c.scaffold], lo, hi, tk, o.alt_size)
+            .filter(|(e, _)| !tk.iter().any(|&(s, f)| e.start <= f && s <= e.end))
+    });
+    let mut log = String::new();
+    for ((ci, lo, hi, si, x), f) in todo.iter().zip(found) {
+        let c = &cs[*ci];
+        let got = f.as_ref().map_or("-".to_string(), |(e, m)| format!("{}-{}:{}-{}:{:.1}", e.start, e.end, e.k1, e.k2, m));
+        let _ = writeln!(log, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}-{}:{}-{}\t{}", c.gene, c.scaffold, c.strand as char, lo, hi,
+                         x.k2 - x.k1 + 1, cs[*si].gene, x.start, x.end, x.k1, x.k2, got);
+        if let Some((e, _)) = f { add_exon(&mut cs[*ci], &e); }
     }
     log
 }
@@ -927,6 +981,12 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             base += wins.len();
             if grew.is_empty() { break; }
             only = Some(grew);
+        }
+        // before copy_to_flank_rows, so a start row takes its own copy rather than its sibling's exon
+        if o.sibfill {
+            let s = sibling_fill(&mut cs, &genome, o);
+            out.buf("sibfill").push_str("# row scaffold strand gap_lo gap_hi nodes sibling sibling_exon found(start-end:k1-k2:margin)\n");
+            out.buf("sibfill").push_str(&s);
         }
         copy_to_flank_rows(&mut cs);
     }

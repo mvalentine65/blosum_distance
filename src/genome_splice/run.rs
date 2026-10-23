@@ -3,7 +3,7 @@
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
 //! .pseudo.tsv, .gff3) plus .acceptor.tsv, .cut.tsv and .rebase.tsv, genomic 1-based coordinates.
 
-use super::chain::{add_exon, covered_nodes, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_ORF, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
+use super::chain::{add_exon, covered_nodes, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_ORF, SRC_SIBFILL, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
 use super::sites::{acceptor_default, base, code, learn_acceptor, revcomp, site_scores, splice_scores, translate, AccTable, Code, SS3_LAST};
@@ -566,6 +566,59 @@ fn sibling_fill(cs: &mut [Chain], genome: &HashMap<String, Vec<u8>>, o: &Opts) -
     log
 }
 
+/// nt between two exons, 0 when they touch or overlap
+fn exon_gap(x: &ChainExon, y: &ChainExon) -> i64 {
+    (y.start - x.end - 1).max(x.start - y.end - 1).max(0)
+}
+
+/// A recovered exon in a row's gap gives way to a sibling row's exon on the same nodes in
+/// that gap lying nearer the row's own side of it (the flank the sibling does not share):
+/// an alternative's first exon sits beside the rest of its own block. Returns the log rows.
+fn nearest_copies(cs: &mut [Chain], size: f64) -> String {
+    let same = |x: &ChainExon, y: &ChainExon| x.start == y.start && x.end == y.end;
+    let mut plan: Vec<(usize, usize, ChainExon, usize, i64, i64)> = Vec::new(); // row, exon, copy, sibling, gap before, after
+    for (ci, c) in cs.iter().enumerate() {
+        if c.passive { continue; }
+        for j in 1..c.ex.len().saturating_sub(1) {
+            let (a, e, b) = (c.ex[j - 1], c.ex[j], c.ex[j + 1]);
+            if e.src == SRC_INPUT || e.src == SRC_CUT { continue; }
+            let (lo, hi) = (a.end.min(b.end), a.start.max(b.start));
+            let mut best: Option<(i64, usize, ChainExon, i64)> = None;
+            for (si, s) in cs.iter().enumerate() {
+                if si == ci || s.passive || s.model != c.model || s.scaffold != c.scaffold || s.strand != c.strand { continue; }
+                let (sa, sb) = (s.ex.iter().any(|y| same(y, &a)), s.ex.iter().any(|y| same(y, &b)));
+                if sa == sb { continue; }
+                let own = if sa { b } else { a };
+                let mine = exon_gap(&e, &own);
+                for y in &s.ex {
+                    let ov = y.k2.min(e.k2) - y.k1.max(e.k1) + 1;
+                    if same(y, &e) || y.start <= lo || y.end >= hi || 2 * ov < (y.k2 - y.k1).min(e.k2 - e.k1) + 1 { continue; }
+                    if c.ex.iter().enumerate().any(|(k, x)| k != j && y.start <= x.end && x.start <= y.end) { continue; }
+                    // a copy, not another version of the same exon: apart from it and of like length
+                    let (ly, le) = ((y.end - y.start + 1) as f64, (e.end - e.start + 1) as f64);
+                    if (y.start <= e.end && e.start <= y.end) || ly.min(le) < size * ly.max(le) { continue; }
+                    let d = exon_gap(y, &own);
+                    if d < mine && best.as_ref().map_or(true, |bb| d < bb.0) { best = Some((d, si, *y, mine)); }
+                }
+            }
+            if let Some((d, si, y, mine)) = best { plan.push((ci, j, y, si, mine, d)); }
+        }
+    }
+    let mut log = String::new();
+    let mut touched = HashSet::new();
+    for (ci, j, y, si, mine, d) in plan {
+        let sib = cs[si].gene.clone();
+        let c = &mut cs[ci];
+        let e = c.ex[j];
+        let _ = writeln!(log, "{}\t{}\t{}\t{}-{}:{}-{}\t{}-{}:{}-{}\t{}\t{}\t{}", c.gene, c.scaffold, c.strand as char,
+                         e.start, e.end, e.k1, e.k2, y.start, y.end, y.k1, y.k2, sib, mine, d);
+        c.ex[j] = ChainExon { src: SRC_SIBFILL, ..y };
+        touched.insert(ci);
+    }
+    for ci in touched { sort_exons(&mut cs[ci].ex); }
+    log
+}
+
 /// model nodes an intron skips before its sequence is tested as coding
 const FAKE_CUT_SKIP: i64 = 5;
 
@@ -987,6 +1040,9 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             let s = sibling_fill(&mut cs, &genome, o);
             out.buf("sibfill").push_str("# row scaffold strand gap_lo gap_hi nodes sibling sibling_exon found(start-end:k1-k2:margin)\n");
             out.buf("sibfill").push_str(&s);
+            let s = nearest_copies(&mut cs, o.alt_size);
+            out.buf("nearest").push_str("# row scaffold strand replaced(start-end:k1-k2) by(start-end:k1-k2) sibling own_side_nt_before own_side_nt_after\n");
+            out.buf("nearest").push_str(&s);
         }
         copy_to_flank_rows(&mut cs);
     }
@@ -1216,3 +1272,7 @@ pub fn exonfill_run(py: Python<'_>, models: &str, chains: &str, genome: &Bound<'
     };
     py.detach(|| run(models, chains, src, prefix, &mut o, stages)).map_err(PyRuntimeError::new_err)
 }
+
+#[cfg(test)]
+#[path = "../tests/genome_run.rs"]
+mod tests;

@@ -24,7 +24,8 @@ pub const SRC_ALT: u8 = 3;
 pub const SRC_TAIL: u8 = 4;
 pub const SRC_CUT: u8 = 5;
 pub const SRC_SIBFILL: u8 = 6;
-pub const SRC_NAME: [&str; 7] = ["input", "orf", "splice", "alt", "tail", "cut", "sibfill"];
+pub const SRC_LEAD: u8 = 7;
+pub const SRC_NAME: [&str; 8] = ["input", "orf", "splice", "alt", "tail", "cut", "sibfill", "lead"];
 
 #[derive(Clone, Copy, Debug)]
 pub struct ChainExon {
@@ -161,7 +162,7 @@ pub struct ChainOpts {
     pub siblings: bool,
 }
 
-fn left_bound(iv: &[(i64, i64)], pos: i64) -> i64 {
+pub(crate) fn left_bound(iv: &[(i64, i64)], pos: i64) -> i64 {
     let mut i = iv.len() as i64 - 1;
     while i >= 0 && iv[i as usize].0 >= pos { i -= 1; }
     while i >= 0 {
@@ -171,7 +172,7 @@ fn left_bound(iv: &[(i64, i64)], pos: i64) -> i64 {
     0
 }
 
-fn right_bound(iv: &[(i64, i64)], pos: i64, l: i64) -> i64 {
+pub(crate) fn right_bound(iv: &[(i64, i64)], pos: i64, l: i64) -> i64 {
     iv.iter().find(|x| x.0 > pos).map(|x| x.0).unwrap_or(l)
 }
 

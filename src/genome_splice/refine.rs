@@ -3,7 +3,7 @@
 //! acceptor from the junction before it and its donor from the junction after
 //! it; gene ends keep their input coordinates.
 
-use super::chain::{covered_nodes, Chain, ChainExon, SRC_CUT, SRC_INPUT, SRC_NAME};
+use super::chain::{covered_nodes, Chain, ChainExon, SRC_CUT, SRC_INPUT, SRC_LEAD, SRC_NAME};
 use super::gate::{start_reach, take_stop, End, STOP_SCAN_NT};
 use super::junction::{JxStatus, Junction};
 use super::sites::{acceptor_default, base, revcomp, splice_scores, translate, Code};
@@ -178,7 +178,8 @@ impl Refine {
             let stop = |x: &[u8; 3]| translate(code, x) == b'*';
             let covered = covered_nodes(c, m);
             let end = |short: i64| End { short, covered, m, exons: n, lone: c.passive };
-            if let Some(reach) = start_reach(&end(c.ex[0].k1 - 1)) {
+            // a lead exon already starts on its own start codon
+            if let (false, Some(reach)) = (c.ex[0].src == SRC_LEAD, start_reach(&end(c.ex[0].k1 - 1))) {
                 let (a, b) = self.span(c, i, 0);
                 let cs0 = if plus { a } else { b };
                 if let Some(p) = start_upstream(code, sq, plus, cs0, reach) { if p != cs0 { self.ex[i][0].start_g = p; } }

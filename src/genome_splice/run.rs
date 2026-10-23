@@ -3,12 +3,13 @@
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
 //! .pseudo.tsv, .gff3) plus .acceptor.tsv, .cut.tsv and .rebase.tsv, genomic 1-based coordinates.
 
-use super::chain::{add_exon, covered_nodes, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_ORF, SRC_SIBFILL, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
+use super::chain::{add_exon, covered_nodes, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_LEAD, SRC_ORF, SRC_SIBFILL, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
 use super::sites::{acceptor_default, base, code, learn_acceptor, revcomp, site_scores, splice_scores, translate, AccTable, Code, SS3_LAST};
 use super::module::{alternatives, copies, seq_copy};
 use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
+use super::lead::add_lead_exons;
 use super::pseudo::Pseudo;
 use super::refine::{junction_sites, start_upstream, JxSites, Refine};
 use super::gate::{keep_against_reversal, keep_at_frameshift, keep_run_piece, lead_start_reach, pays_intron};
@@ -90,6 +91,8 @@ pub struct Opts {
     pub refine_fs: f64,
     /// split a recovered exon at a frameshift its junction path holds inside it
     pub split_fs: bool,
+    /// give a row whose first exon opens on an acceptor the exon 1 found upstream (lead::add_lead_exons)
+    pub lead: bool,
     pub threads: usize,
 }
 
@@ -99,7 +102,7 @@ impl Default for Opts {
             orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false, runs: true },
             chain: ChainOpts { min_gap: 10, max_gap: 1000, max_end: 250, flank: 15000, share: true, siblings: true },
             prm: Params::default(),
-            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, sibfill: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true,
+            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, sibfill: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true, lead: true,
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
@@ -154,6 +157,7 @@ impl Opts {
             "refine_stop" => self.refine_stop = v,
             "refine_fs" => self.refine_fs = v,
             "split_fs" => self.split_fs = v != 0.0,
+            "lead" => self.lead = v != 0.0,
             "skip_open" => self.prm.skip_open = v,
             "gc_donor" => self.prm.gc_donor = v,
             "cpu" => self.threads = (v as usize).max(1),
@@ -708,6 +712,20 @@ struct JxOut {
     stopfree: f64,
 }
 
+/// A lead exon's junction: its sites as the search found them, with no model nodes to align.
+fn lead_junction(c: &Chain, a: &ChainExon, b: &ChainExon, sc: &[u8]) -> JxOut {
+    let plus = c.strand == b'+';
+    let (don_g, acc_g) = if plus { (a.end, b.start) } else { (a.start, b.end) };
+    let on = |p: i64| -> u8 {
+        let x = sc[(p - 1) as usize].to_ascii_uppercase();
+        if plus { x } else { match x { b'A' => b'T', b'T' => b'A', b'C' => b'G', b'G' => b'C', _ => b'N' } }
+    };
+    let d = if plus { 1 } else { -1 };
+    let sites = JxSites { ok: true, don_g, acc_g, don_site: [on(don_g + d), on(don_g + 2 * d)], acc_site: [on(acc_g - 2 * d), on(acc_g - d)],
+                          phase: ((a.end - a.start + 1) % 3) as i32, n_inner: 0, joined: false };
+    JxOut { sites, pseudo: Pseudo::default(), status: "lead", gap: (acc_g - don_g).abs() - 1, dis: Vec::new(), stopfree: f64::NAN }
+}
+
 fn jx_key(c: &Chain, a: &ChainExon, b: &ChainExon) -> String {
     format!("{}|{}|{}|{}|{}|{}|{}", c.model, c.scaffold, c.strand as char, a.start, a.end, b.start, b.end)
 }
@@ -751,6 +769,7 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         let c = &cs[*ci];
         let (a, b) = (&c.ex[*ia], &c.ex[*ib]);
         let sc = &genome[&c.scaffold];
+        if a.src == SRC_LEAD { return lead_junction(c, a, b, sc); }
         let hid = mid[&c.model];
         let lo = a.start.min(b.start);
         let hi = a.end.max(b.end);
@@ -1169,6 +1188,13 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
     }
     if do_fill && o.module {
         add_alternatives(&mut cs, &models, &mid, &genome, o);
+    }
+    if do_refine && o.lead {
+        // the refined first exons say which rows open on an acceptor; their junctions stay cached
+        let (r, _) = refine_all(&models, &mid, o, &cs, &genome, true, false, &mut cache, None, None);
+        let s = add_lead_exons(&mut cs, &r, &genome, o.prm.code, &o.prm.acc);
+        out.buf("lead").push_str("# gene scaffold strand start end donor acceptor intron\n");
+        out.buf("lead").push_str(&s);
     }
     let (mut rf, ps) = if do_refine || do_pseudo {
         let (r, p) = refine_all(&models, &mid, o, &cs, &genome, do_refine, do_pseudo, &mut cache, Some(&mut out), None);

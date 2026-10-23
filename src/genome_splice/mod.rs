@@ -9,6 +9,7 @@ pub mod gate;
 pub mod gff;
 pub mod hmm;
 pub mod junction;
+pub mod lead;
 pub mod module;
 pub mod orf;
 pub mod pseudo;

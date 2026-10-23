@@ -200,3 +200,34 @@ pub fn lead_start_reach(short: i64) -> Option<i64> {
 pub fn take_stop(e: &End, dist: i64, donor: impl FnOnce() -> bool) -> bool {
     (e.short <= STOP_NODES && dist <= STOP_NT) || (e.short <= STOP_REACH_NODES && !donor())
 }
+
+/// nt upstream of a row's first exon searched for a lead exon (exon 1)
+pub const LEAD_WINDOW: i64 = 1000;
+/// shortest intron between a lead exon and the row's first exon
+pub const LEAD_MIN_INTRON: i64 = 40;
+/// longest lead exon, start codon to donor
+pub const LEAD_MAX_NT: i64 = 600;
+/// donor score a lead exon's donor must reach
+const LEAD_DONOR: f64 = 4.0;
+/// acceptor score the row's first exon must open on
+const LEAD_ACC: f64 = 0.0;
+/// codons a lead exon may differ from the model nodes the row lacks before its first exon
+const LEAD_SLACK: i64 = 2;
+
+/// A row earns a lead-exon search when its first exon opens on an AG scoring
+/// LEAD_ACC with no start codon of its own: it is no gene's exon 1.
+pub fn lead_opens(acc: f64) -> bool {
+    acc >= LEAD_ACC
+}
+
+/// A lead exon is kept when its donor scores LEAD_DONOR.
+pub fn keep_lead(donor: f64) -> bool {
+    donor >= LEAD_DONOR
+}
+
+/// A lead exon of `aa` codons fits a row that lacks `missing` model nodes before
+/// its first exon (from the references' median start) within LEAD_SLACK: a row
+/// short of a long exon 1 is a fragment, not one missing a short one.
+pub fn lead_fits(aa: i64, missing: i64) -> bool {
+    (aa - missing).abs() <= LEAD_SLACK
+}

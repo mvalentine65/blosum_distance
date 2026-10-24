@@ -60,3 +60,12 @@ fn test_seq_copy_finds_the_other_copy_and_skips_masked_ones() {
     let both = [(x.start, x.end), (e.start, e.end)];
     assert!(seq_copy(g, b'+', &x, &sc, lo, hi, &both, 0.75).is_none());
 }
+
+#[test]
+fn test_score_gate_drops_a_hit_scoring_under_the_ratio_of_its_exon() {
+    // the exon scores 40 bits; a copy needs 0.3 of that
+    assert!(!gate_keeps(11.0, 0.3, 40.0, 10.0));
+    assert!(gate_keeps(12.5, 0.3, 40.0, 10.0));
+    assert!(gate_keeps(1.0, 0.3, 3.0, 10.0)); // a near-zero exon says nothing about its copies
+    assert!(gate_keeps(1.0, 0.0, 40.0, 10.0)); // ratio 0: gate off
+}

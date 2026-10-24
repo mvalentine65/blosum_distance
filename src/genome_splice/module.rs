@@ -8,6 +8,8 @@
 //! N-terminal row's tail for the rebase step. seq_copy finds a sibling row's exon
 //! again in a row's gap by the exon's own residues (BLOSUM62), for sibling_fill.
 
+use std::fmt::Write as _;
+
 use super::chain::{Chain, ChainExon, SRC_ALT, SRC_SIBFILL};
 use super::hmm::Hmm;
 use super::orf::{is_repeat, translate_frame, Aligner};
@@ -37,8 +39,8 @@ fn oriented(sc: &[u8], lo: i64, hi: i64, strand: u8) -> Vec<u8> {
     if strand == b'-' { revcomp(s) } else { s.to_vec() }
 }
 
-/// Residues of exon x in its best frame (aligner set to its nodes).
-fn exon_len(al: &mut Aligner, code: Code, sc: &[u8], x: &ChainExon, strand: u8) -> usize {
+/// Residues and bits of exon x in its best frame (aligner set to its nodes).
+fn exon_bits(al: &mut Aligner, code: Code, sc: &[u8], x: &ChainExon, strand: u8) -> (usize, f32) {
     let xnt = oriented(sc, x.start, x.end, strand);
     let (mut xb, mut xlen) = (f32::NEG_INFINITY, 0usize);
     for f in 0..3 {
@@ -47,13 +49,29 @@ fn exon_len(al: &mut Aligner, code: Code, sc: &[u8], x: &ChainExon, strand: u8) 
         let bits = al.fwd_bits(&t);
         if bits > xb { xb = bits; xlen = t.len(); }
     }
-    xlen
+    (xlen, xb)
+}
+
+/// The score gate of an alternative search: a hit is dropped when it scores under `ratio`
+/// of the exon it would replace (`exon_bits`); each candidate is logged.
+pub struct ScoreGate<'a> {
+    pub ratio: f32,
+    pub min_exon_bits: f32,
+    pub exon_bits: f32,
+    pub log: &'a mut String,
+    pub prefix: String,
+}
+
+/// A hit is kept when it scores at least `ratio` of the exon it would replace; an exon under
+/// `min_exon_bits` says nothing about its copies (ratio 0: always kept).
+fn gate_keeps(bits: f32, ratio: f32, exon_bits: f32, min_exon_bits: f32) -> bool {
+    ratio <= 0.0 || exon_bits < min_exon_bits || bits >= ratio * exon_bits
 }
 
 /// Copies of exon x (xlen residues) in lo..hi, each with its bits over its reversal (aligner set to x's nodes).
 #[allow(clippy::too_many_arguments)]
 fn scan(al: &mut Aligner, hmm: &Hmm, code: Code, strand: u8, x: &ChainExon, xlen: usize, sc: &[u8], lo: i64, hi: i64, size: f64, nodes_large: f64,
-        out: &mut Vec<(ChainExon, f32)>) {
+        mut gate: Option<&mut ScoreGate>, out: &mut Vec<(ChainExon, f32)>) {
     if hi - lo + 1 < 3 * (size * xlen as f64) as i64 || hi as usize > sc.len() || lo < 1 { return; }
     let xspan = x.k2 - x.k1 + 1;
     let s = oriented(sc, lo, hi, strand);
@@ -82,7 +100,8 @@ fn scan(al: &mut Aligner, hmm: &Hmm, code: Code, strand: u8, x: &ChainExon, xlen
             }
             let hit = &aa[hs..=he];
             let rev: Vec<u8> = hit.iter().rev().copied().collect();
-            let margin = al.fwd_bits(hit) - al.fwd_bits(&rev);
+            let fwd = al.fwd_bits(hit);
+            let margin = fwd - al.fwd_bits(&rev);
             let dens = margin / hlen as f32;
             if dens < MIN_DENSITY || (margin < MIN_MARGIN && (margin < SHORT_MARGIN || dens < SHORT_DENSITY)) { continue; }
             if is_repeat(hit, hmm, kf, kl) { continue; }
@@ -90,6 +109,13 @@ fn scan(al: &mut Aligner, hmm: &Hmm, code: Code, strand: u8, x: &ChainExon, xlen
             let (gs, ge) = if strand == b'-' { (hi - o2, hi - o1) } else { (lo + o1, lo + o2) };
             let dist = if ge < x.start { x.start - ge - 1 } else { gs - x.end - 1 };
             if dist < MIN_DIST { continue; }
+            if let Some(g) = gate.as_deref_mut() {
+                let stops = raw[hs..=he].iter().filter(|&&q| q == b'*').count();
+                let kept = gate_keeps(fwd, g.ratio, g.exon_bits, g.min_exon_bits);
+                let _ = writeln!(g.log, "{}\t{gs}\t{ge}\t{stops}\t{fwd:.2}\t{:.2}\t{:.3}\t{}",
+                                 g.prefix, g.exon_bits, fwd / g.exon_bits, kept as u8);
+                if !kept { continue; }
+            }
             out.push((ChainExon { start: gs, end: ge, k1: kf, k2: kl, src: SRC_ALT, codon: 0, bits: 0.0, run: false, owes: false }, margin));
         }
     }
@@ -98,16 +124,22 @@ fn scan(al: &mut Aligner, hmm: &Hmm, code: Code, strand: u8, x: &ChainExon, xlen
 /// Alternatives of exon j (0 < j < last) of chain c.
 /// size: least length ratio of hit to exon; nodes_large: least node overlap of the larger span.
 /// stop: other modules' block in the intron before and after the exon; each scan ends there.
+/// score_ratio: a hit needs this share of the exon's bits when the exon scores at least
+/// min_exon_bits (ratio 0: no gate); each candidate's line goes to log (alt_scores).
 #[allow(clippy::too_many_arguments)]
 pub fn alternatives(al: &mut Aligner, hid: usize, hmm: &Hmm, code: Code, c: &Chain, j: usize, sc: &[u8], size: f64, nodes_large: f64,
-                    stop: [Option<(i64, i64)>; 2]) -> Vec<ChainExon> {
+                    stop: [Option<(i64, i64)>; 2], score_ratio: f32, min_exon_bits: f32, log: &mut String) -> Vec<ChainExon> {
     let m = hmm.m as i64;
     let x = c.ex[j];
     let (a, b) = (1.max(x.k1 - MARGIN), m.min(x.k2 + MARGIN));
     if x.start < 1 || x.end as usize > sc.len() || b < a { return Vec::new(); }
     al.set(hid, hmm, a as usize, b as usize);
-    let xlen = exon_len(al, code, sc, &x, c.strand);
+    let (xlen, xbits) = exon_bits(al, code, sc, &x, c.strand);
     if xlen == 0 { return Vec::new(); }
+    let mut gate = ScoreGate {
+        ratio: score_ratio, min_exon_bits, exon_bits: xbits, log,
+        prefix: format!("{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, c.strand as char, x.start, x.end),
+    };
     let mut out = Vec::new();
     for (nb, stop) in [(j - 1, stop[0]), (j + 1, stop[1])] {
         let p = c.ex[nb];
@@ -115,7 +147,7 @@ pub fn alternatives(al: &mut Aligner, hid: usize, hmm: &Hmm, code: Code, c: &Cha
         if let Some((s0, s1)) = stop {
             if p.end < x.start { lo = lo.max(s1 + 1); } else { hi = hi.min(s0 - 1); }
         }
-        scan(al, hmm, code, c.strand, &x, xlen, sc, lo, hi, size, nodes_large, &mut out);
+        scan(al, hmm, code, c.strand, &x, xlen, sc, lo, hi, size, nodes_large, Some(&mut gate), &mut out);
     }
     out.into_iter().map(|(e, _)| e).collect()
 }
@@ -128,8 +160,8 @@ pub fn copies(al: &mut Aligner, hid: usize, hmm: &Hmm, code: Code, strand: u8, x
     let mut out = Vec::new();
     if x.start < 1 || x.end as usize > sc.len() || b < a { return out; }
     al.set(hid, hmm, a as usize, b as usize);
-    let xlen = exon_len(al, code, sc, x, strand);
-    if xlen > 0 { scan(al, hmm, code, strand, x, xlen, sc, lo, hi, size, nodes_large, &mut out); }
+    let (xlen, _) = exon_bits(al, code, sc, x, strand);
+    if xlen > 0 { scan(al, hmm, code, strand, x, xlen, sc, lo, hi, size, nodes_large, None, &mut out); }
     out
 }
 

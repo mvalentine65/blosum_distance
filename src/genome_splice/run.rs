@@ -83,6 +83,10 @@ pub struct Opts {
     pub alt_size: f64,
     pub alt_nodes_large: f64,
     pub alt_refined: bool,
+    /// alternatives: a hit needs this share of the replaced exon's bits (0: off)
+    pub alt_score_ratio: f64,
+    /// alternatives: the score ratio is only applied when the replaced exon scores at least this many bits
+    pub alt_min_exon_bits: f64,
     /// fill a row's gap with its own copy of an exon a sibling row has there (sibling_fill)
     pub sibfill: bool,
     /// refine: stop codon score on the junction path (BLOSUM62 '*' against a residue)
@@ -102,7 +106,7 @@ impl Default for Opts {
             orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false, runs: true },
             chain: ChainOpts { min_gap: 10, max_gap: 1000, max_end: 250, flank: 15000, share: true, siblings: true },
             prm: Params::default(),
-            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, sibfill: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true, lead: true,
+            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, alt_score_ratio: 0.15, alt_min_exon_bits: 10.0, sibfill: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true, lead: true,
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
@@ -135,6 +139,8 @@ impl Opts {
             "alt_size" => self.alt_size = v,
             "alt_nodes_large" => self.alt_nodes_large = v,
             "alt_refined" => self.alt_refined = v != 0.0,
+            "alt_score_ratio" => self.alt_score_ratio = v,
+            "alt_min_exon_bits" => self.alt_min_exon_bits = v,
             "sibfill" => self.sibfill = v != 0.0,
             "fill_margin" => self.fill_margin = v,
             "min_seg" => self.min_seg = v as i64,
@@ -856,31 +862,40 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
 /// alt_refined: length ratio a hit needs to be refined at all
 const ALT_LOOSE_SIZE: f64 = 0.5;
 
-/// alt_refined: an alternative chain stays when its refined alternative exon and the
-/// refined exon it replaces meet alt_size and alt_nodes_large (residues and node
-/// ranges from the score stage). Returns a keep flag per chain.
-fn alt_keep(cs: &[Chain], es: &[Vec<ExonScore>], o: &Opts) -> Vec<bool> {
+/// alt_refined: an alternative chain stays when its refined alternative exon holds no
+/// in-frame stop and it and the refined exon it replaces meet alt_size and
+/// alt_nodes_large (residues and node ranges from the score stage). Returns a keep
+/// flag per chain and a line per chain dropped for a stop (alt_scores).
+fn alt_keep(cs: &[Chain], es: &[Vec<ExonScore>], o: &Opts) -> (Vec<bool>, String) {
+    let mut log = String::new();
     let idx: HashMap<&str, usize> = cs.iter().enumerate().map(|(i, c)| (c.gene.as_str(), i)).collect();
     let nodes = |x: &ExonScore| {
         let v: Vec<u32> = x.nodes.iter().copied().filter(|&n| n > 0).collect();
         (!v.is_empty()).then(|| (*v.iter().min().unwrap() as i64, *v.iter().max().unwrap() as i64))
     };
-    cs.iter().enumerate().map(|(i, c)| {
+    let keep = cs.iter().enumerate().map(|(i, c)| {
         let Some(tag) = &c.alt_of else { return true };
         let Some((par, span)) = tag.rsplit_once(':') else { return true };
         let Some((xs, xe)) = span.split_once('-').and_then(|(a, b)| Some((a.parse::<i64>().ok()?, b.parse::<i64>().ok()?))) else { return true };
         let (Some(&pi), Some(j)) = (idx.get(par), c.ex.iter().position(|e| e.src == SRC_ALT)) else { return true };
         let Some(k) = cs[pi].ex.iter().position(|e| e.start <= xe && xs <= e.end) else { return true };
         let (a, x) = (&es[i][j], &es[pi][k]);
+        if !a.stops.is_empty() {
+            let e = c.ex[j];
+            let _ = writeln!(log, "{}\t{}\t{}\t{xs}\t{xe}\t{}\t{}\t{}\trefined_stop", c.gene, c.scaffold, c.strand as char, e.start, e.end, a.stops.len());
+            return false;
+        }
         let (Some((a1, a2)), Some((x1, x2))) = (nodes(a), nodes(x)) else { return false };
         let ratio = a.aa.min(x.aa) as f64 / a.aa.max(x.aa).max(1) as f64;
         let ov = (a2.min(x2) - a1.max(x1) + 1).max(0) as f64;
         let larger = ((a2 - a1).max(x2 - x1) + 1) as f64;
         ratio >= o.alt_size && ov >= o.alt_nodes_large * larger
-    }).collect()
+    }).collect();
+    (keep, log)
 }
 
-fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, usize>, genome: &HashMap<String, Vec<u8>>, o: &Opts) {
+/// Adds the alternative chains; returns the stop gate's log (alt_scores).
+fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, usize>, genome: &HashMap<String, Vec<u8>>, o: &Opts) -> String {
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut todo: Vec<(usize, usize)> = Vec::new();
     for (ci, c) in cs.iter().enumerate() {
@@ -896,7 +911,7 @@ fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, u
         let (p, n) = (&cs[ci].ex[j - 1], &cs[ci].ex[j + 1]);
         p.end.max(n.end) - p.start.min(n.start) + 1
     };
-    let found: Vec<Vec<ChainExon>> = par_map(todo.len(), o.threads, trio_cost, |t, al| {
+    let found: Vec<(Vec<ChainExon>, String)> = par_map(todo.len(), o.threads, trio_cost, |t, al| {
         let (ci, j) = todo[t];
         let c = &cs[ci];
         let hid = mid[&c.model];
@@ -909,8 +924,12 @@ fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, u
             let ((ps, pe), (ns, ne)) = (gap(p, x), gap(x, n));
             [module_block(cs, ci, p, ps, pe, |y| y.k2 >= n.k1), module_block(cs, ci, n, ns, ne, |y| y.k1 <= p.k2)]
         } else { [None, None] };
-        alternatives(al, hid, &models[hid], o.prm.code, c, j, &genome[&c.scaffold], size, large, stop)
+        let mut log = String::new();
+        let alts = alternatives(al, hid, &models[hid], o.prm.code, c, j, &genome[&c.scaffold], size, large, stop,
+                                o.alt_score_ratio as f32, o.alt_min_exon_bits as f32, &mut log);
+        (alts, log)
     });
+    let mut log = String::from("# gene scaffold strand exon_start exon_end start end stops bits exon_bits ratio kept (hits; refined exons dropped for stops are listed as refined_stop)\n");
     let mut taken: HashMap<(String, u8), Vec<(i64, i64)>> = HashMap::new();
     for c in cs.iter() {
         let v = taken.entry((c.scaffold.clone(), c.strand)).or_default();
@@ -918,7 +937,8 @@ fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, u
     }
     let mut new: Vec<Chain> = Vec::new();
     let mut count: HashMap<usize, usize> = HashMap::new();
-    for ((ci, j), alts) in todo.iter().zip(found) {
+    for ((ci, j), (alts, lines)) in todo.iter().zip(found) {
+        log.push_str(&lines);
         for e in alts {
             let v = taken.entry((cs[*ci].scaffold.clone(), cs[*ci].strand)).or_default();
             if v.iter().any(|&(a, b)| e.start <= b && a <= e.end) { continue; }
@@ -940,6 +960,7 @@ fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, u
         }
     }
     cs.extend(new);
+    log
 }
 
 /// Where the genome comes from: a FASTA path (plain or .gz), or sequences by name.
@@ -1187,7 +1208,8 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
         }
     }
     if do_fill && o.module {
-        add_alternatives(&mut cs, &models, &mid, &genome, o);
+        let s = add_alternatives(&mut cs, &models, &mid, &genome, o);
+        out.buf("alt_scores").push_str(&s);
     }
     if do_refine && o.lead {
         // the refined first exons say which rows open on an acceptor; their junctions stay cached
@@ -1220,7 +1242,8 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
     });
     // alternatives judged on their refined exons: failing chains go before anything is written
     if let (true, Some(v)) = (o.module && o.alt_refined, es.as_ref()) {
-        let keep = alt_keep(&cs, v, o);
+        let (keep, log) = alt_keep(&cs, v, o);
+        out.buf("alt_scores").push_str(&log);
         if keep.iter().any(|&k| !k) {
             let mut it = keep.iter();
             cs.retain(|_| *it.next().unwrap());

@@ -74,7 +74,7 @@ unsafe fn sse_expf(mut x: __m128) -> __m128 {
     const MINLOGF: f32 = -88.3762626647949;
     let maxmask = _mm_cmpgt_ps(x, _mm_set1_ps(MAXLOGF));
     let minmask = _mm_cmple_ps(x, _mm_set1_ps(MINLOGF));
-    let mut fx = _mm_mul_ps(x, _mm_set1_ps(1.44269504088896341f64 as f32));
+    let mut fx = _mm_mul_ps(x, _mm_set1_ps(std::f32::consts::LOG2_E));
     fx = _mm_add_ps(fx, _mm_set1_ps(0.5));
     let mut k = _mm_cvttps_epi32(fx);
     let mut tmp = _mm_cvtepi32_ps(k);

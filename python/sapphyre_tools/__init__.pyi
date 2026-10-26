@@ -98,14 +98,14 @@ def get_overlap(
 ) -> Optional[Tuple[int, int]]: ...
 def is_low_complexity_nt(
     seq: str,
-    window_size: int,
-    step: int,
-    dinuc_entropy_threshold: float,
-    trinuc_entropy_threshold: float,
-    min_segment_length: int,
-    min_failing_fraction: float,
-    min_failing_bp: int,
-    min_total_windows: int,
+    window_size: int = ...,
+    step: int = ...,
+    dinuc_entropy_threshold: float = ...,
+    trinuc_entropy_threshold: float = ...,
+    min_segment_length: int = ...,
+    min_failing_fraction: float = ...,
+    min_failing_bp: int = ...,
+    min_total_windows: int = ...,
 ) -> bool: ...
 
 # Column operations
@@ -120,18 +120,18 @@ def delete_empty_columns_pairs(
 ) -> List[Tuple[str, str]]: ...
 def cull_columns(
     records: List[Tuple[str, str]],
-    ref_suffix: str,
-    max_allowed_gaps_in_ref: float,
-    min_ref_supported_gap: int,
-    anchor_run: int,
-    tail_max_data: int,
-    include_edge: bool,
-    edge_ref_data_fraction: float,
-    min_seq_len: int,
-    gap_cull_threshold: float,
-    nt_seqs: Optional[Dict[str, str]],
-    debug: int,
-    log_dir: Optional[str],
+    ref_suffix: str = ...,
+    max_allowed_gaps_in_ref: float = ...,
+    min_ref_supported_gap: int = ...,
+    anchor_run: int = ...,
+    tail_max_data: int = ...,
+    include_edge: bool = ...,
+    edge_ref_data_fraction: float = ...,
+    min_seq_len: int = ...,
+    gap_cull_threshold: float = ...,
+    nt_seqs: Optional[Dict[str, str]] = ...,
+    debug: int = ...,
+    log_dir: Optional[str] = ...,
 ) -> Tuple[
     List[Tuple[str, str]],
     Dict[str, Set[int]],

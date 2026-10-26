@@ -7,7 +7,10 @@ use super::gate::{in_run, keep_piece, keep_run, owes_intron, run_next, run_start
 use super::splice::MIN_INTRON;
 use super::hmm::Hmm;
 use super::sites::{revcomp, translate, Code};
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 
 #[cfg(target_arch = "x86_64")]
 pub use super::avx::XRow as ChainRow;
@@ -263,6 +266,35 @@ struct Cand {
     owes: bool,
 }
 
+/// Forward hits of ORFs already scored, reused by windows that share a node slice: an ORF's
+/// hit and its reversal's depend only on the peptide and the slice, so a window reads the
+/// same values it would compute. Key: model, slice, peptide length and two hashes of it.
+/// model, slice ends, peptide length and two hashes of the peptide
+type OrfKey = (usize, usize, usize, usize, u64, u64);
+type OrfShard = Mutex<HashMap<OrfKey, (AlnHit, AlnHit)>>;
+
+pub struct OrfCache {
+    shards: Vec<OrfShard>,
+    hit: std::sync::atomic::AtomicUsize,
+    miss: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for OrfCache {
+    fn default() -> Self { OrfCache { shards: (0..64).map(|_| Mutex::new(HashMap::new())).collect(), hit: Default::default(), miss: Default::default() } }
+}
+
+impl OrfCache {
+    pub fn hits(&self) -> usize { self.hit.load(std::sync::atomic::Ordering::Relaxed) }
+    pub fn misses(&self) -> usize { self.miss.load(std::sync::atomic::Ordering::Relaxed) }
+    fn key(hmm_id: usize, a: usize, b: usize, aa: &[u8]) -> OrfKey {
+        let h = |seed: u8| { let mut x = std::collections::hash_map::DefaultHasher::new(); seed.hash(&mut x); aa.hash(&mut x); x.finish() };
+        (hmm_id, a, b, aa.len(), h(0), h(1))
+    }
+    fn shard(&self, k: &OrfKey) -> &OrfShard {
+        &self.shards[(k.4 % self.shards.len() as u64) as usize]
+    }
+}
+
 /// One gap/flank window (+ strand sequence) of a row whose exons cover `cover`
 /// of the model; `start`: the row's first exon reads back to a start codon of
 /// its own; `joined`: the gap's two exons join on their own. Rows go to `out`;
@@ -270,7 +302,7 @@ struct Cand {
 #[allow(clippy::too_many_arguments)]
 pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &OrfOpts, id: &str, lead: &str, goff: i64,
                   strand: u8, a0: i64, b0: i64, mut alo: i64, mut ahi: i64, wseq: &[u8], cover: f64, start: bool, joined: bool,
-                  out: &mut String, kept: &mut Vec<ChainExon>) {
+                  out: &mut String, kept: &mut Vec<ChainExon>, cache: Option<&OrfCache>) {
     let w = wseq.len() as i64;
     let s: Vec<u8> = if strand == b'-' {
         let t1 = if alo != 0 { w - alo + 1 } else { 0 };
@@ -297,8 +329,20 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
         if one_sided {
             if up { cb = b.min(a + n + 10) } else { ca = a.max(b - n - 10) }
         }
-        al.set(hmm_id, hmm, ca as usize, cb as usize);
-        let (fh, rh) = if o.decoy { (al.one(&ra), al.one(aa)) } else { (al.one(aa), al.one(&ra)) };
+        // the peptide's hit and its reversal's, from the cache when a window sharing the slice scored it
+        let key = cache.map(|_| OrfCache::key(hmm_id, ca as usize, cb as usize, aa));
+        let got = match (cache, key) { (Some(c), Some(k)) => c.shard(&k).lock().unwrap().get(&k).copied(), _ => None };
+        if let Some(c) = cache { (if got.is_some() { &c.hit } else { &c.miss }).fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        let (hf, hr) = match got {
+            Some(x) => x,
+            None => {
+                al.set(hmm_id, hmm, ca as usize, cb as usize);
+                let x = (al.one(aa), al.one(&ra));
+                if let (Some(c), Some(k)) = (cache, key) { c.shard(&k).lock().unwrap().insert(k, x); }
+                x
+            }
+        };
+        let (fh, rh) = if o.decoy { (hr, hf) } else { (hf, hr) };
         let olo = start + 1;
         let ohi = start + 3 * n;
         let slo = if fh.nmatch > 0 { start + 3 * (fh.rf as i64 - 1) + 1 } else { olo };
@@ -394,3 +438,7 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/genome_orf.rs"]
+mod tests;

@@ -3,12 +3,12 @@
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
 //! .pseudo.tsv, .gff3) plus .acceptor.tsv, .cut.tsv and .rebase.tsv, genomic 1-based coordinates.
 
-use super::chain::{add_exon, covered_nodes, module_block, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_LEAD, SRC_ORF, SRC_SIBFILL, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
+use super::chain::{add_exon, covered_nodes, module_block, Window, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_LEAD, SRC_ORF, SRC_SIBFILL, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
 use super::sites::{acceptor_default, base, code, learn_acceptor, revcomp, site_scores, splice_scores, translate, AccTable, Code, SS3_LAST};
 use super::module::{alternatives, copies, seq_copy};
-use super::orf::{exon_is_repeat, orf_window, Aligner, OrfOpts};
+use super::orf::{exon_is_repeat, orf_window, Aligner, OrfCache, OrfOpts};
 use super::lead::add_lead_exons;
 use super::pseudo::Pseudo;
 use super::refine::{junction_sites, start_upstream, JxSites, Refine};
@@ -97,6 +97,8 @@ pub struct Opts {
     pub split_fs: bool,
     /// give a row whose first exon opens on an acceptor the exon 1 found upstream (lead::add_lead_exons)
     pub lead: bool,
+    /// score each ORF once for windows sharing a node slice, and align a gap junction several windows share once
+    pub cache: bool,
     pub threads: usize,
 }
 
@@ -106,7 +108,7 @@ impl Default for Opts {
             orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false, runs: true },
             chain: ChainOpts { min_gap: 10, max_gap: 1000, max_end: 250, flank: 15000, share: true, siblings: true },
             prm: Params::default(),
-            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, alt_score_ratio: 0.15, alt_min_exon_bits: 10.0, sibfill: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true, lead: true,
+            fill_margin: -6.3, min_seg: 30, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, alt_score_ratio: 0.15, alt_min_exon_bits: 10.0, sibfill: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true, lead: true, cache: true,
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
@@ -167,6 +169,7 @@ impl Opts {
             "skip_open" => self.prm.skip_open = v,
             "gc_donor" => self.prm.gc_donor = v,
             "cpu" => self.threads = (v as usize).max(1),
+            "cache" => self.cache = v != 0.0,
             "table" => self.prm.code = code(v as u8).ok_or_else(|| format!("unknown NCBI table {v}"))?,
             _ => return Err(format!("unknown option '{k}'")),
         }
@@ -654,13 +657,14 @@ fn fake_cut(code: Code, jx: &Junction) -> bool {
 /// True when a and b join on their own: one exon or one clean intron, no frameshift or
 /// stop, and no model node skipped between them.
 fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &ChainExon, b: &ChainExon, sc: &[u8],
-            mask: Option<(i64, i64)>, jid: &str, ci: usize, wo: &mut WinOut) -> bool {
+            mask: Option<(i64, i64)>, jid: &str, ci: usize, wo: &mut WinOut, pre: Option<&Junction>) -> bool {
     let lo = a.start.min(b.start);
     let hi = a.end.max(b.end);
-    let seq = masked(&sc[(lo - 1) as usize..hi as usize], lo, mask);
-    let jx = junction(al, hid, hmm, &o.prm, o.keep, &seq, c.strand,
-                      a.k1, a.k2, a.start - lo + 1, a.end - lo + 1, b.k1, b.k2, b.start - lo + 1, b.end - lo + 1,
-                      mask.map(|(x, y)| (x - lo + 1, y - lo + 1)));
+    let owned;
+    let jx: &Junction = match pre {
+        Some(j) => j,
+        None => { owned = fill_junction(al, hid, hmm, o, c, a, b, sc, mask); &owned }
+    };
     let st = c.strand as char;
     if jx.status != JxStatus::Ok {
         let _ = writeln!(wo.fills, "{}\t{}\t{}\t-\t-\t{}\t{}", c.gene, c.scaffold, st, jx.status.name(), jid);
@@ -700,6 +704,47 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
         }
     }
     res.nfs == 0 && res.nstop == 0 && res.nnonc == 0 && (n == 1 || (n == 2 && res.exons[1].kf - res.exons[0].kl <= 1))
+}
+
+/// The gap junction fill_gap aligns: a and b through the gap, the mask read as N.
+#[allow(clippy::too_many_arguments)]
+fn fill_junction(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &ChainExon, b: &ChainExon, sc: &[u8],
+                 mask: Option<(i64, i64)>) -> Junction {
+    let lo = a.start.min(b.start);
+    let hi = a.end.max(b.end);
+    let seq = masked(&sc[(lo - 1) as usize..hi as usize], lo, mask);
+    junction(al, hid, hmm, &o.prm, o.keep, &seq, c.strand,
+             a.k1, a.k2, a.start - lo + 1, a.end - lo + 1, b.k1, b.k2, b.start - lo + 1, b.end - lo + 1,
+             mask.map(|(x, y)| (x - lo + 1, y - lo + 1)))
+}
+
+/// What fixes a gap window's fill junction: the model, strand, both exons and the mask.
+type FillKey = (String, String, u8, [i64; 8], Option<(i64, i64)>);
+
+fn fill_key(c: &Chain, a: &ChainExon, b: &ChainExon, mask: Option<(i64, i64)>) -> FillKey {
+    (c.model.clone(), c.scaffold.clone(), c.strand, [a.start, a.end, a.k1, a.k2, b.start, b.end, b.k1, b.k2], mask)
+}
+
+/// Windows that overlap another window of the same model, scaffold, strand and nodes: their ORFs repeat.
+fn overlapping_windows(wins: &[Window], cs: &[Chain]) -> Vec<bool> {
+    let mut by: HashMap<(&str, &str, u8, i64, i64), Vec<usize>> = HashMap::new();
+    for (i, w) in wins.iter().enumerate() {
+        let c = &cs[w.ci];
+        by.entry((c.model.as_str(), c.scaffold.as_str(), c.strand, w.k1, w.k2)).or_default().push(i);
+    }
+    let mut out = vec![false; wins.len()];
+    for v in by.values_mut() {
+        v.sort_by_key(|&i| wins[i].gs);
+        let (mut reach, mut owner) = (i64::MIN, None);
+        for &i in v.iter() {
+            if wins[i].gs <= reach {
+                out[i] = true;
+                if let Some(j) = owner { out[j] = true; }
+            }
+            if wins[i].ge > reach { reach = wins[i].ge; owner = Some(i); }
+        }
+    }
+    out
 }
 
 /// One distinct junction's refine/pseudo result.
@@ -994,29 +1039,54 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
     if do_pseudo { out.buf("disablements"); out.buf("pseudo"); }
     if do_score { out.buf("exonscores"); }
 
+    // EXONFILL_TIMES set: each stage's wall time to stderr (prototype instrumentation)
+    let tm = std::env::var_os("EXONFILL_TIMES").is_some();
+    let mut t0 = std::time::Instant::now();
+    let mut lap = |name: &str| { if tm { eprintln!("[exonfill-time] {name}: {:.2}s", t0.elapsed().as_secs_f64()); } t0 = std::time::Instant::now(); };
     let mut cache: HashMap<String, JxOut> = HashMap::new();
     if do_fill || do_refine {
         let (t, log) = learn_sites(&cs, &models, &mid, &genome, o, &mut cache);
         o.prm.acc = t;
         out.buf("acceptor").push_str(&log);
     }
+    lap("learn_sites");
     let o: &Opts = o;
     if do_fill {
         let s = cut_read_through(&mut cs, &models, &mid, &genome, o);
         out.buf("cut").push_str("# model scaffold strand start end intron_start intron_end score free nodes_first nodes_second rows kept\n");
         out.buf("cut").push_str(&s);
     }
+    lap("cut_read_through");
     if do_fill {
         let s = rebase_tails(&mut cs, &models, &mid, &genome, o);
         out.buf("rebase").push_str("# row owner scaffold strand lo hi tail found replaced copies(start-end:k1-k2:margin)\n");
         out.buf("rebase").push_str(&s);
     }
+    lap("rebase_tails");
     if do_fill {
         // a chain that gains exons is searched again: its gaps, or past the end that grew
         let (mut base, mut only): (usize, Option<HashSet<(usize, u8)>>) = (0, None);
+        let orf_cache = o.cache.then(OrfCache::default);
+        // gap junctions by what fixes them, each aligned once by the first window that needs it, kept across rounds
+        let mut fills: HashMap<FillKey, std::sync::OnceLock<Junction>> = HashMap::new();
         for _round in 0..=o.flank_rounds {
             let wins = chain_windows(&cs, &genome, &o.chain, only.as_ref());
             if wins.is_empty() { break; }
+            lap("round: chain_windows");
+            let shared = if o.cache { overlapping_windows(&wins, &cs) } else { Vec::new() };
+            if o.cache && do_splice {
+                for w in &wins {
+                    let c = &cs[w.ci];
+                    if w.kind == GAP && w.ge - w.gs >= 30 && mid.contains_key(&c.model) {
+                        fills.entry(fill_key(c, &c.ex[w.ia], &c.ex[w.ib.unwrap()], w.mask)).or_default();
+                    }
+                }
+            }
+            let fr = &fills;
+            if tm { eprintln!("[exonfill-time]   windows {} (gap {}), ORF-cache windows {}, junction keys {} ({} aligned already)", wins.len(),
+                              wins.iter().filter(|w| w.kind == GAP).count(), shared.iter().filter(|&&x| x).count(), fr.len(),
+                              fr.values().filter(|c| c.get().is_some()).count()); }
+            lap("round: overlap marks + junction keys");
             let win_cost = |i: usize| (wins[i].k2 - wins[i].k1 + 1).max(1) * (wins[i].ge - wins[i].gs + 1);
             let outs: Vec<WinOut> = par_map(wins.len(), o.threads, win_cost, |i, al| {
                 let mut wo = WinOut::default();
@@ -1049,15 +1119,26 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 let joined = do_splice && w.kind == GAP && {
                     let jid = format!("j{}", base + i);
                     let (a, b) = (c.ex[w.ia], c.ex[w.ib.unwrap()]);
-                    fill_gap(al, hid, hmm, o, c, &a, &b, sc, w.mask, &jid, w.ci, &mut wo)
+                    // the first window to need this junction aligns it; the others wait for it and read it
+                    let pj = if o.cache {
+                        fr.get(&fill_key(c, &a, &b, w.mask)).map(|cell| cell.get_or_init(|| {
+                            let mut j = fill_junction(al, hid, hmm, o, c, &a, &b, sc, w.mask);
+                            if j.status != JxStatus::Ok { j.s = Vec::new(); } // only Ok paths read the sequence
+                            j
+                        }))
+                    } else { None };
+                    fill_gap(al, hid, hmm, o, c, &a, &b, sc, w.mask, &jid, w.ci, &mut wo, pj)
                 };
-                orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, cover, start, joined, &mut wo.segments, &mut kept);
+                let oc = if shared.get(i).copied().unwrap_or(false) { orf_cache.as_ref() } else { None };
+                orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, cover, start, joined, &mut wo.segments, &mut kept, oc);
                 for k in kept {
                     wo.pend.push((w.ci, k, w.kind));
                     for &c2 in &w.also { wo.pend.push((c2, k, w.kind)); }
                 }
                 wo
             });
+            lap("round: window search");
+            if let (true, Some(c)) = (tm, orf_cache.as_ref()) { eprintln!("[exonfill-time]   ORF cache hits {} misses {}", c.hits(), c.misses()); }
             let mut pend: Vec<(usize, ChainExon, u8)> = Vec::new();
             for wo in outs {
                 out.buf("windows").push_str(&wo.windows);
@@ -1075,6 +1156,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             if grew.is_empty() { break; }
             only = Some(grew);
         }
+        lap("round tail");
         // before copy_to_flank_rows, so a start row takes its own copy rather than its sibling's exon
         if o.sibfill {
             let s = sibling_fill(&mut cs, &genome, o);
@@ -1085,6 +1167,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             out.buf("nearest").push_str(&s);
         }
         copy_to_flank_rows(&mut cs);
+        lap("sibling_fill + nearest + copy_to_flank");
     }
     // pieces each row's runs hold; a run that loses one goes whole
     let runs: Vec<usize> = cs.iter().map(|c| c.ex.iter().filter(|e| e.run).count()).collect();
@@ -1117,6 +1200,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             });
         }
     }
+    lap("reversal gate");
     if do_fill && do_refine {
         // a weak ORF piece next to an exon in another frame is intron read as exon: the junction
         // comes out a strict frameshift where the gene has a splice site. The piece goes.
@@ -1162,6 +1246,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             c.ex.retain(|_| { j += 1; !gone[j - 1] });
         }
     }
+    lap("frameshift/run gate");
     if do_fill && do_refine && o.split_fs {
         // a recovered exon whose junction path crosses a frameshift inside it holds two reading
         // frames; as one exon its second part is translated off frame. It becomes two exons there.
@@ -1207,10 +1292,12 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             if ex.len() != n { cs[i].ex = ex; }
         }
     }
+    lap("split_fs");
     if do_fill && o.module {
         let s = add_alternatives(&mut cs, &models, &mid, &genome, o);
         out.buf("alt_scores").push_str(&s);
     }
+    lap("add_alternatives");
     if do_refine && o.lead {
         // the refined first exons say which rows open on an acceptor; their junctions stay cached
         let (r, _) = refine_all(&models, &mid, o, &cs, &genome, true, false, &mut cache, None, None);
@@ -1218,15 +1305,18 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
         out.buf("lead").push_str("# gene scaffold strand start end donor acceptor intron\n");
         out.buf("lead").push_str(&s);
     }
+    lap("lead exons");
     let (mut rf, ps) = if do_refine || do_pseudo {
         let (r, p) = refine_all(&models, &mid, o, &cs, &genome, do_refine, do_pseudo, &mut cache, Some(&mut out), None);
         (Some(r), Some(p))
     } else { (None, None) };
+    lap("final refine + pseudo");
     if let (true, true, Some(r)) = (do_refine, o.join, rf.as_mut()) {
         let s = r.apply_joins(&mut cs, &genome);
         out.buf("joins").push_str(&s);
     }
     let mut ps = ps;
+    lap("joins");
     let mut es: Option<Vec<Vec<ExonScore>>> = do_score.then(|| {
         let rf = if do_refine { rf.as_ref() } else { None };
         par_map(cs.len(), o.threads, |_| 0, |i, al| {
@@ -1240,6 +1330,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             }
         })
     });
+    lap("score");
     // alternatives judged on their refined exons: failing chains go before anything is written
     if let (true, Some(v)) = (o.module && o.alt_refined, es.as_ref()) {
         let (keep, log) = alt_keep(&cs, v, o);
@@ -1257,6 +1348,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
             if let Some(v) = es.as_mut() { let mut it = keep.iter(); v.retain(|_| *it.next().unwrap()); }
         }
     }
+    lap("alt_keep");
     if do_fill { out.buf("chains").push_str(&write_chains(&cs)); }
     if let (true, Some(r)) = (do_refine, rf.as_ref()) { let s = r.write(&cs); out.buf("refined").push_str(&s); }
     let rf = if do_refine { rf.as_ref() } else { None };
@@ -1274,6 +1366,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
     }
     let g = write_gff(&cs, rf, if do_pseudo { ps.as_deref() } else { None }, es.as_deref(), o.min_strict);
     out.buf("gff3").push_str(&g);
+    lap("write");
     out.write(prefix)
 }
 

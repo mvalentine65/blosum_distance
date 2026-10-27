@@ -1319,7 +1319,11 @@ pub fn exonfill_run(py: Python<'_>, models: &str, chains: &str, genome: &Bound<'
             GenomeSrc::Seqs(m)
         }
     };
-    py.detach(|| run(models, chains, src, prefix, &mut o, stages)).map_err(PyRuntimeError::new_err)
+    // a panic (here or in a worker) comes back as RuntimeError, not pyo3's PanicException (a BaseException)
+    py.detach(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(models, chains, src, prefix, &mut o, stages))))
+        .unwrap_or_else(|p| Err(format!("exonfill panicked: {}",
+            p.downcast_ref::<&str>().copied().or(p.downcast_ref::<String>().map(|s| s.as_str())).unwrap_or("?"))))
+        .map_err(PyRuntimeError::new_err)
 }
 
 #[cfg(test)]

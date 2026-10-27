@@ -359,6 +359,8 @@ fn has_splice_sites(
 fn mask_retained_introns(
     headers: &[String],
     seqs: &[Vec<u8>],
+    orig_seqs: &[Vec<u8>],
+    current_to_orig: &[usize],
     ref_suffix: &str,
     nt_seqs: &Option<HashMap<String, String>>,
     min_ref_supported_gap: usize,
@@ -398,7 +400,7 @@ fn mask_retained_introns(
     let mut result: Vec<Vec<u8>> = Vec::with_capacity(seqs.len());
     let mut intron_columns: HashMap<String, HashSet<usize>> = HashMap::new();
 
-    for (header, seq) in headers.iter().zip(seqs.iter()) {
+    for ((header, seq), orig_seq) in headers.iter().zip(seqs.iter()).zip(orig_seqs.iter()) {
         if header.ends_with(ref_suffix) {
             result.push(seq.clone());
             continue;
@@ -462,7 +464,8 @@ fn mask_retained_introns(
             let has_stop = block_residues.contains(&b'*');
 
             let has_splice = if let Some(nt) = candidate_nt {
-                let block_first_residue = sb[..bs].iter().filter(|&&c| c != b'-').count();
+                // nt_seqs is indexed by residue of the original row: count the residues Step 1 masked too
+                let block_first_residue = orig_seq[..current_to_orig[bs]].iter().filter(|&&c| c != b'-').count();
                 has_splice_sites(nt, block_first_residue, block_residues.len())
             } else {
                 false
@@ -1166,7 +1169,7 @@ pub fn cull_columns(
     // ---------------------------------------------------------------
 
     let (after_intron, intron_masked_cols) = mask_retained_introns(
-        &norm_headers, &after_gap_cull, ref_suffix, &nt_seqs,
+        &norm_headers, &after_gap_cull, &norm_seqs, &current_to_orig, ref_suffix, &nt_seqs,
         min_ref_supported_gap, debug, &log_dir,
     );
 

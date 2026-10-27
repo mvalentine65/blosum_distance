@@ -74,3 +74,22 @@ fn a_zero_length_r2_is_still_a_pair_and_drops_on_length() {
     let single = Item { paired: false, ..got.into_iter().next().unwrap() };
     assert_eq!(run_batch(&[single], &opts, &mut stats, &mut scratch, &mut canon, 15).spans.len(), 1);
 }
+
+#[test]
+fn both_strands_of_a_read_canonicalise_to_the_same_upper_case_bytes() {
+    let revcomp = |s: &[u8]| -> Vec<u8> { s.iter().rev().map(|&b| crate::COMPLEMENT[b as usize]).collect() };
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for read in [&b"ACGTRYKMACGTTTGA"[..], b"TTTTACGRACGTAAAA", b"acgtnacgTTTTswbd", b"GGGGACGT|CCAT"] {
+        let fwd = canonical(read, &mut a).to_vec();
+        let rev = canonical(&revcomp(read), &mut b).to_vec();
+        assert_eq!(fwd, rev, "{}", String::from_utf8_lossy(read));
+        assert!(!fwd.iter().any(u8::is_ascii_lowercase));
+    }
+    // IUPAC codes survive the flip instead of turning into N
+    let flipped = canonical(b"TTTTACGRACGTAAAA", &mut a).to_vec();
+    assert!(flipped.contains(&b'R') || flipped.contains(&b'Y'));
+    assert!(!flipped.contains(&b'N'));
+    // a stray byte stays for validate_residues to report
+    assert!(canonical(b"TTTTACGT|CCAT", &mut a).contains(&b'|'));
+}

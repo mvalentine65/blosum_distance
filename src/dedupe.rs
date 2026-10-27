@@ -18,7 +18,7 @@ use crate::reads::pipeline::{
     process_pair, process_single, TrimOptions, TrimScratch, TrimStats,
 };
 use crate::reads::seed::PreparedAdapter;
-use crate::reads::seqops::{avx2, complement, reverse_complement_into};
+use crate::reads::seqops::avx2;
 
 // --- Optimized DedupTable from main_bestrs.rs ---
 
@@ -365,16 +365,41 @@ impl DedupTable {
 
 // --- Canonicalization Helpers ---
 
+// The IUPAC table in lib.rs, not seqops' fastp one: it is an involution, so both
+// strands of a read canonicalise to the same bytes, and a byte that is not a
+// nucleotide code stays itself for `validate_residues` to report.
 #[inline]
 fn forward_is_canonical(seq: &[u8]) -> bool {
     let n = seq.len();
     for i in 0..n {
         let f = seq[i];
-        let r = complement(seq[n - 1 - i]);
+        let r = crate::COMPLEMENT[seq[n - 1 - i] as usize];
         if f < r { return true; }
         else if f > r { return false; }
     }
     true
+}
+
+/// The read upper-cased and in canonical orientation, built in `scratch` when
+/// it is not `seq` itself.
+fn canonical<'a>(seq: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    if seq.iter().any(u8::is_ascii_lowercase) {
+        scratch.clear();
+        scratch.extend(seq.iter().map(u8::to_ascii_uppercase));
+        if !forward_is_canonical(scratch) {
+            scratch.reverse();
+            for b in scratch.iter_mut() {
+                *b = crate::COMPLEMENT[*b as usize];
+            }
+        }
+        return scratch;
+    }
+    if forward_is_canonical(seq) {
+        return seq;
+    }
+    scratch.clear();
+    scratch.extend(seq.iter().rev().map(|&b| crate::COMPLEMENT[b as usize]));
+    scratch
 }
 
 fn open_reader(path: &PathBuf) -> Result<Box<dyn Read + Send>> {
@@ -611,13 +636,7 @@ fn push_kept(out: &mut Kept, seq: &[u8], canon: &mut Vec<u8>, min_length: usize)
     if seq.is_empty() || seq.len() < min_length {
         return;
     }
-    let bytes: &[u8] = if forward_is_canonical(seq) {
-        seq
-    } else {
-        canon.resize(seq.len(), 0);
-        reverse_complement_into(seq, canon);
-        canon
-    };
+    let bytes = canonical(seq, canon);
     let start = out.buf.len();
     let len_word = encode_into(bytes, &mut out.buf);
     out.spans.push((len_word, DedupTable::hash64(len_word, &out.buf[start..])));
@@ -1056,13 +1075,7 @@ fn add_canonical(table: &mut DedupTable, seq: &[u8], scratch: &mut Vec<u8>, min_
     if seq.is_empty() || seq.len() < min_length {
         return;
     }
-    if forward_is_canonical(seq) {
-        table.add(seq);
-    } else {
-        scratch.resize(seq.len(), 0);
-        reverse_complement_into(seq, scratch);
-        table.add(scratch);
-    }
+    table.add(canonical(seq, scratch));
 }
 
 enum Reader {

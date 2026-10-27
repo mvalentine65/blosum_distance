@@ -202,7 +202,7 @@ struct AminoAcidTranslator {
 
 fn truncate_header(header: &str) -> String {
     if header.len() > 150 {
-        format!("{}...", &header[0..150])
+        format!("{}...", &header[0..header.floor_char_boundary(150)])
     } else {
         header.to_string()
     }

@@ -647,6 +647,18 @@ fn run_batch(
     out
 }
 
+/// A dedupe thread's panic as an error. Re-raised, it would reach Python as
+/// PanicException, a BaseException that kills a multiprocessing Pool worker
+/// and leaves prepare's pool.map waiting forever.
+fn panic_error(payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
+    let msg = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string payload");
+    anyhow::anyhow!("dedupe thread panicked: {msg}")
+}
+
 /// Fold one worker's stats into the total. Every field is a running count or a
 /// histogram, so the sum does not depend on which worker saw which read.
 fn merge_stats(dst: &mut TrimStats, src: &TrimStats) {
@@ -861,12 +873,23 @@ fn build_table_parallel(
             );
         }
 
+        // A worker that panicked ends the loop above early, possibly with the
+        // others blocked on a full output channel; closing the receivers lets
+        // them exit. Every thread is joined before a panic is reported, so the
+        // scope has none left to re-raise.
+        drop(from_worker);
+        let mut panicked = None;
         for h in handles {
-            if let Ok(stats) = h.join() {
-                merge_stats(&mut totals, &stats);
+            match h.join() {
+                Ok(stats) => merge_stats(&mut totals, &stats),
+                Err(p) => panicked = panicked.or(Some(p)),
             }
         }
-        reader.join().unwrap_or(Ok(()))
+        let read = reader.join();
+        match panicked {
+            Some(p) => Err(panic_error(p)),
+            None => read.unwrap_or_else(|p| Err(panic_error(p))),
+        }
     })?;
 
     Ok(TrimSummary::from(&totals, (det1.as_deref(), det2.as_deref())))

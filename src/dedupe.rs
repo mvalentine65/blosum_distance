@@ -519,6 +519,7 @@ fn read_pair_parallel<F>(
 where
     F: FnMut(Vec<Item>) -> bool,
 {
+    let (pa, pb) = (a.path.clone(), b.path.clone());
     std::thread::scope(|s| -> Result<()> {
         let (txa, rxa) = std::sync::mpsc::sync_channel::<Result<RawBatch>>(2);
         let (txb, rxb) = std::sync::mpsc::sync_channel::<Result<RawBatch>>(2);
@@ -526,8 +527,9 @@ where
         s.spawn(move || read_batches(b, batch, txb));
         while let (Ok(ra), Ok(rb)) = (rxa.recv(), rxb.recv()) {
             let (va, vb) = (ra?, rb?);
-            // zip stops at the shorter, which is the lockstep loop's rule for
-            // mates of unequal length.
+            if va.len() != vb.len() {
+                bail!("Paired files {pa} and {pb} have different numbers of records");
+            }
             let short = va.len() < batch || vb.len() < batch;
             let items: Vec<Item> = va
                 .into_iter()
@@ -565,7 +567,8 @@ impl ItemStream {
                     (Some((s1, q1)), Some((s2, q2))) => {
                         return Ok(Some(Item { s1, q1, s2, q2 }))
                     }
-                    _ => self.cur = None,
+                    (None, None) => self.cur = None,
+                    _ => bail!("Paired files {} and {} have different numbers of records", a.path, b.path),
                 },
                 Some(Cursor::Single(src)) => match src.next_record()? {
                     Some((s1, q1)) => {
@@ -994,7 +997,11 @@ fn build_table(
                     let t0 = prof.then(std::time::Instant::now);
                     let pair = (a.next_record()?, b.next_record()?);
                     if let Some(t) = t0 { t_read += t.elapsed(); }
-                    let (Some((s1, q1)), Some((s2, q2))) = pair else { break };
+                    let (s1, q1, s2, q2) = match pair {
+                        (Some((s1, q1)), Some((s2, q2))) => (s1, q1, s2, q2),
+                        (None, None) => break,
+                        _ => bail!("Paired files {} and {} have different numbers of records", a.path, b.path),
+                    };
                     let t1 = prof.then(std::time::Instant::now);
                     ingest.push_pair(&s1, &q1, &s2, &q2, &mut |kept: &[u8]| {
                         let t2 = prof.then(std::time::Instant::now);

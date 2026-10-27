@@ -343,8 +343,12 @@ fn find_cut(strand: u8, e: &ChainExon, x: &ExonScore, (s, i, j): (f64, usize, us
     Some((lo, hi, s, free, ka, kb))
 }
 
-/// The genomic low piece of exon s..e cut at lo..hi is the one that stays: the longer.
-fn keep_low(s: i64, e: i64, lo: i64, hi: i64) -> bool { lo - s >= e - hi }
+/// Whether the genomic low piece of exon s..e cut at lo..hi is the one that stays: the longer,
+/// or on a tie the coding-first one (the low piece on '+', the high one on '-').
+fn keep_low(st: u8, s: i64, e: i64, lo: i64, hi: i64) -> bool {
+    let (a, b) = (lo - s, e - hi);
+    a > b || (a == b && st != b'-')
+}
 
 /// A search-stage exon that reads through a short in-frame intron (find_cut) is cut in two
 /// in every chain that holds it: the longer piece stays, the other is a cut exon. Returns the log rows.
@@ -382,7 +386,7 @@ fn cut_read_through(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usiz
             let (ka, kb) = ((e.k1.min(ka.1), ka.1), (kb.0, e.k2.max(kb.0)));
             // genomic low and high piece; the coding-first one takes ka
             let (kl, kh) = if c.strand == b'-' { (kb, ka) } else { (ka, kb) };
-            let low = keep_low(e.start, e.end, lo, hi);
+            let low = keep_low(c.strand, e.start, e.end, lo, hi);
             ex.push(ChainExon { start: e.start, end: lo - 1, k1: kl.0, k2: kl.1, src: if low { SRC_INPUT } else { SRC_CUT }, codon: e.codon, bits: 0.0, run: false, owes: false });
             ex.push(ChainExon { start: hi + 1, end: e.end, k1: kh.0, k2: kh.1, src: if low { SRC_CUT } else { SRC_INPUT }, codon: e.codon, bits: 0.0, run: false, owes: false });
         }
@@ -393,7 +397,7 @@ fn cut_read_through(cs: &mut [Chain], models: &[Hmm], mid: &HashMap<String, usiz
     keys.sort_by(|a, b| (&a.0.1, a.0.3).cmp(&(&b.0.1, b.0.3)));
     let mut log = String::new();
     for (k, &(lo, hi, s, free, ka, kb)) in keys {
-        let kept = if keep_low(k.3, k.4, lo, hi) { (k.3, lo - 1) } else { (hi + 1, k.4) };
+        let kept = if keep_low(k.2, k.3, k.4, lo, hi) { (k.3, lo - 1) } else { (hi + 1, k.4) };
         let _ = writeln!(log, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{:.2}\t{}-{}\t{}-{}\t{}\t{}-{}", k.0, k.1, k.2 as char, k.3, k.4, lo, hi, s, free,
                          ka.0, ka.1, kb.0, kb.1, rows.get(k).copied().unwrap_or(0), kept.0, kept.1);
     }

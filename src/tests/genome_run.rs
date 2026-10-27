@@ -74,3 +74,15 @@ fn test_a_copy_of_unlike_length_is_not_swapped_in() {
     assert_eq!(nearest_copies(&mut cs, 0.75).lines().count(), 1);
     assert_eq!((cs[1].ex[1].start, cs[1].ex[1].src), (1610, SRC_SIBFILL));
 }
+
+#[test]
+fn test_keep_low_breaks_a_tie_by_coding_order() {
+    // 1001-1300 cut at 1151-1150: two 150 nt pieces; the coding-first piece stays on either strand
+    assert!(keep_low(b'+', 1001, 1300, 1151, 1150));
+    assert!(!keep_low(b'-', 1001, 1300, 1151, 1150));
+    // otherwise the longer piece stays, whatever the strand
+    for st in [b'+', b'-'] {
+        assert!(keep_low(st, 1001, 1300, 1154, 1153));
+        assert!(!keep_low(st, 1001, 1300, 1148, 1147));
+    }
+}

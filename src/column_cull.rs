@@ -1291,20 +1291,23 @@ pub fn cull_columns(
             .collect();
         surviving_indices.iter().map(|&idx| {
             let s = &after_stop_trim[idx];
-            // Alignment data is ASCII; bypass UTF-8 validation to avoid
-            // a redundant byte-scan on long alignments.
             let mut buf: Vec<u8> = Vec::with_capacity(keep_indices.len());
             for &i in &keep_indices {
                 buf.push(s[i]);
             }
-            let new_seq = unsafe { String::from_utf8_unchecked(buf) };
-            (norm_headers[idx].clone(), new_seq)
-        }).collect()
+            // Masked columns can split a multi-byte character in non-ASCII input.
+            let new_seq = String::from_utf8(buf).map_err(|e| {
+                PyRuntimeError::new_err(format!("{}: alignment is not ASCII ({e})", norm_headers[idx]))
+            })?;
+            Ok((norm_headers[idx].clone(), new_seq))
+        }).collect::<PyResult<_>>()?
     } else {
         surviving_indices.iter().map(|&idx| {
-            let new_seq = unsafe { String::from_utf8_unchecked(after_stop_trim[idx].clone()) };
-            (norm_headers[idx].clone(), new_seq)
-        }).collect()
+            let new_seq = String::from_utf8(after_stop_trim[idx].clone()).map_err(|e| {
+                PyRuntimeError::new_err(format!("{}: alignment is not ASCII ({e})", norm_headers[idx]))
+            })?;
+            Ok((norm_headers[idx].clone(), new_seq))
+        }).collect::<PyResult<_>>()?
     };
 
     // ---------------------------------------------------------------

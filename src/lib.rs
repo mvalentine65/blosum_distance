@@ -14,6 +14,7 @@ mod translate;
 
 use flexcull::*;
 use overlap::get_overlap;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 
@@ -179,9 +180,9 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
 /// a gap.  Operates on `(header, sequence)` pairs the SAPPHYRE Python side
 /// already has on hand.
 #[pyfunction]
-fn delete_empty_columns_pairs(records: Vec<(String, String)>) -> Vec<(String, String)> {
+fn delete_empty_columns_pairs(records: Vec<(String, String)>) -> PyResult<Vec<(String, String)>> {
     if records.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let len = records[0].1.len();
     let n_recs = records.len();
@@ -221,10 +222,12 @@ fn delete_empty_columns_pairs(records: Vec<(String, String)>) -> Vec<(String, St
                 buf.push(bytes[i]);
             }
         }
-        // Alignment data is ASCII, so the UTF-8 invariant holds.
-        out.push((header, unsafe { String::from_utf8_unchecked(buf) }));
+        // Byte columns can split a multi-byte character in non-ASCII input.
+        let seq = String::from_utf8(buf)
+            .map_err(|e| PyValueError::new_err(format!("{header}: alignment is not ASCII ({e})")))?;
+        out.push((header, seq));
     }
-    out
+    Ok(out)
 }
 
 /// Sliding-window low-complexity check on a nucleotide sequence.

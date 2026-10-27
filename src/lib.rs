@@ -8,6 +8,7 @@ mod flexcull;
 mod ntbatch;
 mod pn2codon;
 mod reads;
+mod repeat_copy;
 mod overlap;
 mod blosum_tables;
 mod translate;
@@ -564,6 +565,7 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(column_cull::cull_columns, m)?)?;
     m.add_function(wrap_pyfunction!(column_cull::apply_gff_culls, m)?)?;
     m.add_function(wrap_pyfunction!(genome_splice::run::exonfill_run, m)?)?;
+    m.add_function(wrap_pyfunction!(repeat_copy::repeat_copy_matches, m)?)?;
     m.add_function(wrap_pyfunction!(genome_splice::run::exonfill_model_cols, m)?)?;
     m.add_function(wrap_pyfunction!(pn2codon::pn2codon, m)?)?;
 

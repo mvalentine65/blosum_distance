@@ -5,6 +5,6 @@ use crate::blosum62_distance;
 
 #[test]
 fn test_blosum62_gap_penalty() {
-    let result = blosum62_distance(String::from("A"), String::from("-"));
+    let result = blosum62_distance(String::from("A"), String::from("-")).unwrap();
     assert_eq!(result, 2.0)
 }

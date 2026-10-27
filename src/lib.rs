@@ -67,37 +67,55 @@ fn find_indices(sequence: &[u8], gap: u8) -> (usize, usize) {
 }
 
 #[pyfunction]
-fn find_index_pair(sequence: &str, gap: &str) -> (usize, usize) {
+fn find_index_pair(sequence: &str, gap: &str) -> PyResult<(usize, usize)> {
     if gap.len() != 1 {
-        panic!("Gap character must be a single character");
+        return Err(PyValueError::new_err(
+            "Gap character must be a single character",
+        ));
     }
     let gap_char = gap.as_bytes()[0];
-    find_indices(sequence.as_bytes(), gap_char)
+    Ok(find_indices(sequence.as_bytes(), gap_char))
 }
 
 #[pyfunction]
-fn is_same_kmer(one: &str, two: &str) -> bool {
-    hamming(one.as_ref(), two.as_ref()) == 0
+fn is_same_kmer(one: &str, two: &str) -> PyResult<bool> {
+    if one.len() != two.len() {
+        return Err(PyValueError::new_err(format!(
+            "is_same_kmer needs texts of equal length ({}!={})",
+            one.len(),
+            two.len()
+        )));
+    }
+    Ok(hamming(one.as_ref(), two.as_ref()) == 0)
 }
 
 #[pyfunction]
-fn constrained_distance(consensus: &str, candidate: &str) -> u64 {
+fn constrained_distance(consensus: &str, candidate: &str) -> PyResult<u64> {
     let can = candidate.as_bytes();
     let con = consensus.as_bytes();
 
     let (start, end) = find_indices(candidate.as_bytes(), b'-');
+    if end > con.len() || end > can.len() {
+        return Err(PyValueError::new_err(format!(
+            "candidate span {}..{} does not fit (consensus length {}, candidate length {})",
+            start,
+            end,
+            con.len(),
+            can.len()
+        )));
+    }
     let con = &con[start..end];
     let can = &can[start..end];
     let hamming_distance = hamming(con, can);
     let blank_count = con.iter().filter(|c: &&u8| **c == b'X').count() as u64;
-    match hamming_distance > blank_count {
+    Ok(match hamming_distance > blank_count {
         true => hamming_distance - blank_count,
         false => 0,
-    }
+    })
 }
 
 #[pyfunction]
-fn blosum62_distance(one: String, two: String) -> f64 {
+fn blosum62_distance(one: String, two: String) -> PyResult<f64> {
     // only used for ref to ref
     let first: &[u8] = one.as_bytes();
     let second: &[u8] = two.as_bytes();
@@ -105,6 +123,13 @@ fn blosum62_distance(one: String, two: String) -> f64 {
     let mut max_first = 0;
     let mut max_second = 0;
     let length = first.len();
+    if second.len() < length {
+        return Err(PyValueError::new_err(format!(
+            "second is shorter than first ({}<{})",
+            second.len(),
+            length
+        )));
+    }
     // bio's matrix is a LazyLock and its lookup() is a four-branch chain, both
     // paid three times per residue. Index a const table instead, and take the
     // two self-scores off the diagonal, which is a per-character constant.
@@ -120,10 +145,16 @@ fn blosum62_distance(one: String, two: String) -> f64 {
         let a = blosum_tables::XLAT[char1 as usize];
         let b = blosum_tables::XLAT[char2 as usize];
         if a == blosum_tables::INVALID {
-            panic!("first[i]  {} not in allowed\n{}", char1 as char, one);
+            return Err(PyValueError::new_err(format!(
+                "first[i]  {} not in allowed\n{}",
+                char1 as char, one
+            )));
         }
         if b == blosum_tables::INVALID {
-            panic!("second[i] {} not in allowed\n{}", char2 as char, two);
+            return Err(PyValueError::new_err(format!(
+                "second[i] {} not in allowed\n{}",
+                char2 as char, two
+            )));
         }
         let (ai, bi) = (a as usize, b as usize);
         score += blosum_tables::BLOSUM[27 * ai + bi];
@@ -131,18 +162,24 @@ fn blosum62_distance(one: String, two: String) -> f64 {
         max_second += blosum_tables::DIAG[bi];
     }
     let maximum_score = std::cmp::max(max_first, max_second);
-    1.0_f64 - (score as f64 / maximum_score as f64)
+    Ok(1.0_f64 - (score as f64 / maximum_score as f64))
 }
 
 #[pyfunction]
-fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
+fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> PyResult<f64> {
     let cand_bytes: &[u8] = candidate.as_bytes();
     let ref_bytes: &[u8] = reference.as_bytes();
     let mut score = 0;
     let mut max_first = 0;
     let mut max_second = 0;
     let length = cand_bytes.len();
-    assert!(length == ref_bytes.len());
+    if length != ref_bytes.len() {
+        return Err(PyValueError::new_err(format!(
+            "candidate and reference differ in length ({}!={})",
+            length,
+            ref_bytes.len()
+        )));
+    }
     for i in 0..length {
         let mut char1 = cand_bytes[i];
         let char2 = ref_bytes[i];
@@ -155,10 +192,16 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
         let a = blosum_tables::XLAT[char1 as usize];
         let b = blosum_tables::XLAT[char2 as usize];
         if a == blosum_tables::INVALID {
-            panic!("first[i]  {} not in allowed\n{}", char1 as char, candidate);
+            return Err(PyValueError::new_err(format!(
+                "first[i]  {} not in allowed\n{}",
+                char1 as char, candidate
+            )));
         }
         if b == blosum_tables::INVALID {
-            panic!("second[i] {} not in allowed\n{}", char2 as char, reference);
+            return Err(PyValueError::new_err(format!(
+                "second[i] {} not in allowed\n{}",
+                char2 as char, reference
+            )));
         }
         let (ai, bi) = (a as usize, b as usize);
 
@@ -173,7 +216,7 @@ fn blosum62_candidate_to_reference(candidate: &str, reference: &str) -> f64 {
         }
     }
     let maximum_score = std::cmp::max(max_first, max_second);
-    1.0_f64 - (score as f64 / maximum_score as f64)
+    Ok(1.0_f64 - (score as f64 / maximum_score as f64))
 }
 
 /// Column-filter helper: drops alignment columns where every sequence holds
@@ -264,7 +307,7 @@ pub fn is_low_complexity_nt(
     min_failing_fraction: f64,
     min_failing_bp: usize,
     min_total_windows: usize,
-) -> bool {
+) -> PyResult<bool> {
     // Encode bases A/C/G/T -> 0..3, anything else -> 4 ("N").
     let mut codes = Vec::with_capacity(seq.len());
     for b in seq.as_bytes() {
@@ -295,7 +338,7 @@ pub fn is_low_complexity_nt(
         i = j;
     }
     if segments.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     let entropy_from_counts = |counts: &[u32], total: u32| -> f64 {
@@ -394,6 +437,15 @@ pub fn is_low_complexity_nt(
             continue;
         }
 
+        // step == 0 never advances `w`, so the loop below would never end.
+        // window_size == 0 makes the first window end at w - 1, which wraps
+        // and runs past the end of `codes` when the segment starts at 0.
+        if step == 0 || (window_size == 0 && seg_start == 0) {
+            return Err(PyValueError::new_err(format!(
+                "step ({}) and window_size ({}) must be positive",
+                step, window_size
+            )));
+        }
         let mut w = 0usize;
         while w + window_size <= seg_len {
             let (failed, win_bp) = check_window(w, w + window_size - 1);
@@ -420,11 +472,11 @@ pub fn is_low_complexity_nt(
     // Very short sequences with one or two windows shouldn't be flaggable on
     // a single failing window.
     if total_windows < min_total_windows {
-        return false;
+        return Ok(false);
     }
 
     let failing_fraction = failing_windows as f64 / total_windows as f64;
-    failing_fraction >= min_failing_fraction && failing_bp >= min_failing_bp
+    Ok(failing_fraction >= min_failing_fraction && failing_bp >= min_failing_bp)
 }
 
 fn find_question_marks(sequences: Vec<&[u8]>, start: usize, stop: usize) -> HashSet<usize> {

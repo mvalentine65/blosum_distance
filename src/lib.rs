@@ -10,6 +10,7 @@ mod pn2codon;
 mod reads;
 mod repeat_copy;
 mod overlap;
+mod pseq;
 mod blosum_tables;
 mod translate;
 
@@ -575,6 +576,9 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dedupe::dedupe_reads, m)?)?;
     m.add_class::<genome_prep::GenomeScanner>()?;
     m.add_function(wrap_pyfunction!(genome_prep::genome_windows, m)?)?;
+    m.add_function(wrap_pyfunction!(pseq::pack_pseq, m)?)?;
+    m.add_function(wrap_pyfunction!(pseq::unpack_pseq, m)?)?;
+    m.add_function(wrap_pyfunction!(pseq::unpack_pseq_many, m)?)?;
 
     Ok(())
 }

@@ -31,7 +31,7 @@ pub fn complement(base: u8) -> u8 {
 
 /// `dst` receives the reverse complement of `src`. `dst` must be `src.len()`.
 pub fn reverse_complement_into(src: &[u8], dst: &mut [u8]) {
-    debug_assert_eq!(src.len(), dst.len());
+    assert_eq!(src.len(), dst.len());
     #[cfg(target_arch = "x86_64")]
     if src.len() >= 32 && avx2() {
         // SAFETY: AVX2 was just checked; the slices are equally long.

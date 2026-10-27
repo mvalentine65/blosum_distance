@@ -126,6 +126,7 @@ pub struct OProfile {
 
 impl OProfile {
     pub fn new(p: &Profile) -> OProfile {
+        assert!(available());
         unsafe { Self::build(p) }
     }
 

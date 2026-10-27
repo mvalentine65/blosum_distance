@@ -3,7 +3,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use seq_io::fastq::{Reader as FastqReader, Record as FastqRecord};
-use seq_io::fasta::{Reader as FastaReader, Record as FastaRecord};
+use seq_io::fasta::Reader as FastaReader;
 use std::fs::File;
 use std::iter::once;
 use std::io::{BufReader, Read};
@@ -1097,7 +1097,8 @@ impl RecordSource {
                     let rec = rec.with_context(|| {
                         format!("Error reading FASTA record {n} of {path}")
                     })?;
-                    Ok(Some((rec.seq().to_vec(), Vec::new())))
+                    // owned_seq joins a wrapped record's lines and drops their CRs
+                    Ok(Some((rec.owned_seq(), Vec::new())))
                 }
             },
         }
@@ -1546,3 +1547,7 @@ fn validate_residues(node_id: u64, seq: &[u8]) -> PyResult<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/dedupe.rs"]
+mod tests;

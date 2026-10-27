@@ -704,6 +704,7 @@ fn build_table_parallel(
     workers: usize,
     min_length: usize,
     prof: bool,
+    check: &dyn Fn() -> PyResult<()>,
 ) -> Result<TrimSummary> {
     const BATCH: usize = 4096;
 
@@ -843,6 +844,9 @@ fn build_table_parallel(
             std::time::Duration::ZERO,
         );
         loop {
+            // Returning drops the receivers, which winds the workers and the
+            // reader down before the scope joins them.
+            check()?;
             let t0 = prof.then(std::time::Instant::now);
             let Ok(kept) = from_worker[seq % workers].recv() else { break };
             if let Some(t) = t0 {
@@ -895,12 +899,17 @@ fn build_table_parallel(
     Ok(TrimSummary::from(&totals, (det1.as_deref(), det2.as_deref())))
 }
 
+/// Records between polls for Ctrl-C. Python only raises KeyboardInterrupt on
+/// this thread once native code asks, so an unpolled loop defers it to return.
+const CHECK_EVERY: usize = 1 << 16;
+
 /// Sequences shorter than `min_length` are never inserted: no N-free run of
 /// theirs can reach the floor, so `dedupe_reads` would drop them unemitted.
 fn build_table(
     input_paths: Vec<PathBuf>,
     trim: bool,
     min_length: usize,
+    check: &dyn Fn() -> PyResult<()>,
 ) -> Result<(DedupTable, TrimSummary)> {
     let prof = std::env::var("SAPPHYRE_PROFILE").is_ok();
     let mut t_read = std::time::Duration::ZERO;
@@ -909,12 +918,18 @@ fn build_table(
     let t_all = std::time::Instant::now();
     let (expected_uniques, expected_bytes) = size_hint(&input_paths);
     let mut table = DedupTable::with_capacity(expected_uniques, expected_bytes);
+    let mut polled = 0usize;
+    let mut poll = || -> PyResult<()> {
+        polled += 1;
+        if polled % CHECK_EVERY == 0 { check() } else { Ok(()) }
+    };
 
     if !trim {
         let mut scratch = Vec::with_capacity(300);
         for path in input_paths {
             let mut src = RecordSource::open(&path)?;
             loop {
+                poll()?;
                 let t0 = prof.then(std::time::Instant::now);
                 let rec = src.next_record()?;
                 if let Some(t) = t0 { t_read += t.elapsed(); }
@@ -952,7 +967,8 @@ fn build_table(
         });
 
     if workers >= 1 {
-        let summary = build_table_parallel(input_paths, &mut table, workers, min_length, prof)?;
+        let summary =
+            build_table_parallel(input_paths, &mut table, workers, min_length, prof, check)?;
         if prof {
             eprintln!(
                 "[profile] parallel trim total {:.1}s | {} workers",
@@ -974,6 +990,7 @@ fn build_table(
                 let mut a = RecordSource::open(&p1)?;
                 let mut b = RecordSource::open(&p2)?;
                 loop {
+                    poll()?;
                     let t0 = prof.then(std::time::Instant::now);
                     let pair = (a.next_record()?, b.next_record()?);
                     if let Some(t) = t0 { t_read += t.elapsed(); }
@@ -990,6 +1007,7 @@ fn build_table(
             InputGroup::Single(path) => {
                 let mut src = RecordSource::open(&path)?;
                 while let Some((seq, qual)) = src.next_record()? {
+                    poll()?;
                     ingest.push_single(&seq, &qual, &mut |kept: &[u8]| {
                         add_canonical(&mut table, kept, &mut scratch, min_length)
                     });
@@ -1327,6 +1345,7 @@ impl PreparedReads {
 /// parse error.
 #[pyfunction]
 pub fn dedupe_reads(
+    py: Python<'_>,
     inputs: Vec<String>,
     min_length: usize,
     batch_size: usize,
@@ -1343,8 +1362,13 @@ pub fn dedupe_reads(
         a_name.cmp(b_name).then_with(|| a.as_os_str().cmp(b.as_os_str()))
     });
 
-    let (mut table, trim_summary) = build_table(input_paths, trim, min_length)
-        .map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+    let check = || py.check_signals();
+    let (mut table, trim_summary) = build_table(input_paths, trim, min_length, &check)
+        // A KeyboardInterrupt from `check` goes back as itself, not a ValueError.
+        .map_err(|e| {
+            e.downcast::<PyErr>()
+                .unwrap_or_else(|e| PyValueError::new_err(format!("{e:#}")))
+        })?;
     // Only records and the arena are read from here on.
     drop(std::mem::take(&mut table.buckets));
 
@@ -1371,6 +1395,9 @@ pub fn dedupe_reads(
     let mut bases: Vec<u8> = Vec::with_capacity(300);
 
     for id in 0..table.next_id {
+        if id % CHECK_EVERY == 0 {
+            py.check_signals()?;
+        }
         let rec = table.records[id];
         let off = rec.off as usize;
         let packed = rec.len & PACKED != 0;

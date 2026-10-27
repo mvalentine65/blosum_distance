@@ -269,8 +269,9 @@ unsafe fn forward<const ROLL: bool>(dsq: &[u8], om: &OProfile, xf: &Xf, ox: &mut
             dp[pc + q * 3 + XD] = _mm256_add_ps(dcv, dp[pc + q * 3 + XD]);
             dcv = _mm256_mul_ps(dp[pc + q * 3 + XD], om.tfv[dd0 + q]);
         }
+        // 7 more passes: a delete path can cross all 8 lanes (HMMER's SSE has 4, so 3)
         if om.m < 100 {
-            for _ in 1..4 {
+            for _ in 1..8 {
                 dcv = rightshiftz(dcv);
                 for q in 0..q_ {
                     dp[pc + q * 3 + XD] = _mm256_add_ps(dcv, dp[pc + q * 3 + XD]);
@@ -278,7 +279,7 @@ unsafe fn forward<const ROLL: bool>(dsq: &[u8], om: &OProfile, xf: &Xf, ox: &mut
                 }
             }
         } else {
-            for _ in 1..4 {
+            for _ in 1..8 {
                 dcv = rightshiftz(dcv);
                 let mut cv = zerov;
                 for q in 0..q_ {
@@ -353,7 +354,8 @@ unsafe fn backward(dsq: &[u8], om: &OProfile, xf: &Xf, fwd: &mut Omx, bck: &mut 
         dp[pc + q * 3 + XD] = _mm256_add_ps(dp[pc + q * 3 + XD], dcv);
         dpv = dp[pc + q * 3 + XD];
     }
-    for _ in 1..4 {
+    // 7 more passes across the 8 lanes, as in forward
+    for _ in 1..8 {
         tp = 8 * q_ - 1;
         dcv = leftshiftz(dcv);
         for q in (0..q_).rev() {
@@ -423,7 +425,7 @@ unsafe fn backward(dsq: &[u8], om: &OProfile, xf: &Xf, fwd: &mut Omx, bck: &mut 
             dpv = dp[pc + q * 3 + XD];
             dp[pc + q * 3 + XM] = _mm256_add_ps(dp[pc + q * 3 + XM], xev);
         }
-        for _ in 1..4 {
+        for _ in 1..8 {
             dcv = leftshiftz(dcv);
             let mut tp3 = 8 * q_ - 1;
             for q in (0..q_).rev() {
@@ -911,3 +913,7 @@ pub fn fwd_bits_x(om: &OProfile, seq: &[u8], start: usize, init: Option<&XRow>, 
         ((fwdsc - nullsc) as f64 / std::f64::consts::LN_2) as f32
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/genome_avx.rs"]
+mod tests;

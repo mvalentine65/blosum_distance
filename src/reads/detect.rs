@@ -49,6 +49,19 @@ impl Default for NucleotideTree {
     }
 }
 
+// The derived drop recurses once per level, and the forward tree is as deep as
+// the longest record a seed hit, so an assembly-length record overflows the
+// stack. Unlink the nodes onto a heap stack instead.
+impl Drop for NucleotideTree {
+    fn drop(&mut self) {
+        let mut stack: Vec<Box<NucleotideNode>> =
+            self.root.children.iter_mut().filter_map(Option::take).collect();
+        while let Some(mut node) = stack.pop() {
+            stack.extend(node.children.iter_mut().filter_map(Option::take));
+        }
+    }
+}
+
 impl NucleotideTree {
     pub fn new() -> Self {
         NucleotideTree { root: Box::new(NucleotideNode::new(b'N')) }

@@ -57,3 +57,20 @@ fn mate_files_of_unequal_length_are_an_error() {
         assert!(res.is_err(), "batch {batch}");
     }
 }
+
+#[test]
+fn a_zero_length_r2_is_still_a_pair_and_drops_on_length() {
+    let d = dir("empty_r2");
+    let (r1, r2) = (d.join("lib_1.fq"), d.join("lib_2.fq"));
+    let read = "ACGTTGCAAGGTCCATTGACGATCGGATCCAAGGTTCCAAGGTTCCAAGG";
+    fastq(&r1, &[read]);
+    fastq(&r2, &[""]);
+    let got = items(&[r1, r2]).unwrap();
+    assert!(got.len() == 1 && got[0].paired && got[0].s2.is_empty());
+    let (opts, mut stats, mut scratch, mut canon) =
+        (TrimOptions::default(), TrimStats::default(), TrimScratch::default(), Vec::new());
+    // dropped with its empty mate, as an empty R1 is; the same read alone is kept
+    assert!(run_batch(&got, &opts, &mut stats, &mut scratch, &mut canon, 15).spans.is_empty());
+    let single = Item { paired: false, ..got.into_iter().next().unwrap() };
+    assert_eq!(run_batch(&[single], &opts, &mut stats, &mut scratch, &mut canon, 15).spans.len(), 1);
+}

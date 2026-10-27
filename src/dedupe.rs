@@ -458,6 +458,8 @@ struct Item {
     q1: Vec<u8>,
     s2: Vec<u8>,
     q2: Vec<u8>,
+    /// From a paired group: an empty `s2` is then a zero-length mate, not a missing one.
+    paired: bool,
 }
 
 /// Every input group as one ordered stream, so the encounter order the output
@@ -534,7 +536,7 @@ where
             let items: Vec<Item> = va
                 .into_iter()
                 .zip(vb)
-                .map(|((s1, q1), (s2, q2))| Item { s1, q1, s2, q2 })
+                .map(|((s1, q1), (s2, q2))| Item { s1, q1, s2, q2, paired: true })
                 .collect();
             if !items.is_empty() && !emit(items) {
                 return Ok(());
@@ -565,14 +567,14 @@ impl ItemStream {
                 // both halves of a fragment.
                 Some(Cursor::Paired(a, b)) => match (a.next_record()?, b.next_record()?) {
                     (Some((s1, q1)), Some((s2, q2))) => {
-                        return Ok(Some(Item { s1, q1, s2, q2 }))
+                        return Ok(Some(Item { s1, q1, s2, q2, paired: true }))
                     }
                     (None, None) => self.cur = None,
                     _ => bail!("Paired files {} and {} have different numbers of records", a.path, b.path),
                 },
                 Some(Cursor::Single(src)) => match src.next_record()? {
                     Some((s1, q1)) => {
-                        return Ok(Some(Item { s1, q1, s2: Vec::new(), q2: Vec::new() }))
+                        return Ok(Some(Item { s1, q1, s2: Vec::new(), q2: Vec::new(), paired: false }))
                     }
                     None => self.cur = None,
                 },
@@ -633,7 +635,7 @@ fn run_batch(
 ) -> Kept {
     let mut out = Kept::default();
     for it in items {
-        if it.s2.is_empty() {
+        if !it.paired {
             if let Some(r) = process_single(&it.s1, &it.q1, opts, stats, scratch) {
                 push_kept(&mut out, r.bases(), canon, min_length);
             }
@@ -731,8 +733,10 @@ fn build_table_parallel(
             opts.adapter_r1 = Some(PreparedAdapter::new(&seq));
             det1 = Some(seq);
         }
-        if staged.first().is_some_and(|p| !p.s2.is_empty()) {
-            let sample2: Vec<&[u8]> = staged.iter().map(|p| p.s2.as_slice()).collect();
+        // R2 detection runs when any staged record has a mate, on the mates alone
+        if staged.iter().any(|p| p.paired) {
+            let sample2: Vec<&[u8]> =
+                staged.iter().filter(|p| p.paired && !p.s2.is_empty()).map(|p| p.s2.as_slice()).collect();
             if let Detected::Known { seq, .. } | Detected::Novel { seq } =
                 detect_adapter(&sample2, 1)
             {
@@ -821,7 +825,7 @@ fn build_table_parallel(
                     Cursor::Single(mut src) => {
                         let mut batch = Vec::with_capacity(BATCH);
                         while let Some((s1, q1)) = src.next_record()? {
-                            batch.push(Item { s1, q1, s2: Vec::new(), q2: Vec::new() });
+                            batch.push(Item { s1, q1, s2: Vec::new(), q2: Vec::new(), paired: false });
                             if batch.len() == BATCH {
                                 let full =
                                     std::mem::replace(&mut batch, Vec::with_capacity(BATCH));

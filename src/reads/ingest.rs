@@ -166,6 +166,8 @@ struct StagedPair {
     q1: Vec<u8>,
     s2: Vec<u8>,
     q2: Vec<u8>,
+    /// Pushed as a pair: an empty `s2` is then a zero-length mate.
+    paired: bool,
 }
 
 /// Runs the trim chain over a stream of records, staging the head so adapters
@@ -221,6 +223,7 @@ impl Ingest {
             q1: q1.to_vec(),
             s2: s2.to_vec(),
             q2: q2.to_vec(),
+            paired: true,
         });
         if self.staged.len() >= DETECT_SAMPLE {
             self.arm(sink);
@@ -238,6 +241,7 @@ impl Ingest {
             q1: q.to_vec(),
             s2: Vec::new(),
             q2: Vec::new(),
+            paired: false,
         });
         if self.staged.len() >= DETECT_SAMPLE {
             self.arm(sink);
@@ -254,7 +258,8 @@ impl Ingest {
     /// Detect from the staged head, then drain it through the chain.
     fn arm(&mut self, sink: &mut impl FnMut(&[u8])) {
         let staged = std::mem::take(&mut self.staged);
-        let paired = staged.first().is_some_and(|p| !p.s2.is_empty());
+        // R2 detection runs when any staged record has a mate, on the mates alone
+        let paired = staged.iter().any(|p| p.paired);
 
         if self.opts.adapter_trimming {
             let sample1: Vec<&[u8]> = staged.iter().map(|p| p.s1.as_slice()).collect();
@@ -265,7 +270,8 @@ impl Ingest {
                 self.detected_r1 = Some(seq);
             }
             if paired {
-                let sample2: Vec<&[u8]> = staged.iter().map(|p| p.s2.as_slice()).collect();
+                let sample2: Vec<&[u8]> =
+                    staged.iter().filter(|p| p.paired && !p.s2.is_empty()).map(|p| p.s2.as_slice()).collect();
                 if let Detected::Known { seq, .. } | Detected::Novel { seq } =
                     detect_adapter(&sample2, 1)
                 {
@@ -277,7 +283,7 @@ impl Ingest {
         self.armed = true;
 
         for p in &staged {
-            if p.s2.is_empty() {
+            if !p.paired {
                 self.run_single(&p.s1, &p.q1, sink);
             } else {
                 self.run_pair(&p.s1, &p.q1, &p.s2, &p.q2, sink);

@@ -143,3 +143,34 @@ fn trimming_makes_two_reads_identical() {
     assert_eq!(kept[0], kept[1], "untrimmed these would be distinct");
     assert_eq!(kept[0], insert.to_vec());
 }
+
+/// An unpaired file that sorts ahead of the pair (fastq-dump --split-3) must not
+/// switch off R2 adapter detection for the whole library.
+#[test]
+fn r2_adapters_are_detected_when_an_unpaired_read_comes_first() {
+    const R1_ADAPTER: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+    const R2_ADAPTER: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
+    let mut x: u64 = 17;
+    let mut rand_seq = |n: usize| -> Vec<u8> {
+        (0..n).map(|_| { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); b"ACGT"[(x >> 62) as usize] }).collect()
+    };
+    let mut ing = Ingest::new(TrimOptions::default());
+    let mut sink = |_: &[u8]| {};
+    let q = vec![b'I'; 120];
+    for _ in 0..100 {
+        ing.push_single(&rand_seq(120), &q, &mut sink);
+    }
+    for _ in 0..12_000 {
+        let mut r1 = rand_seq(70);
+        r1.extend_from_slice(R1_ADAPTER);
+        r1.extend(rand_seq(120 - r1.len()));
+        let mut r2 = rand_seq(70);
+        r2.extend_from_slice(R2_ADAPTER);
+        r2.extend(rand_seq(120 - r2.len()));
+        ing.push_pair(&r1, &q, &r2, &q, &mut sink);
+    }
+    ing.finish(&mut sink);
+    let (d1, d2) = ing.detected();
+    assert!(d1.is_some_and(|s| R1_ADAPTER.starts_with(s) || s.starts_with(R1_ADAPTER)));
+    assert!(d2.is_some_and(|s| R2_ADAPTER.starts_with(s) || s.starts_with(R2_ADAPTER)), "{d2:?}");
+}

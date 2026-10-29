@@ -142,6 +142,17 @@ pub fn keep_at_frameshift(bits: f32, floor: f32) -> bool {
     bits >= floor
 }
 
+/// share of a row's coding nt its last ORF piece may hold and still go as read past a stop
+const PAST_STOP_SHARE: f64 = 0.10;
+
+/// A row's last ORF piece that meets the exon before it across an in-frame stop, with
+/// no room for an intron and no frameshift, is the gene read on past its stop codon.
+/// It goes when it holds at most PAST_STOP_SHARE of the row's nt; the row then ends at
+/// that stop (extend_ends).
+pub fn past_stop(piece_nt: i64, row_nt: i64) -> bool {
+    piece_nt as f64 <= PAST_STOP_SHARE * row_nt as f64
+}
+
 /// An internal recovered exon must fit its chain at least `min_rev` bits better
 /// than reversed. NaN: untested, kept.
 pub fn keep_against_reversal(rev: f64, min_rev: f64) -> bool {

@@ -12,7 +12,7 @@ use super::orf::{exon_is_repeat, orf_window, Aligner, OrfCache, OrfOpts};
 use super::lead::add_lead_exons;
 use super::pseudo::Pseudo;
 use super::refine::{junction_sites, start_upstream, JxSites, Refine};
-use super::gate::{keep_against_reversal, keep_at_frameshift, keep_run_piece, lead_start_reach, pays_intron};
+use super::gate::{keep_against_reversal, keep_at_frameshift, keep_run_piece, lead_start_reach, past_stop, pays_intron};
 use super::gff::write_gff;
 use super::score::{score_chain, ExonScore};
 use super::splice::{intron_charge, Params, DIS_FS, DIS_STOP, MIN_INTRON};
@@ -781,6 +781,11 @@ fn lead_junction(c: &Chain, a: &ChainExon, b: &ChainExon, sc: &[u8]) -> JxOut {
     JxOut { sites, pseudo: Pseudo::default(), status: "lead", gap: (acc_g - don_g).abs() - 1, dis: Vec::new(), stopfree: f64::NAN }
 }
 
+/// The junction's two exons meet across a strict in-frame stop, with no room for an intron and no frameshift.
+fn stop_only(r: &JxOut) -> bool {
+    r.gap < MIN_INTRON as i64 && r.dis.iter().any(|x| x.0 == DIS_STOP as usize && x.3) && !r.dis.iter().any(|x| x.0 == DIS_FS as usize)
+}
+
 fn jx_key(c: &Chain, a: &ChainExon, b: &ChainExon) -> String {
     format!("{}|{}|{}|{}|{}|{}|{}", c.model, c.scaffold, c.strand as char, a.start, a.end, b.start, b.end)
 }
@@ -1207,7 +1212,8 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
     lap("reversal gate");
     if do_fill && do_refine {
         // a weak ORF piece next to an exon in another frame is intron read as exon: the junction
-        // comes out a strict frameshift where the gene has a splice site. The piece goes.
+        // comes out a strict frameshift where the gene has a splice site. The piece goes, as
+        // does a last ORF piece the search read on past the gene's stop codon.
         refine_all(&models, &mid, o, &cs, &genome, true, false, &mut cache, None, None);
         let d = out.buf("dropped");
         for (c, &held) in cs.iter_mut().zip(&runs) {
@@ -1236,15 +1242,20 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 let e = &c.ex[j];
                 e.run && (orphan(j) || !keep_run_piece((j == 0 || clean(&c.ex[j - 1], e)) && (j + 1 == n || clean(e, &c.ex[j + 1])), whole))
             });
+            let read_past = |a: &ChainExon, b: &ChainExon| cache.get(&jx_key(c, a, b)).is_some_and(stop_only);
+            let row_nt: i64 = c.ex.iter().map(|e| e.end - e.start + 1).sum();
+            let stop_gone = n > 1 && c.ex[n - 1].src == SRC_ORF && read_past(&c.ex[n - 2], &c.ex[n - 1])
+                && past_stop(c.ex[n - 1].end - c.ex[n - 1].start + 1, row_nt);
             let gone: Vec<bool> = (0..n).map(|j| {
                 let e = &c.ex[j];
-                orphan(j) || (e.run && run_gone) || (o.orf_fs_bits > 0.0 && e.src == SRC_ORF && !keep_at_frameshift(e.bits, o.orf_fs_bits)
-                    && ((j > 0 && fs(&c.ex[j - 1], e)) || (j + 1 < n && fs(e, &c.ex[j + 1]))))
+                orphan(j) || (e.run && run_gone) || (j + 1 == n && stop_gone)
+                    || (o.orf_fs_bits > 0.0 && e.src == SRC_ORF && !keep_at_frameshift(e.bits, o.orf_fs_bits)
+                        && ((j > 0 && fs(&c.ex[j - 1], e)) || (j + 1 < n && fs(e, &c.ex[j + 1]))))
             }).collect();
             if !gone.contains(&true) { continue; }
             for (j, e) in c.ex.iter().enumerate().filter(|x| gone[x.0]) {
-                let _ = writeln!(d, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}", c.gene, c.scaffold, c.strand as char, e.start, e.end, e.k1, e.k2,
-                                 if orphan(j) { "intron" } else if e.run && run_gone { "run" } else { "fs" }, e.bits);
+                let why = if orphan(j) { "intron" } else if e.run && run_gone { "run" } else if j + 1 == n && stop_gone { "stop" } else { "fs" };
+                let _ = writeln!(d, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}", c.gene, c.scaffold, c.strand as char, e.start, e.end, e.k1, e.k2, why, e.bits);
             }
             let mut j = 0;
             c.ex.retain(|_| { j += 1; !gone[j - 1] });

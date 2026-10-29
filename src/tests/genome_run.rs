@@ -86,3 +86,24 @@ fn test_keep_low_breaks_a_tie_by_coding_order() {
         assert!(!keep_low(st, 1001, 1300, 1148, 1147));
     }
 }
+
+fn jx(gap: i64, dis: Vec<(usize, i64, i64, bool)>) -> JxOut {
+    JxOut { sites: JxSites::default(), pseudo: Pseudo::default(), status: "ok", gap, dis, stopfree: f64::NAN }
+}
+
+#[test]
+fn test_a_stop_with_no_room_for_an_intron_is_read_past() {
+    let stop = (DIS_STOP as usize, 18416355, 0, true);
+    assert!(stop_only(&jx(9, vec![stop])));
+    assert!(!stop_only(&jx(9, vec![(DIS_STOP as usize, 18416355, 0, false)])));   // not a strict stop
+    assert!(!stop_only(&jx(9, vec![stop, (DIS_FS as usize, 18416300, 1, true)])));  // a frameshift too
+    assert!(!stop_only(&jx(MIN_INTRON as i64, vec![stop])));                      // an intron fits
+    assert!(!stop_only(&jx(3, Vec::new())));
+}
+
+#[test]
+fn test_only_a_short_last_piece_goes_past_a_stop() {
+    assert!(past_stop(117, 3054));    // the elephant shark Nu tail, 3.8% of its row
+    assert!(past_stop(100, 1000));
+    assert!(!past_stop(101, 1000));
+}

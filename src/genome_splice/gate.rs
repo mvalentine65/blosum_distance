@@ -142,6 +142,18 @@ pub fn keep_at_frameshift(bits: f32, floor: f32) -> bool {
     bits >= floor
 }
 
+/// residues a hit must hold past a stop, toward the junction, before the stop can count as the gene's own
+const TAIL_MIN_RES: usize = 3;
+/// share of those residues that must match model nodes
+const TAIL_MATCHED: f64 = 0.8;
+
+/// A stop inside a profile hit, with the hit's residues past it still on the model, is in the
+/// gene: the junction keeps it rather than splicing it out. Past a stop at a hit's edge the
+/// residues are few or off the model, which is a retained piece of intron.
+pub fn real_stop(tail: usize, matched: usize) -> bool {
+    tail >= TAIL_MIN_RES && matched as f64 >= TAIL_MATCHED * tail as f64
+}
+
 /// share of a row's coding nt its last ORF piece may hold and still go as read past a stop
 const PAST_STOP_SHARE: f64 = 0.10;
 

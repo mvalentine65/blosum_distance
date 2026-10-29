@@ -107,3 +107,70 @@ fn test_only_a_short_last_piece_goes_past_a_stop() {
     assert!(past_stop(100, 1000));
     assert!(!past_stop(101, 1000));
 }
+
+#[test]
+fn test_a_stop_needs_a_matched_tail_to_be_real() {
+    assert!(real_stop(3, 3) && real_stop(10, 8));
+    assert!(!real_stop(2, 2));     // too few residues past it: a hit's edge
+    assert!(!real_stop(10, 7));    // past it the hit leaves the model
+}
+
+/// A profile of `pep` (its residue at 0.8 per node), as the ORF tests build it.
+fn straw_model(pep: &[u8]) -> Hmm {
+    const AA: &[u8; 20] = b"ACDEFGHIKLMNPQRSTVWY";
+    let nl = |p: f64| format!("{:.5}", -p.ln());
+    let row = |r: Option<u8>| AA.iter().map(|&a| nl(match r { Some(x) if x == a => 0.8, Some(_) => 0.2 / 19.0, None => 0.05 }))
+        .collect::<Vec<_>>().join(" ");
+    let tr = |last: bool| [nl(0.9), nl(0.05), if last { "*".into() } else { nl(0.05) }, nl(0.5), nl(0.5), nl(0.5), nl(0.5)].join(" ");
+    let mut s = format!("HMMER3/f\nNAME  straw\nLENG  {}\nALPH  amino\nHMM          A\n            m->m\n  COMPO   {}\n          {}\n          {}\n",
+                        pep.len(), row(None), row(None), tr(false));
+    for (k, &r) in pep.iter().enumerate() {
+        s += &format!("{:7} {} {}\n          {}\n          {}\n", k + 1, row(Some(r)), k + 1, row(None), tr(k + 1 == pep.len()));
+    }
+    s += "//\n";
+    let path = std::env::temp_dir().join(format!("stop_in_hit_test_{}.hmm", std::process::id()));
+    std::fs::write(&path, s).unwrap();
+    let h = super::super::hmm::read_hmms(path.to_str().unwrap(), 1).unwrap().remove(0);
+    let _ = std::fs::remove_file(&path);
+    h
+}
+
+fn codons(p: &[u8]) -> Vec<u8> {
+    p.iter().flat_map(|&a| match a {
+        b'A' => *b"GCT", b'C' => *b"TGT", b'D' => *b"GAT", b'E' => *b"GAA", b'F' => *b"TTT", b'G' => *b"GGT",
+        b'H' => *b"CAT", b'I' => *b"ATT", b'K' => *b"AAA", b'L' => *b"CTT", b'M' => *b"ATG", b'N' => *b"AAT",
+        b'P' => *b"CCT", b'Q' => *b"CAA", b'R' => *b"CGT", b'S' => *b"TCT", b'T' => *b"ACT", b'V' => *b"GTT",
+        b'W' => *b"TGG", _ => *b"TAT",
+    }).collect()
+}
+
+#[test]
+fn test_a_stop_inside_a_hit_is_kept_only_with_model_residues_past_it() {
+    const PEP: &[u8] = b"VMNPLDAQCNRQRNDAICVSQLKNALEIDRGILAEKPDVKIFLPFRFFVYRAEDLFQPNTYNRFL";
+    let hmm = straw_model(PEP);
+    // hit a: residues 1-50 with residue 31 a TAA stop; then 300 nt of spacer and exon b
+    let mut sc = codons(&PEP[..30]);
+    sc.extend(b"TAA");
+    sc.extend(codons(&PEP[31..50]));
+    sc.extend(std::iter::repeat_n(b'C', 300));
+    sc.extend(codons(&PEP[50..]));
+    let ex = |start: i64, end: i64, k1: i64, k2: i64, src: u8| ChainExon { start, end, k1, k2, src, codon: start, bits: 0.0, run: false, owes: false };
+    let a = ex(1, 150, 1, 50, SRC_INPUT);
+    let b = ex(451, 495, 51, 65, SRC_ORF);
+    let c = Chain { gene: "straw#0".into(), model: "straw".into(), scaffold: "s".into(), strand: b'+', klo: 1, khi: 65,
+                    flank_only: false, passive: false, imx: false, alt_of: None, rebased: None, ex: vec![a, b] };
+    let jx_at = |g: i64| Junction { status: JxStatus::Ok, s: Vec::new(), w: sc.len() as i64, lo: 0, strand: b'+', gap: 0, d: 0, axe: 0, bxs: 0,
+        res: super::super::splice::SpliceResult { dis: vec![super::super::splice::Disable { kind: DIS_STOP, pos: g - 1, n: 0, tight: true }],
+                                                 ..Default::default() } };
+    let mut al = Aligner::default();
+    // 19 residues past the stop, all on the model: the gene's own stop
+    assert!(stop_in_hit(&mut al, 0, &hmm, code(1).unwrap(), &c, &a, &b, &jx_at(91), 1, &sc));
+    // the same stop two residues before the hit's edge: a retained piece of intron
+    let short = ex(1, 99, 1, 33, SRC_INPUT);
+    let c2 = Chain { ex: vec![short, b], ..c.clone() };
+    assert!(!stop_in_hit(&mut al, 0, &hmm, code(1).unwrap(), &c2, &short, &b, &jx_at(91), 1, &sc));
+    // a stop in an exonfill piece is never kept this way
+    let orf = ex(1, 150, 1, 50, SRC_ORF);
+    let c3 = Chain { ex: vec![orf, b], ..c.clone() };
+    assert!(!stop_in_hit(&mut al, 0, &hmm, code(1).unwrap(), &c3, &orf, &b, &jx_at(91), 1, &sc));
+}

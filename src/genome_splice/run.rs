@@ -12,7 +12,7 @@ use super::orf::{exon_is_repeat, orf_window, Aligner, OrfCache, OrfOpts};
 use super::lead::add_lead_exons;
 use super::pseudo::Pseudo;
 use super::refine::{junction_sites, start_upstream, JxSites, Refine};
-use super::gate::{keep_against_reversal, keep_at_frameshift, keep_run_piece, lead_start_reach, past_stop, pays_intron};
+use super::gate::{keep_against_reversal, keep_at_frameshift, keep_run_piece, lead_start_reach, past_stop, pays_intron, real_stop};
 use super::gff::write_gff;
 use super::score::{score_chain, ExonScore};
 use super::splice::{intron_charge, Params, DIS_FS, DIS_STOP, MIN_INTRON};
@@ -786,6 +786,28 @@ fn stop_only(r: &JxOut) -> bool {
     r.gap < MIN_INTRON as i64 && r.dis.iter().any(|x| x.0 == DIS_STOP as usize && x.3) && !r.dis.iter().any(|x| x.0 == DIS_FS as usize)
 }
 
+/// The read-through path holds a stop inside one of the junction's own hits (an input exon), and the
+/// hit's residues past it, toward the junction, still match model nodes (gate::real_stop).
+#[allow(clippy::too_many_arguments)]
+fn stop_in_hit(al: &mut Aligner, hid: usize, hmm: &Hmm, code: Code, c: &Chain, a: &ChainExon, b: &ChainExon,
+               jx: &Junction, lo: i64, sc: &[u8]) -> bool {
+    let stops: Vec<i64> = jx.res.dis.iter().filter(|d| d.kind == DIS_STOP).map(|d| lo - 1 + jx.pos(d.pos)).collect();
+    for (e, up) in [(a, true), (b, false)] {
+        if e.src != SRC_INPUT || !stops.iter().any(|&g| g >= e.start && g <= e.end) { continue; }
+        let one = Chain { ex: vec![*e], ..c.clone() };
+        let es = score_chain(al, hid, hmm, code, &one, &[(e.start, e.end)], sc, true, false, |_| false).swap_remove(0);
+        if es.frame < 0 { continue; }
+        for &s0 in &es.stops {
+            if !stops.iter().any(|&g| (g - s0).abs() <= 2) { continue; }
+            let k = (((if c.strand == b'-' { e.end - s0 } else { s0 - e.start }) - es.frame) / 3) as usize;
+            // residues between the stop and the exon's edge at the junction
+            let tail = if up { &es.nodes[(k + 1).min(es.nodes.len())..] } else { &es.nodes[..k.min(es.nodes.len())] };
+            if real_stop(tail.len(), tail.iter().filter(|&&n| n > 0).count()) { return true; }
+        }
+    }
+    false
+}
+
 fn jx_key(c: &Chain, a: &ChainExon, b: &ChainExon) -> String {
     format!("{}|{}|{}|{}|{}|{}|{}", c.model, c.scaffold, c.strand as char, a.start, a.end, b.start, b.end)
 }
@@ -847,7 +869,9 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         // the stop-free path gives sites and disablements unless avoiding the
         // stops costs at least stop_margin; then the stops are real
         // nor when it trades the stops for more frameshifts
-        let pj = match &jb { Some(b) if stopfree < o.stop_margin && b.res.nfs <= jx.res.nfs => b, _ => &jx };
+        // nor when a stop lies inside a hit whose residues past it stay on the model
+        let in_hit = jb.is_some() && stop_in_hit(al, hid, &models[hid], o.prm.code, c, a, b, &jx, lo, sc);
+        let pj = match &jb { Some(b) if stopfree < o.stop_margin && b.res.nfs <= jx.res.nfs && !in_hit => b, _ => &jx };
         // a node-skipping intron over clean in-frame sequence is more likely a divergent
         // stretch of the exon: realign the junction without node-skipping introns
         // hits that abut across skipped nodes leave no room for an intron: the species

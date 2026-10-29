@@ -985,7 +985,7 @@ fn add_alternatives(cs: &mut Vec<Chain>, models: &[Hmm], mid: &HashMap<String, u
     });
     let mut log = String::from("# gene scaffold strand exon_start exon_end start end stops bits exon_bits ratio kept (hits; refined exons dropped for stops are listed as refined_stop)\n");
     let mut taken: HashMap<(String, u8), Vec<(i64, i64)>> = HashMap::new();
-    for c in cs.iter() {
+    for c in cs.iter().filter(|c| !c.passive) {
         let v = taken.entry((c.scaffold.clone(), c.strand)).or_default();
         v.extend(c.ex.iter().map(|e| (e.start, e.end)));
     }

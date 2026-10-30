@@ -238,7 +238,8 @@ pub fn chain_windows(cs: &[Chain], genome: &HashMap<String, Vec<u8>>, o: &ChainO
 /// has a twin (another such exon on the same nodes at another locus). In a
 /// module each alternative's own neighbouring exons sit next to it, outside the
 /// other alternatives' block; constitutive exons past the block stay searched.
-/// alts_only: copies are only alternatives to a or b (half of both node spans), no twins.
+/// alts_only: copies are only alternatives to a or b (half of both node spans), no twins;
+/// a or b counts together with the row's exons past it that lie in the copy's nodes (a split alternative).
 pub fn sibling_mask(cs: &[Chain], i: usize, a: &ChainExon, b: &ChainExon, gs: i64, ge: i64, alts_only: bool) -> Option<(i64, i64)> {
     let c = &cs[i];
     let same_nodes = |x: &ChainExon, e: &ChainExon| {
@@ -257,7 +258,18 @@ pub fn sibling_mask(cs: &[Chain], i: usize, a: &ChainExon, b: &ChainExon, gs: i6
         let ov = x.k2.min(e.k2) - x.k1.max(e.k1) + 1;
         2 * ov >= (x.k2 - x.k1).max(e.k2 - e.k1) + 1
     };
-    let copy = |x: &ChainExon| if alts_only { alt(x, a) || alt(x, b) } else {
+    // e and the row's run of exons on its far side (back: before it) that lie in x's nodes, as one node span
+    let unit = |e: &ChainExon, back: bool, x: &ChainExon| {
+        let mut u = *e;
+        let Some(j) = c.ex.iter().position(|y| y.start == e.start && y.end == e.end) else { return u };
+        let far: Vec<usize> = if back { (0..j).rev().collect() } else { (j + 1..c.ex.len()).collect() };
+        for y in far.iter().map(|&k| &c.ex[k]).take_while(|y| 2 * (y.k2.min(x.k2) - y.k1.max(x.k1) + 1) >= y.k2 - y.k1 + 1) {
+            u.k1 = u.k1.min(y.k1);
+            u.k2 = u.k2.max(y.k2);
+        }
+        u
+    };
+    let copy = |x: &ChainExon| if alts_only { alt(x, &unit(a, true, x)) || alt(x, &unit(b, false, x)) } else {
         same_nodes(x, a) || same_nodes(x, b) || sib.iter().any(|y| (y.end < x.start || x.end < y.start) && same_nodes(x, y))
     };
     let mut span: Option<(i64, i64)> = None;
@@ -323,3 +335,7 @@ pub fn write_chains(cs: &[Chain]) -> String {
     }
     s
 }
+
+#[cfg(test)]
+#[path = "../tests/genome_chain.rs"]
+mod tests;

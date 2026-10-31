@@ -174,3 +174,32 @@ fn test_a_stop_inside_a_hit_is_kept_only_with_model_residues_past_it() {
     let c3 = Chain { ex: vec![orf, b], ..c.clone() };
     assert!(!stop_in_hit(&mut al, 0, &hmm, code(1).unwrap(), &c3, &orf, &b, &jx_at(91), 1, &sc));
 }
+
+// The row shares b with a sibling whose alternative v and exon x lie in the row's gap; a copy of x sits at `at`
+fn sibfill_case(at: usize) -> (Vec<Chain>, HashMap<String, Vec<u8>>) {
+    let x: Vec<u8> = b"GCTGAATGGAAACACTTTGATTACATGCAAAATCGTACCGTTGAAGCTTGGAAACATTTCGACTATATGCAGAACCGCACGGTGGAA".to_vec();
+    let mut sc = vec![b'C'; 3400];
+    sc[1400..1400 + x.len()].copy_from_slice(&x);
+    sc[at..at + x.len()].copy_from_slice(&x);
+    let (a, b) = (ex(101, 400, 1, 100, SRC_INPUT), ex(3000, 3100, 150, 180, SRC_INPUT));
+    let cs = vec![
+        row("g#1", vec![a, b]),
+        row("g#1_1", vec![ex(1000, 1300, 1, 100, SRC_INPUT), ex(1401, 1400 + x.len() as i64, 101, 129, SRC_INPUT), b]),
+    ];
+    (cs, HashMap::from([("NT_033778.4".to_string(), sc)]))
+}
+
+#[test]
+fn test_sibling_fill_stays_before_the_other_alternatives() {
+    let (mut cs, g) = sibfill_case(1800);
+    sibling_fill(&mut cs, &g, &Opts::default());
+    assert_eq!(cs[0].ex.len(), 2);
+}
+
+#[test]
+fn test_sibling_fill_takes_a_copy_beside_the_rows_own_exon() {
+    let (mut cs, g) = sibfill_case(600);
+    sibling_fill(&mut cs, &g, &Opts::default());
+    assert_eq!(cs[0].ex.len(), 3);
+    assert_eq!((cs[0].ex[1].start, cs[0].ex[1].src), (601, SRC_SIBFILL));
+}

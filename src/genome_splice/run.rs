@@ -548,8 +548,8 @@ fn sibling_fill(cs: &mut [Chain], genome: &HashMap<String, Vec<u8>>, o: &Opts) -
     for c in cs.iter().filter(|c| !c.passive) {
         taken.entry((c.scaffold.as_str(), c.strand, c.model.as_str())).or_default().extend(c.ex.iter().map(|e| (e.start, e.end)));
     }
-    // (row, gap lo, gap hi, sibling, its exon)
-    let mut todo: Vec<(usize, i64, i64, usize, ChainExon)> = Vec::new();
+    // (row, gap lo, gap hi, sibling, its exon, part of the gap past the other alternatives)
+    let mut todo: Vec<(usize, i64, i64, usize, ChainExon, Option<(i64, i64)>)> = Vec::new();
     for (ci, c) in cs.iter().enumerate() {
         if c.passive || !genome.contains_key(&c.scaffold) { continue; }
         for j in 1..c.ex.len() {
@@ -562,18 +562,25 @@ fn sibling_fill(cs: &mut [Chain], genome: &HashMap<String, Vec<u8>>, o: &Opts) -
                 .flat_map(|(si, s)| s.ex.iter().map(move |x| (si, *x)))
                 .filter(|(_, x)| x.k1 >= a.k2 + 1 - SIBFILL_NODE_SLACK && x.k2 <= b.k1 - 1 + SIBFILL_NODE_SLACK && !same(x, &a) && !same(x, &b))
                 .max_by_key(|(_, x)| x.k2 - x.k1);
-            if let Some((si, x)) = sib { todo.push((ci, lo, hi, si, x)); }
+            if let Some((si, x)) = sib {
+                // the row's own exon lies beside its unshared flank, before any other alternative
+                let (sa, sb) = (cs[si].ex.iter().any(|y| same(y, &a)), cs[si].ex.iter().any(|y| same(y, &b)));
+                let past = if o.chain.siblings { sibling_mask(cs, ci, &a, &b, lo, hi, true) } else { None }
+                    .map(|(p, q)| if sa == sb { (p, q) } else if sb == (c.strand == b'+') { (p, hi) } else { (lo, q) });
+                todo.push((ci, lo, hi, si, x, past));
+            }
         }
     }
     let found: Vec<Option<(ChainExon, f32)>> = par_map(todo.len(), o.threads, |t| todo[t].2 - todo[t].1, |t, _| {
-        let (ci, lo, hi, _, x) = todo[t];
+        let (ci, lo, hi, _, x, past) = todo[t];
         let c = &cs[ci];
-        let tk = &taken[&(c.scaffold.as_str(), c.strand, c.model.as_str())];
-        seq_copy(o.prm.code, c.strand, &x, &genome[&c.scaffold], lo, hi, tk, o.alt_size)
+        let mut tk = taken[&(c.scaffold.as_str(), c.strand, c.model.as_str())].clone();
+        tk.extend(past);
+        seq_copy(o.prm.code, c.strand, &x, &genome[&c.scaffold], lo, hi, &tk, o.alt_size)
             .filter(|(e, _)| !tk.iter().any(|&(s, f)| e.start <= f && s <= e.end))
     });
     let mut log = String::new();
-    for ((ci, lo, hi, si, x), f) in todo.iter().zip(found) {
+    for ((ci, lo, hi, si, x, _), f) in todo.iter().zip(found) {
         let c = &cs[*ci];
         let got = f.as_ref().map_or("-".to_string(), |(e, m)| format!("{}-{}:{}-{}:{:.1}", e.start, e.end, e.k1, e.k2, m));
         let _ = writeln!(log, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}-{}:{}-{}\t{}", c.gene, c.scaffold, c.strand as char, lo, hi,

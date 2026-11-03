@@ -31,7 +31,9 @@ fn model(pep: &[u8]) -> Hmm {
         s += &format!("{:7} {} {}\n          {}\n          {}\n", k + 1, row(Some(r)), k + 1, row(None), tr(k + 1 == pep.len()));
     }
     s += "//\n";
-    let path = std::env::temp_dir().join(format!("orf_cache_test_{}.hmm", std::process::id()));
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("orf_cache_test_{}_{n}.hmm", std::process::id()));
     std::fs::write(&path, s).unwrap();
     let h = read_hmms(path.to_str().unwrap(), 1).unwrap().remove(0);
     let _ = std::fs::remove_file(&path);
@@ -71,4 +73,39 @@ fn test_orf_window_reads_the_same_from_its_cache() {
         assert_eq!((cache.hits(), cache.misses()), (2 * hits + misses, misses));
         assert!(plain.0.lines().count() >= 2, "{}", plain.0);
     }
+}
+
+#[test]
+fn test_tandem_array_reads_a_diverged_satellite_at_its_period() {
+    let unit = b"AAATGTAAAATGTTTTATTTACATGTTTTTGAA";
+    let mut nt: Vec<u8> = unit.iter().cycle().take(198).copied().collect();
+    for i in (5..nt.len()).step_by(7) { nt[i] = b'C'; }
+    assert_eq!(tandem_array(&nt).map(|l| l % 33), Some(0));
+}
+
+#[test]
+fn test_tandem_array_leaves_codon_bias_alone() {
+    // no repeat: each codon position leans to its own base, as coding sequence does
+    let mut x = 88172645463325252u64;
+    let nt: Vec<u8> = (0..360).map(|i| {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        if x % 8 == 0 { b"ACGT"[(x >> 8) as usize % 4] } else { b"ACG"[i % 3] }
+    }).collect();
+    assert_eq!(tandem_array(&nt), None);
+}
+
+#[test]
+fn test_tandem_array_leaves_an_at_rich_exon_alone() {
+    let nt: Vec<u8> = back(PEP);
+    assert_eq!(tandem_array(&nt), None);
+}
+
+#[test]
+fn test_tandem_keeps_a_repeat_the_model_holds_too() {
+    let pep: Vec<u8> = PEP[..11].iter().cycle().take(55).copied().collect();
+    let hmm = model(&pep);
+    let nt = back(&pep);
+    assert!(!tandem(&nt, &hmm, 1, 55));
+    let other = model(PEP);
+    assert!(tandem(&nt, &other, 1, 55));
 }

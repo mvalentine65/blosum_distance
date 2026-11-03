@@ -6,6 +6,7 @@
 
 use super::chain::{left_bound, right_bound, Chain, ChainExon, SRC_LEAD};
 use super::gate::{keep_lead, lead_fits, lead_opens, LEAD_MAX_NT, LEAD_MIN_INTRON, LEAD_WINDOW};
+use super::orf::tandem_array;
 use super::refine::Refine;
 use super::sites::{site_scores, translate, AccTable, Code};
 use std::collections::HashMap;
@@ -73,6 +74,7 @@ pub fn find_lead(code: Code, sq: &[u8], plus: bool, five: i64, f: i64, bound: i6
         // the best donor; the nearer of two that tie
         if best.is_some_and(|b| donor <= b.donor) { continue; }
         let (a, b) = (pos(us), pos(ue));
+        if tandem_array(&sq[(a.min(b) - 1) as usize..a.max(b) as usize]).is_some() { continue; }
         best = Some(Lead { start: a.min(b), end: a.max(b), atg: a, donor, acceptor, intron: ue - 1 });
     }
     best

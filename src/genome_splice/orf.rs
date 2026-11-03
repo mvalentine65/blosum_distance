@@ -241,11 +241,63 @@ pub fn is_repeat(aa: &[u8], hmm: &Hmm, k1: i64, k2: i64) -> bool {
     (n as f32) / ((b - a + 1) as f32) < REF_UNIT
 }
 
-/// is_repeat for an exon (oriented nt) in its frame with the fewest stops.
+/// is_repeat for an exon (oriented nt) in its frame with the fewest stops, or a tandem array.
 pub fn exon_is_repeat(code: Code, nt: &[u8], hmm: &Hmm, k1: i64, k2: i64) -> bool {
-    (0..3).map(|f| translate_frame(code, nt, f)).filter(|t| !t.is_empty())
+    tandem(nt, hmm, k1, k2) || (0..3).map(|f| translate_frame(code, nt, f)).filter(|t| !t.is_empty())
         .min_by_key(|t| t.iter().filter(|&&c| c == b'*').count())
         .is_some_and(|t| is_repeat(&t, hmm, k1, k2))
+}
+
+/// A tandem array matches itself this far above chance at some lag, as reads::periodicity scores it,
+const TANDEM_EXCESS: f64 = 0.4;
+/// a lag up to MAX_LAG nt with MIN_PAIRS positions compared,
+const MAX_LAG: usize = 300;
+const MIN_PAIRS: usize = 60;
+/// unless the model's consensus over its nodes repeats at that lag by this much: the gene's own repeat.
+const REF_EXCESS: f64 = 0.2;
+
+/// Best excess self-match of `s` over lags 1..=max_lag, and that lag. Chance comes from the
+/// composition at each third position, frame unknown: codon bias alone repeats at every third lag.
+fn best_lag(s: &[u8], max_lag: usize, min_pairs: usize) -> (f64, usize) {
+    let mut freq = [[0f64; 256]; 3];
+    let mut n = [0f64; 3];
+    for (i, &c) in s.iter().enumerate() { freq[i % 3][c as usize] += 1.0; n[i % 3] += 1.0; }
+    let chance = |d: usize| (0..3).map(|c| {
+        let o = (c + d) % 3;
+        (0..256).map(|b| freq[c][b] * freq[o][b]).sum::<f64>() / (n[c] * n[o])
+    }).sum::<f64>() / 3.0;
+    let e = [chance(0), chance(1), chance(2)];
+    let mut best = (f64::NEG_INFINITY, 0usize);
+    for p in 1..=max_lag.min(s.len().saturating_sub(min_pairs)) {
+        let m = s[p..].iter().zip(s).filter(|(a, b)| a == b).count();
+        let e = e[p % 3];
+        let x = if e >= 1.0 { 1.0 } else { (m as f64 / (s.len() - p) as f64 - e) / (1.0 - e) };
+        if x > best.0 { best = (x, p); }
+    }
+    best
+}
+
+/// A tandem array in `nt`, whatever its period, whatever the model holds at nodes k1..k2 aside.
+pub fn tandem_array(nt: &[u8]) -> Option<usize> {
+    let s = nt.to_ascii_uppercase();
+    let (x, lag) = best_lag(&s, MAX_LAG, MIN_PAIRS);
+    (x >= TANDEM_EXCESS).then_some(lag)
+}
+
+/// A tandem array the model's consensus at nodes k1..k2 does not share.
+pub fn tandem(nt: &[u8], hmm: &Hmm, k1: i64, k2: i64) -> bool {
+    let Some(lag) = tandem_array(nt) else { return false };
+    if lag % 3 != 0 { return true; }
+    let (a, b) = (k1.max(1) as usize, (k2.max(0) as usize).min(hmm.m));
+    if b < a { return true; }
+    let cons: Vec<u8> = (a..=b).map(|k| (0..hmm.mat[k].len()).max_by(|&x, &y| hmm.mat[k][x].total_cmp(&hmm.mat[k][y])).unwrap_or(0) as u8).collect();
+    let u = lag / 3;
+    if cons.len() < u + 10 { return true; }
+    let m = cons[u..].iter().zip(&cons).filter(|(x, y)| x == y).count() as f64 / (cons.len() - u) as f64;
+    let mut freq = [0usize; 256];
+    for &c in &cons { freq[c as usize] += 1; }
+    let e: f64 = freq.iter().map(|&c| (c as f64 / cons.len() as f64).powi(2)).sum();
+    e >= 1.0 || (m - e) / (1.0 - e) < REF_EXCESS
 }
 
 #[derive(Clone, Copy)]
@@ -351,7 +403,8 @@ pub fn orf_window(al: &mut Aligner, hmm_id: usize, hmm: &Hmm, code: Code, o: &Or
         if alo > 0 { d = d.min(if slo > alo { slo - alo } else if alo > shi { alo - shi } else { 0 }); }
         if ahi > 0 { d = d.min(if ahi > shi { ahi - shi } else if slo > ahi { slo - ahi } else { 0 }); }
         let fp: &[u8] = if o.decoy { &ra } else { aa };
-        let rep = fh.nmatch > 0 && is_repeat(&fp[(fh.rf - 1) as usize..fh.rl as usize], hmm, fh.kf as i64, fh.kl as i64);
+        let rep = fh.nmatch > 0 && (is_repeat(&fp[(fh.rf - 1) as usize..fh.rl as usize], hmm, fh.kf as i64, fh.kl as i64)
+            || (fh.nmatch >= o.minm && fh.bits - rh.bits >= o.revthr && tandem(&s[(slo - 1) as usize..shi as usize], hmm, fh.kf as i64, fh.kl as i64)));
         cands.push(Cand { slo, shi, nmatch: fh.nmatch, kf: fh.kf, kl: fh.kl, dist: d, kept: false, bits: fh.bits, margin: fh.bits - rh.bits, rep, run: false, owes: false });
     };
     for f in 0..3usize {

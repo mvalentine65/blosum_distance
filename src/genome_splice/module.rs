@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use super::chain::{Chain, ChainExon, SRC_ALT, SRC_SIBFILL};
 use super::hmm::Hmm;
-use super::orf::{is_repeat, translate_frame, Aligner};
+use super::orf::{is_repeat, tandem, translate_frame, Aligner};
 use super::sites::{revcomp, Code};
 use crate::blosum_tables::{BLOSUM, INVALID, XLAT};
 
@@ -104,7 +104,7 @@ fn scan(al: &mut Aligner, hmm: &Hmm, code: Code, strand: u8, x: &ChainExon, xlen
             let margin = fwd - al.fwd_bits(&rev);
             let dens = margin / hlen as f32;
             if dens < MIN_DENSITY || (margin < MIN_MARGIN && (margin < SHORT_MARGIN || dens < SHORT_DENSITY)) { continue; }
-            if is_repeat(hit, hmm, kf, kl) { continue; }
+            if is_repeat(hit, hmm, kf, kl) || tandem(&s[f + 3 * hs..f + 3 * he + 3], hmm, kf, kl) { continue; }
             let (o1, o2) = (f as i64 + 3 * hs as i64, f as i64 + 3 * he as i64 + 2);
             let (gs, ge) = if strand == b'-' { (hi - o2, hi - o1) } else { (lo + o1, lo + o2) };
             let dist = if ge < x.start { x.start - ge - 1 } else { gs - x.end - 1 };

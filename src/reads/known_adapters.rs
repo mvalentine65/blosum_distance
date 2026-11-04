@@ -6,8 +6,8 @@
 //!
 //! fastp iterates a `std::map<string,string>`, so it visits adapters in
 //! lexicographic order by sequence; ties in `check_known_adapters` resolve to
-//! whichever it saw first. We sort the table the same way at load so the tie
-//! break matches.
+//! whichever it saw first. The table is written out in that order and is not
+//! sorted at load, so keep entries sorted by sequence for the tie break to match.
 
 /// (sequence, name), in fastp's `std::map` iteration order.
 pub static KNOWN_ADAPTERS: &[(&[u8], &str)] = &[

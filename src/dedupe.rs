@@ -34,6 +34,17 @@ struct Bucket {
 /// `id` of an unoccupied slot. Doubles as the occupancy flag.
 const EMPTY: u32 = u32::MAX;
 
+/// Most bucket slots written up front: 2^27 slots, 1 GiB, about 94M uniques
+/// before the first grow. The record estimate counts duplicates, so past this
+/// `maybe_grow` takes over rather than paying for slots that may never be used.
+const MAX_INITIAL_BUCKETS: usize = 1 << 27;
+
+/// Most reserved up front for the arena and for records, about what those 94M
+/// uniques need. The estimate reaches tens of GiB on a large input, and a
+/// reservation the machine refuses aborts the process however few uniques it holds.
+const MAX_INITIAL_ARENA: usize = 4 << 30;
+const MAX_INITIAL_RECORDS: usize = MAX_INITIAL_BUCKETS / 10 * 7;
+
 /// How far ahead the consumer warms bucket lines.
 const PREFETCH_AHEAD: usize = 16;
 
@@ -249,10 +260,10 @@ struct DedupTable {
 impl DedupTable {
     fn with_capacity(expected_uniques: usize, expected_bytes: usize) -> Self {
         let mut cap = (expected_uniques * 10) / 7;
-        cap = cap.next_power_of_two().max(1024);
-        let arena = Vec::with_capacity(expected_bytes.max(64 * 1024 * 1024));
+        cap = cap.next_power_of_two().clamp(1024, MAX_INITIAL_BUCKETS);
+        let arena = Vec::with_capacity(expected_bytes.clamp(64 * 1024 * 1024, MAX_INITIAL_ARENA));
         advise_huge_vec(&arena);
-        let records = Vec::with_capacity(expected_uniques);
+        let records = Vec::with_capacity(expected_uniques.min(MAX_INITIAL_RECORDS));
         advise_huge_vec(&records);
         Self {
             grows: 0,

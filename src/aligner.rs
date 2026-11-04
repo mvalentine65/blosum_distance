@@ -81,24 +81,18 @@ fn write_fasta_to_writer<W: Write>(
 }
 
 fn run_command(cmd: &mut Command, name: &str) -> Result<(), String> {
-    // Default to discarding stderr; only re-run with a captured pipe if the
-    // command failed, so the happy path avoids pipe creation entirely.
-    let status = cmd
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("{} failed to start: {}", name, e))?;
-    if status.success() {
-        return Ok(());
-    }
-
+    // Capture stderr on the one run; it is small, and a failure then reports
+    // the real message and exit status without running the tool a second time.
     let output = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("{} failed to start (rerun): {}", name, e))?;
+        .map_err(|e| format!("{} failed to start: {}", name, e))?;
+    if output.status.success() {
+        return Ok(());
+    }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!("{} failed: {}", name, stderr))
+    Err(format!("{} failed ({}): {}", name, output.status, stderr))
 }
 
 /// Run bathbuild + bathalign on candidate sequences against a reference alignment.

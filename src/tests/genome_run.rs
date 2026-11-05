@@ -218,3 +218,23 @@ fn test_a_short_gap_exon_goes_in_only_where_it_restores_the_frame() {
     assert!(!fill_seg_kept(30, 24, 23, true));
     assert!(!fill_seg_kept(30, 0, 25, true));
 }
+
+#[test]
+fn test_adjacent_short_gap_exons_go_in_together_or_not_at_all() {
+    let k = |ex: &[(i64, bool)], clean: bool| fill_exons_kept(30, 24, ex, clean);
+    // Folsomia Dscam1: 23 + 25 nt; the 25-nt exon would go in alone, so the run goes in whole
+    assert_eq!(k(&[(57, true), (23, true), (25, true)], true), (vec![true, true, true], true));
+    // a run whose total breaks the frame goes in although neither exon would alone
+    assert_eq!(k(&[(13, true), (15, true)], true), (vec![true, true], true));
+    // frame-neutral run, no exon passing alone: none of it (total >= 30 is not enough)
+    assert_eq!(k(&[(18, true), (15, true)], true), (vec![false, false], false));
+    // a run of one is judged as fill_seg_kept judges it
+    assert_eq!(k(&[(25, true)], true), (vec![true], false));
+    assert_eq!(k(&[(23, true)], true), (vec![false], false));
+    // a path with a frameshift or stop: only the long exon
+    assert_eq!(k(&[(57, true), (23, true), (25, true)], false), (vec![true, false, false], false));
+    // an unusable exon (no matches or a repeat) splits runs and never goes in
+    assert_eq!(k(&[(23, true), (10, false), (25, true)], true), (vec![false, false, true], false));
+    // the rule off: the 30 nt floor only
+    assert_eq!(fill_exons_kept(30, 0, &[(23, true), (25, true), (31, true)], true), (vec![false, false, true], false));
+}

@@ -674,6 +674,37 @@ fn fill_seg_kept(min_seg: i64, short_frame_seg: i64, len: i64, clean: bool) -> b
     len >= min_seg || (short_frame_seg > 0 && len >= short_frame_seg && len % 3 != 0 && clean)
 }
 
+/// Which gap exons of a fill path go in, from each one's (length, usable: matches and not a repeat). An exon of `min_seg`
+/// or more goes in alone. Adjacent usable exons each under `min_seg` form a run, judged together: leaving out part of a
+/// run shifts the frame between its neighbours (Folsomia Dscam1: 23 + 25 nt, where the 25-nt exon went in alone). A run
+/// goes in whole when its total passes the frame rule of `fill_seg_kept` (total >= `short_frame_seg`, not a multiple of 3,
+/// clean path) or one of its exons would go in alone; otherwise none of it. A run of one is judged as before. Also returns
+/// whether a run of two or more went in.
+fn fill_exons_kept(min_seg: i64, short_frame_seg: i64, ex: &[(i64, bool)], clean: bool) -> (Vec<bool>, bool) {
+    let mut take = vec![false; ex.len()];
+    let mut multi = false;
+    let mut i = 0;
+    while i < ex.len() {
+        let (len, usable) = ex[i];
+        if !usable || len >= min_seg {
+            take[i] = usable;
+            i += 1;
+            continue;
+        }
+        let j0 = i;
+        while i < ex.len() && ex[i].1 && ex[i].0 < min_seg { i += 1; }
+        let run = &ex[j0..i];
+        let total: i64 = run.iter().map(|x| x.0).sum();
+        let frame = short_frame_seg > 0 && clean && total >= short_frame_seg && total % 3 != 0;
+        let go = frame || run.iter().any(|x| fill_seg_kept(min_seg, short_frame_seg, x.0, clean));
+        if go {
+            take[j0..i].iter_mut().for_each(|t| *t = true);
+            multi |= run.len() > 1;
+        }
+    }
+    (take, multi)
+}
+
 #[allow(clippy::too_many_arguments)]
 /// True when a and b join on their own: one exon or one clean intron, no frameshift or
 /// stop, and no model node skipped between them.
@@ -705,12 +736,18 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
         let (p, q) = (lo - 1 + jx.pos(s0), lo - 1 + jx.pos(s1));
         segs.push(format!("{}-{}", p.min(q), p.max(q)));
     }
-    let kept = e >= need && !segs.is_empty();
+    let n = res.exons.len();
+    let dna = jx.dna();
+    // a short-period repeat (e.g. (TA)n read as IYIY) is not an exon
+    let rep: Vec<bool> = res.exons.iter().enumerate().map(|(i, x)| e >= need && i > 0 && i + 1 < n
+        && exon_is_repeat(o.prm.code, &dna[x.lo as usize..=x.hi as usize], hmm, x.kf, x.kl)).collect();
+    let gaps: Vec<(i64, bool)> = (1..n.saturating_sub(1)).map(|i| (res.exons[i].hi - res.exons[i].lo + 1, res.exons[i].nmatch > 0 && !rep[i])).collect();
+    let (take, multi) = fill_exons_kept(o.min_seg, o.short_frame_seg, &gaps, clean);
+    // a run of short exons that goes in together counts as the path's long segment
+    let kept = e >= need && (!segs.is_empty() || multi);
     let _ = writeln!(wo.fills, "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, st,
                      if segs.is_empty() { "-".to_string() } else { segs.join(";") }, e, need, res.free / 2.0, res.null / 2.0, jx.gap,
                      res.nmatch, res.kf, res.kl, res.nfs, res.nstop, res.nnonc, kept as i32, jid);
-    let n = res.exons.len();
-    let dna = jx.dna();
     for (i, x) in res.exons.iter().enumerate() {
         let role = if i == 0 { "A" } else if i == n - 1 { "B" } else { "gap" };
         let (p, q) = (lo - 1 + jx.pos(x.lo), lo - 1 + jx.pos(x.hi));
@@ -718,11 +755,10 @@ fn fill_gap(al: &mut Aligner, hid: usize, hmm: &Hmm, o: &Opts, c: &Chain, a: &Ch
         let dn = if x.don >= 0 { lo - 1 + jx.pos(x.don) } else { 0 };
         let asite = if x.acc >= 1 { format!("{}{}", dna[x.acc as usize - 1] as char, dna[x.acc as usize] as char) } else { "--".into() };
         let dsite = if x.don >= 0 && x.don + 1 < jx.d { format!("{}{}", dna[x.don as usize] as char, dna[x.don as usize + 1] as char) } else { "--".into() };
-        // a short-period repeat (e.g. (TA)n read as IYIY) is not an exon
-        let kept = kept && (role != "gap" || !exon_is_repeat(o.prm.code, &dna[x.lo as usize..=x.hi as usize], hmm, x.kf, x.kl));
+        let kept = kept && !rep[i];
         let _ = writeln!(wo.exons, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", c.gene, c.scaffold, st,
                          jid, i, role, p.min(q), p.max(q), ac, dn, asite, dsite, x.phase, x.nmatch, x.kf, x.kl, kept as i32);
-        if kept && i > 0 && i < n - 1 && x.nmatch > 0 && seg_ok(x.hi - x.lo + 1) {
+        if kept && i > 0 && i < n - 1 && take[i - 1] {
             wo.pend.push((ci, ChainExon { start: p.min(q), end: p.max(q), k1: x.kf, k2: x.kl, src: SRC_SPLICE, codon: 0, bits: 0.0, run: false, owes: false }, GAP));
         }
     }

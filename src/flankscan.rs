@@ -521,7 +521,7 @@ impl SeedHits {
 /// outward plus any growth so far) on row `edge_rows[e]`; `batch(i)` returns the
 /// sample's i-th ntbatch blob. Returns each edge's growth past `bases[e]`.
 #[pyfunction]
-#[pyo3(signature = (rows, edge_rows, holds, bases, follows, rounds, batch, n_batches, seed, k, max_hits, read_agree, depth, agree, max_grow))]
+#[pyo3(signature = (rows, edge_rows, holds, bases, follows, rounds, batch, n_batches, seed, k, max_hits, read_agree, depth, agree, max_grow, jump=0.0, jump_floor=20))]
 #[allow(clippy::too_many_arguments)]
 pub fn flank_grow(
     py: Python<'_>,
@@ -540,6 +540,8 @@ pub fn flank_grow(
     depth: usize,
     agree: f64,
     max_grow: usize,
+    jump: f64,
+    jump_floor: usize,
 ) -> PyResult<Vec<String>> {
     // k-mers seen once in each row or its reverse complement: growth that reaches one has run back into the row
     let row_kmers: Vec<ahash::AHashSet<u64>> = rows
@@ -553,6 +555,8 @@ pub fn flank_grow(
         .collect();
     let mut hold: Vec<Vec<u8>> = holds.into_iter().map(|h| h.into_bytes()).collect();
     let mut live: Vec<bool> = vec![true; hold.len()];
+    // reads at each edge in its first round, against which a later jump into a repeat is judged
+    let mut first_hits: Vec<Option<usize>> = vec![None; hold.len()];
     for _ in 0..rounds {
         // seeds from each live edge's outer bases; a seed two edges share, or one edge twice, is dropped
         let mut owner: AHashMap<Vec<u8>, (usize, usize, usize)> = AHashMap::new(); // seed -> (count, edge, position)
@@ -609,6 +613,16 @@ pub fn flank_grow(
             if hits[e].len() > max_hits {
                 live[e] = false;
                 continue;
+            }
+            let n = hits[e].len();
+            match first_hits[e] {
+                None => first_hits[e] = Some(n),
+                Some(b) => {
+                    if jump > 0.0 && (n as f64) > (jump * b as f64).max((b + jump_floor) as f64) {
+                        live[e] = false;
+                        continue;
+                    }
+                }
             }
             let tails: Vec<&[u8]> = hits[e]
                 .iter()

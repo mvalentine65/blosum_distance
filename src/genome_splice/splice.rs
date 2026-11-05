@@ -40,6 +40,8 @@ const RM: usize = RING - 1;
 const TILE: usize = 32;
 // cut: spacer columns for a cut-out gap block; no splice site within WALL_SITES of them (past both PSSMs)
 const SPACER: usize = 60;
+// null_cut applies when the walled block would be at least this long
+const NULL_CUT_MIN: i64 = 300;
 const WALL_SITES: i64 = 30;
 
 #[derive(Clone, Copy)]
@@ -57,6 +59,10 @@ pub struct Params {
     pub slack: i64,
     pub null_run: bool,
     pub min_gap_nt: i64,
+    /// null run over a long barred stretch: nt kept each side of it, the rest aligned as intron only (0: whole)
+    pub null_cut: i64,
+    /// run only the null alignment (the null_cut realignment)
+    pub null_only: bool,
     /// acceptor log-odds
     pub acc: AccTable,
     /// genetic code the locus is translated with
@@ -65,7 +71,7 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Params { stop: -1000.0, fs: -28.0, skip_open: -20.0, gc_donor: GC_DONOR, w_in: 60, ext: 45, max_cells: 40_000_000, xsc: -4.0, slack: 15, null_run: true, min_gap_nt: 30, acc: acceptor_default(), code: STANDARD }
+        Params { stop: -1000.0, fs: -28.0, skip_open: -20.0, gc_donor: GC_DONOR, w_in: 60, ext: 45, max_cells: 40_000_000, xsc: -4.0, slack: 15, null_run: true, min_gap_nt: 30, null_cut: 150, null_only: false, acc: acceptor_default(), code: STANDARD }
     }
 }
 
@@ -719,6 +725,19 @@ fn splice_on(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work:
     let ins_stop = prm.stop > -100.0;
     let flo = loc.axe + prm.ext;
     let fhi = loc.bxs - prm.ext;
+    // the null run: no codon, whole or split, in the barred stretch
+    let null_kernel = |work: &mut SpliceWork, fhi: i64| -> f64 {
+        let mut ok = frame_ok(loc, flo, fhi);
+        walled(&mut ok);
+        let bar: Vec<bool> = (0..=d as i64).map(|p| p >= flo && p < fhi && !(p >= loc.axs && p < loc.axe) && !(p >= loc.bxs && p < loc.bxe)).collect();
+        kernel(&t, &ok, &in_gap, &wl, &bar, &gapb, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
+        traceback(&t, work).0
+    };
+    if prm.null_only {
+        res.null = null_kernel(work, if fhi > flo { fhi } else { flo });
+        res.free = NEG;
+        return SpliceStatus::NoPath;
+    }
     let mut ok = frame_ok(loc, 0, 0);
     walled(&mut ok);
     kernel(&t, &ok, &in_gap, &wl, &no_bar, &gapb, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
@@ -738,13 +757,20 @@ fn splice_on(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work:
             Ev::S { d, a, ph } => (d - ph..d).chain(a + 1..a + 4 - ph).any(bbar),
             _ => false,
         }) || tr.ins.iter().any(|&k| barred(k));
-        res.null = if fhi == flo || (sc > HALF && !uses) { sc } else {
-            let mut ok = frame_ok(loc, flo, fhi);
-            walled(&mut ok);
-            let bar: Vec<bool> = (0..=d as i64).map(|p| p >= flo && p < fhi && !(p >= loc.axs && p < loc.axe) && !(p >= loc.bxs && p < loc.bxe)).collect();
-            kernel(&t, &ok, &in_gap, &wl, &bar, &gapb, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
-            traceback(&t, work).0
-        };
+        // a long barred stretch holds no codon: past null_cut of its ends only an intron crosses it
+        let (c0, c1) = (flo + prm.null_cut, fhi - prm.null_cut);
+        let short_cut = fhi == flo || (sc > HALF && !uses);
+        let cutv = if !short_cut && prm.null_cut > 0 && c1 - c0 > NULL_CUT_MIN {
+            let (c0, c1) = if whi > wlo { (c0.min(wlo - WALL_SITES), c1.max(whi + WALL_SITES)) } else { (c0, c1) };
+            let mut p2 = *prm;
+            p2.null_only = true;
+            let mut tmp = SpliceResult::default();
+            match splice(hmm, &Locus { cut: Some((c0, c1)), ..*loc }, &p2, &mut tmp, work) {
+                SpliceStatus::NoPath => Some(tmp.null),
+                _ => None,
+            }
+        } else { None };
+        res.null = if short_cut { sc } else if let Some(v) = cutv { v } else { work.prepare(cells, d); null_kernel(work, fhi) };
     }
     if res.free > HALF {
         summarize(&t, loc, &tr, res);

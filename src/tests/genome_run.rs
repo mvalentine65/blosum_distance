@@ -301,3 +301,14 @@ fn test_anchor_nodes_place_no_split_codon_in_the_gap() {
     assert!(deep(&gap_nodes));
     assert!(!deep(&anchored) && anchored.free < gap_nodes.free);
 }
+
+#[test]
+fn test_the_null_run_cut_gives_the_whole_null_run() {
+    // the barred stretch is long enough to cut; whole and cut null runs agree, the micro-exon's split codons barred in both
+    use super::super::splice::Params;
+    for ak2 in [25, 26] {
+        let (whole, cut) = (split_gap_run(ak2, Params { null_cut: 0, ..Default::default() }), split_gap_run(ak2, Params::default()));
+        assert!(whole.null > -1e17 && whole.null < whole.free);
+        assert_eq!((whole.free, whole.null), (cut.free, cut.null));
+    }
+}

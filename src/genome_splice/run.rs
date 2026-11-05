@@ -164,6 +164,7 @@ impl Opts {
             "xsc" => self.prm.xsc = v,
             "keep" => self.keep = v as usize,
             "max_cells" => self.prm.max_cells = v as i64,
+            "null_cut" => self.prm.null_cut = v as i64,
             "min_strict" => self.min_strict = v as i64,
             "nosplice" => self.splice = v == 0.0,
             "min_rev" => self.min_rev = v,

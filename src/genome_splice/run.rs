@@ -1523,12 +1523,32 @@ pub fn exonfill_run(py: Python<'_>, models: &str, chains: &str, genome: &Bound<'
                 let seq = if let Ok(full) = v.extract::<String>() {
                     full.bytes().filter(|c| !c.is_ascii_whitespace()).map(|c| c.to_ascii_uppercase()).collect()
                 } else {
-                    let (len, segs): (usize, Vec<(usize, String)>) = v.extract()?;
+                    // (length, [(start, piece)]): each piece read in place (str or bytes, no owned copy) and written once
+                    // into the scaffold buffer; upper-cased only when it holds a lowercase base
+                    let t = v.cast::<pyo3::types::PyTuple>()?;
+                    let len: usize = t.get_item(0)?.extract()?;
                     let mut buf = vec![0u8; len];
-                    for (start, piece) in segs {
-                        let at = start.saturating_sub(1).min(len);
-                        let n = piece.len().min(len - at);
-                        for (b, c) in buf[at..at + n].iter_mut().zip(piece.bytes()) { *b = c.to_ascii_uppercase(); }
+                    for item in t.get_item(1)?.try_iter()? {
+                        let item = item?;
+                        let pair = item.cast::<pyo3::types::PyTuple>()?;
+                        let start: usize = pair.get_item(0)?.extract()?;
+                        let piece = pair.get_item(1)?;
+                        let fill = |bytes: &[u8], buf: &mut [u8]| {
+                            let at = start.saturating_sub(1).min(len);
+                            let n = bytes.len().min(len - at);
+                            let dst = &mut buf[at..at + n];
+                            if bytes[..n].iter().any(|c| c.is_ascii_lowercase()) {
+                                for (b, c) in dst.iter_mut().zip(&bytes[..n]) { *b = c.to_ascii_uppercase(); }
+                            } else {
+                                dst.copy_from_slice(&bytes[..n]);
+                            }
+                        };
+                        if let Ok(b) = piece.cast::<pyo3::types::PyBytes>() {
+                            fill(b.as_bytes(), &mut buf);
+                        } else {
+                            let st = piece.cast::<pyo3::types::PyString>()?;
+                            fill(st.to_str()?.as_bytes(), &mut buf);
+                        }
                     }
                     buf
                 };

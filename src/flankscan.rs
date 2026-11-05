@@ -615,11 +615,22 @@ pub fn flank_grow(
                 .filter_map(|(r, st)| overlap_tail(&hold[e], r, *st, read_agree))
                 .collect();
             let mut new = extend_core(&tails, follows[e], depth, agree);
-            let cut = windows(&new, k)
+            // growth that runs back into the row: the k-mer may start in bases earlier rounds grew,
+            // so their last k - 1 are checked with this round's
+            let from = bases[e].max(hold[e].len().saturating_sub(k - 1));
+            let old = hold[e].len() - from;
+            let mut both = hold[e][from..].to_vec();
+            both.extend_from_slice(&new);
+            let cut = windows(&both, k)
                 .into_iter()
                 .position(|w| w.is_some_and(|km| row_kmers[edge_rows[e]].contains(&km)));
             if let Some(c) = cut {
-                new.truncate(c);
+                if c < old {
+                    hold[e].truncate(from + c);
+                    live[e] = false;
+                    continue;
+                }
+                new.truncate(c - old);
             }
             if new.is_empty() {
                 live[e] = false;

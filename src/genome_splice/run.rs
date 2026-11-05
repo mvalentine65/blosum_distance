@@ -102,6 +102,12 @@ pub struct Opts {
     pub lead: bool,
     /// score each ORF once for windows sharing a node slice, and align a gap junction several windows share once
     pub cache: bool,
+    /// refine: align the intron interior beyond this many nt of each exon as intron only, when no model node lies
+    /// between the exons (refine_band_cut); 0 aligns every junction whole
+    pub refine_band: i64,
+    /// a banded junction whose path moves either exon's end more than this many nt from its input coordinate, or
+    /// gives no sites, is aligned whole again (an exon inside the walled intron may have taken it); -1 never
+    pub refine_band_tol: i64,
     pub threads: usize,
 }
 
@@ -111,7 +117,7 @@ impl Default for Opts {
             orf: OrfOpts { margin: 5, min_aa: 10, thr: 1.0, near: 100, revthr: 3.0, minm: 12, all: false, decoy: false, overlap: 0, anchored: false, rank: false, runs: true },
             chain: ChainOpts { min_gap: 10, max_gap: 1000, max_end: 250, flank: 15000, share: true, siblings: true },
             prm: Params::default(),
-            fill_margin: -6.3, min_seg: 30, short_frame_seg: 24, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, alt_score_ratio: 0.15, alt_min_exon_bits: 10.0, sibfill: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true, lead: true, cache: true,
+            fill_margin: -6.3, min_seg: 30, short_frame_seg: 24, keep: 30, min_strict: 2, splice: true, min_rev: 0.0, orf_fs_bits: 7.0, ends: true, score_full: false, stop_sites: true, stop_margin: f64::INFINITY, join: true, flank_rounds: 3, module: true, alt_size: 0.75, alt_nodes_large: 0.75, alt_refined: true, alt_score_ratio: 0.15, alt_min_exon_bits: 10.0, sibfill: true, refine_stop: -4.0, refine_fs: f64::NAN, split_fs: true, lead: true, cache: true, refine_band: 1000, refine_band_tol: 3,
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
@@ -174,6 +180,8 @@ impl Opts {
             "gc_donor" => self.prm.gc_donor = v,
             "cpu" => self.threads = (v as usize).max(1),
             "cache" => self.cache = v != 0.0,
+            "refine_band" => self.refine_band = v as i64,
+            "refine_band_tol" => self.refine_band_tol = v as i64,
             "table" => self.prm.code = code(v as u8).ok_or_else(|| format!("unknown NCBI table {v}"))?,
             _ => return Err(format!("unknown option '{k}'")),
         }
@@ -863,6 +871,14 @@ fn stop_in_hit(al: &mut Aligner, hid: usize, hmm: &Hmm, code: Code, c: &Chain, a
     false
 }
 
+/// The gap gs..ge (genomic) between exons a and b, less f nt at each end, to align as intron only: when no model
+/// node lies between a and b and the gap leaves room for a wall; `None` otherwise (and when f is 0).
+pub(crate) fn refine_band_cut(a: &ChainExon, b: &ChainExon, gs: i64, ge: i64, f: i64) -> Option<(i64, i64)> {
+    let (first, second) = if a.k1 <= b.k1 { (a, b) } else { (b, a) };
+    if f <= 0 || second.k1 - first.k2 - 1 > 0 || ge - gs + 1 <= 2 * f + 200 { return None; }
+    Some((gs + f, ge - f))
+}
+
 fn jx_key(c: &Chain, a: &ChainExon, b: &ChainExon) -> String {
     format!("{}|{}|{}|{}|{}|{}|{}", c.model, c.scaffold, c.strand as char, a.start, a.end, b.start, b.end)
 }
@@ -913,39 +929,53 @@ fn refine_all(models: &[Hmm], mid: &HashMap<String, usize>, o: &Opts, cs: &[Chai
         let seq = &sc[(lo - 1) as usize..hi as usize];
         // other isoforms' alternatives to a or b in the gap are aligned as intron only
         let (gs, ge) = (a.end.min(b.end) + 1, a.start.max(b.start) - 1);
-        let cut = if o.chain.siblings { sibling_mask(cs, *ci, a, b, gs, ge, true) } else { None }.map(|(x, y)| (x - lo + 1, y - lo + 1));
-        let run = |al: &mut Aligner, p: &Params| junction(al, hid, &models[hid], p, o.keep, seq, c.strand,
-                                                          a.k1, a.k2, a.start - lo + 1, a.end - lo + 1, b.k1, b.k2, b.start - lo + 1, b.end - lo + 1, cut);
-        let jx = run(al, &prm);
-        // a permissive path with no stop is also the best stop-free one
-        let has_stop = jx.status == JxStatus::Ok && jx.res.dis.iter().any(|d| d.kind == DIS_STOP);
-        let jb = (o.stop_sites && has_stop).then(|| run(al, &bar)).filter(|b| b.status == JxStatus::Ok);
-        let stopfree = jb.as_ref().map_or(f64::NAN, |b| jx.res.free - b.res.free);
-        // the stop-free path gives sites and disablements unless avoiding the
-        // stops costs at least stop_margin; then the stops are real
-        // nor when it trades the stops for more frameshifts
-        // nor when a stop lies inside a hit whose residues past it stay on the model
-        let in_hit = jb.is_some() && stop_in_hit(al, hid, &models[hid], o.prm.code, c, a, b, &jx, lo, sc);
-        let pj = match &jb { Some(b) if stopfree < o.stop_margin && b.res.nfs <= jx.res.nfs && !in_hit => b, _ => &jx };
-        // a node-skipping intron over clean in-frame sequence is more likely a divergent
-        // stretch of the exon: realign the junction without node-skipping introns
-        // hits that abut across skipped nodes leave no room for an intron: the species
-        // lacks those nodes, and a skipping intron there cuts the exon (a frameshift may remain)
-        let abut = pj.status == JxStatus::Ok && pj.gap < MIN_INTRON as i64 && b.k1 - a.k2 - 1 >= FAKE_CUT_SKIP
-            && pj.res.exons.windows(2).any(|w| w[1].nmatch > 0 && w[0].nmatch > 0 && w[1].kf - w[0].kl - 1 >= FAKE_CUT_SKIP);
-        let jc = (pj.status == JxStatus::Ok && (abut || fake_cut(o.prm.code, pj))).then(|| {
-            let mut p2 = if std::ptr::eq(pj, &jx) { prm } else { bar };
-            p2.skip_open = -1.0e6;
-            run(al, &p2)
-        }).filter(|c| c.status == JxStatus::Ok && (abut || c.res.nfs <= pj.res.nfs) && c.res.nstop <= pj.res.nstop);
-        let pj = jc.as_ref().unwrap_or(pj);
-        let sites = junction_sites(pj, lo, o.stop_sites);
-        let (mut pseudo, mut dis) = (Pseudo::default(), Vec::new());
-        if pj.status == JxStatus::Ok {
-            pseudo = Pseudo::count(&pj.res);
-            dis = pj.res.dis.iter().map(|d| (d.kind as usize, lo - 1 + pj.pos(d.pos), d.n as i64, d.tight)).collect();
+        let sib = if o.chain.siblings { sibling_mask(cs, *ci, a, b, gs, ge, true) } else { None };
+        let local = |x: Option<(i64, i64)>| x.map(|(x, y)| (x - lo + 1, y - lo + 1));
+        // the whole junction for one intron-only block (the sibling mask, the band or both)
+        let solve = |al: &mut Aligner, cut: Option<(i64, i64)>| -> JxOut {
+            let run = |al: &mut Aligner, p: &Params| junction(al, hid, &models[hid], p, o.keep, seq, c.strand,
+                                                              a.k1, a.k2, a.start - lo + 1, a.end - lo + 1, b.k1, b.k2, b.start - lo + 1, b.end - lo + 1, cut);
+            let jx = run(al, &prm);
+            // a permissive path with no stop is also the best stop-free one
+            let has_stop = jx.status == JxStatus::Ok && jx.res.dis.iter().any(|d| d.kind == DIS_STOP);
+            let jb = (o.stop_sites && has_stop).then(|| run(al, &bar)).filter(|b| b.status == JxStatus::Ok);
+            let stopfree = jb.as_ref().map_or(f64::NAN, |b| jx.res.free - b.res.free);
+            // the stop-free path gives sites and disablements unless avoiding the
+            // stops costs at least stop_margin; then the stops are real
+            // nor when it trades the stops for more frameshifts
+            // nor when a stop lies inside a hit whose residues past it stay on the model
+            let in_hit = jb.is_some() && stop_in_hit(al, hid, &models[hid], o.prm.code, c, a, b, &jx, lo, sc);
+            let pj = match &jb { Some(b) if stopfree < o.stop_margin && b.res.nfs <= jx.res.nfs && !in_hit => b, _ => &jx };
+            // a node-skipping intron over clean in-frame sequence is more likely a divergent
+            // stretch of the exon: realign the junction without node-skipping introns
+            // hits that abut across skipped nodes leave no room for an intron: the species
+            // lacks those nodes, and a skipping intron there cuts the exon (a frameshift may remain)
+            let abut = pj.status == JxStatus::Ok && pj.gap < MIN_INTRON as i64 && b.k1 - a.k2 - 1 >= FAKE_CUT_SKIP
+                && pj.res.exons.windows(2).any(|w| w[1].nmatch > 0 && w[0].nmatch > 0 && w[1].kf - w[0].kl - 1 >= FAKE_CUT_SKIP);
+            let jc = (pj.status == JxStatus::Ok && (abut || fake_cut(o.prm.code, pj))).then(|| {
+                let mut p2 = if std::ptr::eq(pj, &jx) { prm } else { bar };
+                p2.skip_open = -1.0e6;
+                run(al, &p2)
+            }).filter(|c| c.status == JxStatus::Ok && (abut || c.res.nfs <= pj.res.nfs) && c.res.nstop <= pj.res.nstop);
+            let pj = jc.as_ref().unwrap_or(pj);
+            let sites = junction_sites(pj, lo, o.stop_sites);
+            let (mut pseudo, mut dis) = (Pseudo::default(), Vec::new());
+            if pj.status == JxStatus::Ok {
+                pseudo = Pseudo::count(&pj.res);
+                dis = pj.res.dis.iter().map(|d| (d.kind as usize, lo - 1 + pj.pos(d.pos), d.n as i64, d.tight)).collect();
+            }
+            JxOut { sites, pseudo, status: jx.status.name(), gap: jx.gap, dis, stopfree }
+        };
+        // a long intron with no exon missing between a and b: only its ends hold the sites
+        let Some(bd) = refine_band_cut(a, b, gs, ge, o.refine_band) else { return solve(al, local(sib)) };
+        let r = solve(al, local(Some(sib.map_or(bd, |x| (x.0.min(bd.0), x.1.max(bd.1))))));
+        if o.refine_band_tol >= 0 {
+            let (don_in, acc_in) = if c.strand == b'+' { (a.end, b.start) } else { (a.start, b.end) };
+            if !r.sites.ok || (r.sites.don_g - don_in).abs() > o.refine_band_tol || (r.sites.acc_g - acc_in).abs() > o.refine_band_tol {
+                return solve(al, local(sib));
+            }
         }
-        JxOut { sites, pseudo, status: jx.status.name(), gap: jx.gap, dis, stopfree }
+        r
     });
     for (t, r) in todo.iter().zip(res) { cache.insert(uniq[*t].3.clone(), r); }
     let mut rf = Refine::new(cs);

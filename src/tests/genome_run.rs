@@ -238,3 +238,14 @@ fn test_adjacent_short_gap_exons_go_in_together_or_not_at_all() {
     // the rule off: the 30 nt floor only
     assert_eq!(fill_exons_kept(30, 0, &[(23, true), (25, true), (31, true)], true), (vec![false, false, true], false));
 }
+
+#[test]
+fn test_refine_band_cut_walls_only_a_long_gap_with_no_node_missing() {
+    let ex = |start: i64, end: i64, k1: i64, k2: i64| ChainExon { start, end, k1, k2, src: SRC_INPUT, codon: 0, bits: 0.0, run: false, owes: false };
+    let (a, b) = (ex(1000, 1100, 1, 34), ex(20000, 20100, 35, 68));
+    assert_eq!(refine_band_cut(&a, &b, 1101, 19999, 1000), Some((2101, 18999)));
+    assert_eq!(refine_band_cut(&b, &a, 1101, 19999, 1000), Some((2101, 18999)));
+    assert_eq!(refine_band_cut(&a, &b, 1101, 19999, 0), None);                                // off
+    assert_eq!(refine_band_cut(&a, &ex(20000, 20100, 40, 70), 1101, 19999, 1000), None);   // nodes 35-39 missing: an exon may lie inside
+    assert_eq!(refine_band_cut(&a, &ex(3000, 3100, 35, 68), 1101, 2999, 1000), None);      // too short for a wall
+}

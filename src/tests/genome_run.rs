@@ -128,7 +128,10 @@ fn straw_model(pep: &[u8]) -> Hmm {
         s += &format!("{:7} {} {}\n          {}\n          {}\n", k + 1, row(Some(r)), k + 1, row(None), tr(k + 1 == pep.len()));
     }
     s += "//\n";
-    let path = std::env::temp_dir().join(format!("stop_in_hit_test_{}.hmm", std::process::id()));
+    // one file per call: tests run in parallel
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("stop_in_hit_test_{}_{n}.hmm", std::process::id()));
     std::fs::write(&path, s).unwrap();
     let h = super::super::hmm::read_hmms(path.to_str().unwrap(), 1).unwrap().remove(0);
     let _ = std::fs::remove_file(&path);
@@ -248,4 +251,53 @@ fn test_refine_band_cut_walls_only_a_long_gap_with_no_node_missing() {
     assert_eq!(refine_band_cut(&a, &b, 1101, 19999, 0), None);                                // off
     assert_eq!(refine_band_cut(&a, &ex(20000, 20100, 40, 70), 1101, 19999, 1000), None);   // nodes 35-39 missing: an exon may lie inside
     assert_eq!(refine_band_cut(&a, &ex(3000, 3100, 35, 68), 1101, 2999, 1000), None);      // too short for a wall
+}
+
+// Nodes 26-27 sit only in split codons around a 3-nt micro-exon deep in the gap: anchor A (nodes 1-25), 2 bases of node 26's
+// codon and a donor; deep in the gap an acceptor, node 26's third base and 2 bases of node 27's codon, a donor; then B's
+// acceptor, node 27's third base and anchor B (nodes 28-65).
+fn split_gap_locus() -> (Hmm, Vec<u8>, i64, i64) {
+    const PEP: &[u8] = b"VMNPLDAQCNRQRNDAICVSQLKNALEIDRGILAEKPDVKIFLPFRFFVYRAEDLFQPNTYNRFL";
+    let hmm = straw_model(PEP);
+    let mut x: u64 = 12345;
+    let mut filler = |n: usize| -> Vec<u8> {
+        (0..n).map(|_| { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); b"ACGT"[(x >> 33) as usize % 4] }).collect()
+    };
+    let (c26, c27) = (codons(&PEP[25..26]), codons(&PEP[26..27]));
+    let acc = b"TTTCTTTTCTTTTTCCTTTCAG";
+    let mut s = codons(&PEP[..25]);
+    let axe = s.len() as i64;
+    s.extend(&c26[..2]); s.extend(b"GTAAGTAT"); s.extend(filler(600));
+    s.extend(acc); s.push(c26[2]); s.extend(&c27[..2]); s.extend(b"GTAAGTAT"); s.extend(filler(600));
+    s.extend(acc); s.push(c27[2]);
+    let bxs = s.len() as i64;
+    s.extend(codons(&PEP[27..]));
+    (hmm, s, axe, bxs)
+}
+
+fn split_gap_run(ak2: usize, prm: super::super::splice::Params) -> super::super::splice::SpliceResult {
+    use super::super::splice::{splice, Locus, SpliceResult, SpliceWork};
+    let (hmm, s, axe, bxs) = split_gap_locus();
+    let loc = Locus { dna: &s, axs: 0, axe, bxs, bxe: s.len() as i64, afo: 0, bfo: 0, k1: 1, k2: 65, ak2, bk1: 28, cut: None };
+    let mut r = SpliceResult::default();
+    splice(&hmm, &loc, &prm, &mut r, &mut SpliceWork::default());
+    r
+}
+
+#[test]
+fn test_a_split_codon_deep_in_the_gap_is_barred_from_the_null_run() {
+    // the free path uses no whole codon in the gap, only the micro-exon's split codons: the null run must not take them
+    let r = split_gap_run(25, super::super::splice::Params::default());
+    assert!(r.free > -1e17 && r.null < r.free);
+}
+
+#[test]
+fn test_anchor_nodes_place_no_split_codon_in_the_gap() {
+    let (_, _, axe, bxs) = split_gap_locus();
+    let prm = |slack: i64| super::super::splice::Params { slack, null_run: false, ..Default::default() };
+    // with no slack and anchor A ending at node 27, nodes 26-27 are anchor nodes: their split codons may not use gap bases
+    let (gap_nodes, anchored) = (split_gap_run(25, prm(15)), split_gap_run(27, prm(0)));
+    let deep = |r: &super::super::splice::SpliceResult| r.exons.iter().any(|e| e.lo > axe + 45 && e.hi < bxs - 45);
+    assert!(deep(&gap_nodes));
+    assert!(!deep(&anchored) && anchored.free < gap_nodes.free);
 }

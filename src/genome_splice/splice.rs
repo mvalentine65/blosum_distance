@@ -311,31 +311,32 @@ unsafe fn fold_avx<const N: usize>(o: &[f64; N], od: &[i32; N], a: f64, em: &[f6
 /// at each acceptor the row folds those into h1/h2, scored with the next node.
 /// Every row buffer and pointer word is written once per cell.
 #[allow(clippy::too_many_arguments)]
-fn kernel(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
+fn kernel(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[bool], bar: &[bool], gapb: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
     #[cfg(target_arch = "x86_64")]
     if super::avx::available() {
         // same code, compiled for AVX2; plain adds and compares, so results match
-        return unsafe { kernel_avx2(t, ok, in_gap, wl, ra, rb, fs, skip_open, ins_stop, p) };
+        return unsafe { kernel_avx2(t, ok, in_gap, wl, bar, gapb, ra, rb, fs, skip_open, ins_stop, p) };
     }
-    kernel_body::<false>(t, ok, in_gap, wl, ra, rb, fs, skip_open, ins_stop, p)
+    kernel_body::<false>(t, ok, in_gap, wl, bar, gapb, ra, rb, fs, skip_open, ins_stop, p)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn kernel_avx2(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
-    kernel_body::<true>(t, ok, in_gap, wl, ra, rb, fs, skip_open, ins_stop, p)
+unsafe fn kernel_avx2(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[bool], bar: &[bool], gapb: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
+    kernel_body::<true>(t, ok, in_gap, wl, bar, gapb, ra, rb, fs, skip_open, ins_stop, p)
 }
 
-/// wl: bases of the cut wall, which only an intron may consume
+/// wl: bases of the cut wall, which only an intron may consume; bar: bases no codon may use (the null run's barred
+/// stretch); gapb: gap bases, which anchor nodes' codons may not use. Split codons obey bar and gapb as whole codons do.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
+fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[bool], bar: &[bool], gapb: &[bool], ra: i64, rb: i64, fs: f64, skip_open: f64, ins_stop: bool, p: &mut SpliceWork) {
     let (lp, d) = (t.lp, t.d);
     let d1 = d + 1;
     let (l_, ls) = (MIN_INTRON as i64, SKIP_INTRON as i64);
     let (neg, half) = (NEG, HALF);
-    assert!(ok.len() == d1 && in_gap.len() == d1 && wl.len() == d1 && t.codaa.len() == d1 && t.tb.len() == d1 && t.don.len() == d && t.acc.len() == d);
+    assert!(ok.len() == d1 && in_gap.len() == d1 && wl.len() == d1 && bar.len() == d1 && gapb.len() == d1 && t.codaa.len() == d1 && t.tb.len() == d1 && t.don.len() == d && t.acc.len() == d);
     assert!(p.ptr.len() >= (lp + 1) * d1 && p.md.len() >= (lp + 1) * d1 && p.last.len() >= d1);
     // Row state lives in per-row rings of RING columns; the fill runs in
     // column tiles, all rows per tile, so long loci stay in cache. Every read
@@ -369,11 +370,14 @@ fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[
             let (t_mm, t_mi, t_ym, t_yy, t_xm) = (t.t[0][r], t.t[1][r], t.t[3][r], t.t[4][r], t.t[5][r]);
             let emj = if r > 0 { &t.em[r - 1] } else { &t.em[0] };
             let anchor_row = (r as i64) <= ra || (r as i64) >= rb;
+            // split codons opened or folded in this row are matched by node r+1
+            let next_anchor = ((r + 1) as i64) <= ra || ((r + 1) as i64) >= rb;
             let (t_mx, t_xx) = if r > 0 { (t.t[2][r - 1], t.t[6][r - 1]) } else { (neg, neg) };
             let (mut o1, mut o1d, mut o2, mut o2d) = ost[r];
 
             for k in k0..k1 {
                 let q = ro + k;
+                let free = |p: usize| !g!(bar, p) && !(next_anchor && g!(gapb, p));
                 let mut w: u32 = 0;
                 let ck = g!(codaa, k);
                 let cod_ok = k >= 3 && ck >= 0 && g!(ok, k) && !(anchor_row && g!(in_gap, k));
@@ -474,8 +478,8 @@ fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[
                 if r == lp { s!(last, k, if bi > half { bi } else { neg }); }
                 let (mut e1v, mut e2v) = (neg, neg);
                 if dk > half {
-                    if k >= 1 && g!(tb, k - 1) < 4 && g!(bin, cr + ((k - 1) & RM)) > half { e1v = g!(bin, cr + ((k - 1) & RM)) + dk; }
-                    if k >= 2 && g!(tb, k - 2) < 4 && g!(tb, k - 1) < 4 && g!(bin, cr + ((k - 2) & RM)) > half { e2v = g!(bin, cr + ((k - 2) & RM)) + dk; }
+                    if k >= 1 && g!(tb, k - 1) < 4 && free(k - 1) && g!(bin, cr + ((k - 1) & RM)) > half { e1v = g!(bin, cr + ((k - 1) & RM)) + dk; }
+                    if k >= 2 && g!(tb, k - 2) < 4 && g!(tb, k - 1) < 4 && free(k - 2) && free(k - 1) && g!(bin, cr + ((k - 2) & RM)) > half { e2v = g!(bin, cr + ((k - 2) & RM)) + dk; }
                 }
                 s!(e1, cr + ((k) & RM), e1v);
                 s!(e2, cr + ((k) & RM), e2v);
@@ -493,15 +497,16 @@ fn kernel_body<const AVX: bool>(t: &Tables, ok: &[bool], in_gap: &[bool], wl: &[
                         if v2 > half { let c = g!(tb, du - 2) as usize * 4 + g!(tb, du - 1) as usize; if v2 > o2[c] { o2[c] = v2; o2d[c] = dd as i32; } }
                     }
                     let ak0 = g!(acc, k);
-                    if r < lp && ak0 > half && g!(tb, k + 1) < 4 {
-                        if k + 2 <= d && g!(tb, k + 2) < 4 {
+                    if r < lp && ak0 > half && g!(tb, k + 1) < 4 && free(k + 1) {
+                        let ok1 = k + 2 <= d && g!(tb, k + 2) < 4 && free(k + 2);
+                        if ok1 {
                             let x = g!(tb, k + 1) as usize * 4 + g!(tb, k + 2) as usize;
                             (h1v, h1d) = fold_any(AVX, &o1, &o1d, ak0, &em12[r][x * 4..64]);
                         }
                         let y = g!(tb, k + 1) as usize;
                         (h2v, h2d) = fold_any(AVX, &o2, &o2d, ak0, &em12[r][64 + y * 16..]);
                         // a node-skipping split intron; its codon is unscored, -2 marks it for the traceback
-                        if k + 2 <= d && g!(tb, k + 2) < 4 && il1v > half && il1v + ak0 > h1v { h1v = il1v + ak0; h1d = -2; }
+                        if ok1 && il1v > half && il1v + ak0 > h1v { h1v = il1v + ak0; h1d = -2; }
                         if il2v > half && il2v + ak0 > h2v { h2v = il2v + ak0; h2d = -2; }
                     }
                 }
@@ -705,6 +710,8 @@ fn splice_on(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work:
     let ra = (loc.ak2 as i64 - loc.k1 as i64 + 1) - prm.slack;
     let rb = (loc.bk1 as i64 - loc.k1 as i64 + 1) + prm.slack;
     let in_gap: Vec<bool> = (0..=d as i64).map(|k| k >= 3 && k - 3 >= loc.axe && k - 3 < loc.bxs).collect();
+    let gapb: Vec<bool> = (0..=d as i64).map(|p| p >= loc.axe && p < loc.bxs).collect();
+    let no_bar = vec![false; d + 1];
     let (wlo, whi) = wall.unwrap_or((0, 0));
     let wl: Vec<bool> = (0..=d as i64).map(|k| k >= wlo && k < whi).collect();
     // codon ending at k covers bases k-3..k
@@ -714,7 +721,7 @@ fn splice_on(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work:
     let fhi = loc.bxs - prm.ext;
     let mut ok = frame_ok(loc, 0, 0);
     walled(&mut ok);
-    kernel(&t, &ok, &in_gap, &wl, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
+    kernel(&t, &ok, &in_gap, &wl, &no_bar, &gapb, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
     let (sc, tr) = traceback(&t, work);
     res.free = sc;
     if prm.null_run {
@@ -724,11 +731,18 @@ fn splice_on(hmm: &Hmm, loc: &Locus, prm: &Params, res: &mut SpliceResult, work:
             let x = k as i64 - 3;
             x >= flo && x < fhi && !(x >= loc.axs && x < loc.axe) && !(x >= loc.bxs && x < loc.bxe)
         };
-        let uses = tr.ev.iter().any(|e| matches!(*e, Ev::M { k, .. } if barred(k))) || tr.ins.iter().any(|&k| barred(k));
+        let bbar = |p: usize| barred(p + 3);
+        let uses = tr.ev.iter().any(|e| match *e {
+            Ev::M { k, .. } => barred(k),
+            // a split codon's bases: ph before the donor, 3 - ph after the acceptor
+            Ev::S { d, a, ph } => (d - ph..d).chain(a + 1..a + 4 - ph).any(bbar),
+            _ => false,
+        }) || tr.ins.iter().any(|&k| barred(k));
         res.null = if fhi == flo || (sc > HALF && !uses) { sc } else {
             let mut ok = frame_ok(loc, flo, fhi);
             walled(&mut ok);
-            kernel(&t, &ok, &in_gap, &wl, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
+            let bar: Vec<bool> = (0..=d as i64).map(|p| p >= flo && p < fhi && !(p >= loc.axs && p < loc.axe) && !(p >= loc.bxs && p < loc.bxe)).collect();
+            kernel(&t, &ok, &in_gap, &wl, &bar, &gapb, ra, rb, prm.fs, prm.skip_open, ins_stop, work);
             traceback(&t, work).0
         };
     }

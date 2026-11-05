@@ -203,3 +203,18 @@ fn test_sibling_fill_takes_a_copy_beside_the_rows_own_exon() {
     assert_eq!(cs[0].ex.len(), 3);
     assert_eq!((cs[0].ex[1].start, cs[0].ex[1].src), (601, SRC_SIBFILL));
 }
+
+#[test]
+fn test_a_short_gap_exon_goes_in_only_where_it_restores_the_frame() {
+    // the default 30 nt floor, unchanged
+    assert!(fill_seg_kept(30, 24, 30, false));
+    // 25 nt (not a multiple of 3) on a clean path
+    assert!(fill_seg_kept(30, 24, 25, true));
+    // 24 nt is a multiple of 3: leaving it out keeps the frame
+    assert!(!fill_seg_kept(30, 24, 24, true));
+    // a path with a frameshift or stop
+    assert!(!fill_seg_kept(30, 24, 25, false));
+    // under the floor, or the rule off
+    assert!(!fill_seg_kept(30, 24, 23, true));
+    assert!(!fill_seg_kept(30, 0, 25, true));
+}

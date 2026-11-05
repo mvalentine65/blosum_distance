@@ -133,6 +133,26 @@ impl<K: std::hash::Hash + Eq + Clone> Ordered<K> {
 type Edges = Vec<((String, i64), Vec<String>)>;
 type Whole = Vec<(i64, Vec<String>)>;
 
+/// flanks.fit_junction: the intron that, written after row base `p`, gives back the read. The read holds
+/// seq[..=p] + piece + seq[q..]; the row is written as seq[..=p] + intron + seq[p + 1..]. Junction bases both
+/// exons share move `q`: with q <= p the read holds seq[q..=p] again after the piece; with q > p + 1 the row holds
+/// bases the read lacks, removed from the piece's end when it ends with them. None when it does not.
+fn fit_junction(piece: &[u8], seq: &[u8], p: i64, q: i64) -> Option<Vec<u8>> {
+    if q == p + 1 {
+        return Some(piece.to_vec());
+    }
+    if q <= p {
+        let mut out = piece.to_vec();
+        out.extend_from_slice(&seq[q as usize..=p as usize]);
+        return Some(out);
+    }
+    let extra = &seq[p as usize + 1..q as usize];
+    if piece.len() > extra.len() && piece.ends_with(extra) {
+        return Some(piece[..piece.len() - extra.len()].to_vec());
+    }
+    None
+}
+
 fn strings(v: Vec<Vec<u8>>) -> Vec<String> {
     v.into_iter().map(|p| String::from_utf8_lossy(&p).into_owned()).collect()
 }
@@ -215,7 +235,11 @@ pub fn flank_first_pass(
                         edges.push((b'o', last), piece.to_vec());
                     }
                 } else if 0 < a && b < r.len() && (0..=3).contains(&(pos[b] - pos[a - 1])) {
-                    whole.push(pos[a - 1], piece.to_vec());
+                    if let Some(fit) = fit_junction(piece, seq, pos[a - 1], pos[b]) {
+                        if fit.len() >= min_piece {
+                            whole.push(pos[a - 1], fit);
+                        }
+                    }
                 }
             }
         }

@@ -177,7 +177,7 @@ impl Refine {
             };
             let stop = |x: &[u8; 3]| translate(code, x) == b'*';
             let covered = covered_nodes(c, m);
-            let end = |short: i64| End { short, covered, m, exons: n, lone: c.passive };
+            let end = |short: i64| End { short, covered, m };
             // a lead exon already starts on its own start codon
             if let (false, Some(reach)) = (c.ex[0].src == SRC_LEAD, start_reach(&end(c.ex[0].k1 - 1))) {
                 let (a, b) = self.span(c, i, 0);

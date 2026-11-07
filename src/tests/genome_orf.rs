@@ -46,7 +46,7 @@ fn search(al: &mut Aligner, hmm: &Hmm, w: &[u8], strand: u8, cache: Option<&OrfC
                       overlap: 0, anchored: false, rank: false, runs: true };
     let (mut out, mut kept) = (String::new(), Vec::new());
     orf_window(al, 0, hmm, code(1).unwrap(), &o, "w0", "g\ts\t+", 1000, strand, 1, hmm.m as i64, 1, w.len() as i64, w,
-               0.5, false, false, &mut out, &mut kept, cache);
+               false, false, &mut out, &mut kept, cache);
     (out, format!("{kept:?}"))
 }
 

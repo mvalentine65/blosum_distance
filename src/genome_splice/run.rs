@@ -3,7 +3,7 @@
 //! .exons.tsv, .chains.tsv, .junctions.tsv, .refined.tsv, .disablements.tsv,
 //! .pseudo.tsv, .gff3) plus .acceptor.tsv, .cut.tsv and .rebase.tsv, genomic 1-based coordinates.
 
-use super::chain::{add_exon, covered_nodes, module_block, Window, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_LEAD, SRC_ORF, SRC_SIBFILL, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
+use super::chain::{add_exon, module_block, Window, sibling_mask, sort_exons, SRC_ALT, SRC_CUT, SRC_INPUT, SRC_LEAD, SRC_ORF, SRC_SIBFILL, SRC_TAIL, chain_junctions, chain_windows, load_genome, read_chains, write_chains, Chain, ChainExon, ChainOpts, GAP, KIND_NAME, SRC_NAME, SRC_SPLICE};
 use super::hmm::{read_hmms, Hmm};
 use super::junction::{junction, Junction, JxStatus};
 use super::sites::{acceptor_default, base, code, learn_acceptor, revcomp, site_scores, splice_scores, translate, AccTable, Code, SS3_LAST};
@@ -1228,7 +1228,6 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                 // a gap part that belongs to other isoforms reads as N
                 let seg: Vec<u8> = masked(&sc[(w.gs - 1) as usize..w.ge as usize], w.gs, w.mask);
                 let mut kept: Vec<ChainExon> = Vec::new();
-                let cover = covered_nodes(c, hmm.m) as f64 / hmm.m as f64;
                 // before the row's first exon: does that exon read back to a start codon of its own
                 let plus = c.strand == b'+';
                 let before = w.kind != GAP && (if plus { w.ge < e.start } else { w.gs > e.end });
@@ -1249,7 +1248,7 @@ pub fn run(models_path: &str, chains_path: &str, genome_src: GenomeSrc, prefix: 
                     fill_gap(al, hid, hmm, o, c, &a, &b, sc, w.mask, &jid, w.ci, &mut wo, pj)
                 };
                 let oc = if shared.get(i).copied().unwrap_or(false) { orf_cache.as_ref() } else { None };
-                orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, cover, start, joined, &mut wo.segments, &mut kept, oc);
+                orf_window(al, hid, hmm, o.prm.code, &o.orf, &id, &lead, w.gs - 1, c.strand, k1, k2, alo, ahi, &seg, start, joined, &mut wo.segments, &mut kept, oc);
                 for k in kept {
                     wo.pend.push((w.ci, k, w.kind));
                     for &c2 in &w.also { wo.pend.push((c2, k, w.kind)); }

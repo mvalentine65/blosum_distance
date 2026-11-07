@@ -5,8 +5,7 @@
 
 use super::orf::OrfOpts;
 
-/// A recovered ORF piece as it is judged. `cover` is evidence no rule reads yet.
-#[allow(dead_code)]
+/// A recovered ORF piece as it is judged.
 #[derive(Clone, Copy)]
 pub struct Piece {
     /// Forward bits against the window's model nodes
@@ -26,8 +25,6 @@ pub struct Piece {
     pub skip: i64,
     /// found past a row's end, not between two of its exons
     pub flank: bool,
-    /// share of the model's nodes the row's exons cover
-    pub cover: f64,
     /// found before the row's first exon
     pub lead: bool,
     /// that exon reads back to a start codon of its own (lead_start_reach)
@@ -171,9 +168,7 @@ pub fn keep_against_reversal(rev: f64, min_rev: f64) -> bool {
     !(rev < min_rev)
 }
 
-/// A row's end as its extension is judged. `exons` and `lone` are evidence no
-/// rule reads yet.
-#[allow(dead_code)]
+/// A row's end as its extension is judged.
 pub struct End {
     /// model nodes between the end exon and that end of the model
     pub short: i64,
@@ -181,10 +176,6 @@ pub struct End {
     pub covered: usize,
     /// the model's length
     pub m: usize,
-    /// exons in the row
-    pub exons: usize,
-    /// a hit in no row
-    pub lone: bool,
 }
 
 const START_NODES: i64 = 30;

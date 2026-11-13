@@ -7,6 +7,7 @@ mod genome_splice;
 mod flexcull;
 mod ntbatch;
 mod seedscan;
+mod shake;
 mod flankscan;
 mod pn2codon;
 mod reads;
@@ -580,6 +581,7 @@ fn sapphyre_tools(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(flankscan::flank_extend, m)?)?;
     m.add_function(wrap_pyfunction!(flankscan::flank_overlap_tails, m)?)?;
     m.add_function(wrap_pyfunction!(flankscan::flank_grow, m)?)?;
+    m.add_function(wrap_pyfunction!(shake::shake_contigs, m)?)?;
     m.add_class::<dedupe::PreparedReads>()?;
     m.add_function(wrap_pyfunction!(dedupe::dedupe_reads, m)?)?;
     m.add_class::<genome_prep::GenomeScanner>()?;
